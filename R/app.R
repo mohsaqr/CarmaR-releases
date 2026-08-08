@@ -56,11 +56,20 @@ launch_sh_code <- function(launch_r, alert) {
     " || alert \"CarmaR could not start. Open R and run: carmar::run()\"\n")
 }
 
+#' Where the shipped icon files live — inst/launcher in the installed
+#' package, "" when running from source (the generators then skip the icon,
+#' never fail on it).
+#' @keywords internal
+launcher_assets <- function() {
+  p <- system.file("launcher", package = "carmar")
+  if (nzchar(p)) p else ""
+}
+
 #' Build CarmaR.app — a plain bundle with a shell-script executable. Scripts
 #' need no code signature even on Apple silicon, and a bundle this machine
 #' wrote has no quarantine bit: it opens like any app, first click included.
 #' @keywords internal
-app_macos <- function(apps = "~/Applications") {
+app_macos <- function(apps = "~/Applications", assets = launcher_assets()) {
   apps <- path.expand(apps)
   app <- file.path(apps, "CarmaR.app")
   res <- file.path(app, "Contents", "Resources")
@@ -68,6 +77,10 @@ app_macos <- function(apps = "~/Applications") {
   unlink(app, recursive = TRUE)
   dir.create(res, recursive = TRUE, showWarnings = FALSE)
   dir.create(bin, recursive = TRUE, showWarnings = FALSE)
+
+  icns <- if (nzchar(assets)) file.path(assets, "carmar.icns") else ""
+  has_icon <- nzchar(icns) && file.exists(icns)
+  if (has_icon) file.copy(icns, file.path(res, "CarmaR.icns"))
 
   version <- tryCatch(as.character(utils::packageVersion("carmar")),
                       error = function(e) "0.0")
@@ -80,6 +93,7 @@ app_macos <- function(apps = "~/Applications") {
     "  <key>CFBundleIdentifier</key><string>me.saqr.carmar</string>",
     "  <key>CFBundleExecutable</key><string>CarmaR</string>",
     "  <key>CFBundlePackageType</key><string>APPL</string>",
+    if (has_icon) "  <key>CFBundleIconFile</key><string>CarmaR</string>",
     paste0("  <key>CFBundleShortVersionString</key><string>", version, "</string>"),
     "  <key>LSApplicationCategoryType</key><string>public.app-category.education</string>",
     "</dict></plist>"),
@@ -104,10 +118,16 @@ app_macos <- function(apps = "~/Applications") {
 app_windows <- function(base = file.path(Sys.getenv("LOCALAPPDATA"), "CarmaR"),
                         startmenu = file.path(Sys.getenv("APPDATA"),
                           "Microsoft", "Windows", "Start Menu", "Programs"),
-                        make_shortcut = identical(.Platform$OS.type, "windows")) {
+                        make_shortcut = identical(.Platform$OS.type, "windows"),
+                        assets = launcher_assets()) {
   dir.create(base, recursive = TRUE, showWarnings = FALSE)
   launch_r <- file.path(base, "launch.R")
   writeLines(launch_r_code(), launch_r)
+  ico <- if (nzchar(assets)) file.path(assets, "carmar.ico") else ""
+  has_icon <- nzchar(ico) && file.exists(ico)
+  if (has_icon) file.copy(ico, file.path(base, "carmar.ico"), overwrite = TRUE)
+  # Shell APIs want backslashes; R built these paths with forward slashes.
+  winpath <- function(p) chartr("/", "\\", p)
 
   vbs <- file.path(base, "launch.vbs")
   writeLines(c(
@@ -133,9 +153,10 @@ app_windows <- function(base = file.path(Sys.getenv("LOCALAPPDATA"), "CarmaR"),
     maker <- tempfile(fileext = ".vbs")
     writeLines(c(
       'Set sh = CreateObject("WScript.Shell")',
-      paste0('Set lnk = sh.CreateShortcut("', file.path(startmenu, "CarmaR.lnk"), '")'),
+      paste0('Set lnk = sh.CreateShortcut("', winpath(file.path(startmenu, "CarmaR.lnk")), '")'),
       'lnk.TargetPath = "wscript.exe"',
-      paste0('lnk.Arguments = """', vbs, '"""'),
+      paste0('lnk.Arguments = """', winpath(vbs), '"""'),
+      if (has_icon) paste0('lnk.IconLocation = "', winpath(file.path(base, "carmar.ico")), ', 0"'),
       'lnk.Description = "CarmaR - R notebook"',
       "lnk.Save"), maker)
     system2("cscript", c("//nologo", maker), stdout = FALSE, stderr = FALSE)
@@ -147,7 +168,7 @@ app_windows <- function(base = file.path(Sys.getenv("LOCALAPPDATA"), "CarmaR"),
 #' Linux: a launcher script plus a freedesktop .desktop entry — the app menu
 #' on every desktop that follows the spec, which is all of them.
 #' @keywords internal
-app_linux <- function(share = "~/.local/share") {
+app_linux <- function(share = "~/.local/share", assets = launcher_assets()) {
   share <- path.expand(share)
   base <- file.path(share, "carmar")
   apps <- file.path(share, "applications")
@@ -162,12 +183,17 @@ app_linux <- function(share = "~/.local/share") {
     "notify-send CarmaR \"$1\" 2>/dev/null || echo \"CarmaR: $1\" >&2"), sh)
   Sys.chmod(sh, "0755")
 
+  png <- if (nzchar(assets)) file.path(assets, "carmar.png") else ""
+  has_icon <- nzchar(png) && file.exists(png)
+  if (has_icon) file.copy(png, file.path(base, "carmar.png"), overwrite = TRUE)
+
   writeLines(c(
     "[Desktop Entry]",
     "Type=Application",
     "Name=CarmaR",
     "Comment=R notebook - your R, your files, your machine",
     paste0("Exec=", sh),
+    if (has_icon) paste0("Icon=", file.path(base, "carmar.png")),
     "Terminal=false",
     "Categories=Development;Science;Education;"),
     file.path(apps, "carmar.desktop"))
