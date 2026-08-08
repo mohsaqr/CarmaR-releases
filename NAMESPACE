@@ -1,3 +1,5 @@
 export(run)
 export(stop_kernel)
 export(upgrade)
+export(install_app)
+export(uninstall_app)
