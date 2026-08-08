@@ -31,6 +31,17 @@ run <- function(port = 4747, open = TRUE) {
   dir.create(state, recursive = TRUE, showWarnings = FALSE)
   url_file <- file.path(state, paste0("url-", port))
 
+  # The fast channel runs on EVERY call — including the reuse path below.
+  # The first version upgraded only on a fresh launch, and the reuse branch
+  # returned before ever reaching it: exactly when someone re-runs run() to
+  # "get the update", nothing updated. Quiet, and never allowed to block or
+  # fail the launch.
+  try(upgrade(quiet = TRUE), silent = TRUE)
+  # ...and the freshest notebook is copied where EVERY server generation
+  # looks, so even a long-lived kernel from an older install serves it on
+  # the very next reload.
+  try(sync_notebook(), silent = TRUE)
+
   # Second call means "take me back", never "start a second kernel".
   if (file.exists(url_file)) {
     u <- readLines(url_file, warn = FALSE)[1]
@@ -40,11 +51,6 @@ run <- function(port = 4747, open = TRUE) {
       return(invisible(u))
     }
   }
-
-  # Starting a kernel is the moment that matters for freshness (a new class
-  # day): check the fast channel quietly, never letting it block or fail the
-  # launch. Mid-session, carmar::upgrade() does the same by hand.
-  try(upgrade(quiet = TRUE), silent = TRUE)
 
   serve <- system.file("app", "kernel", "serve.R", package = "carmar")
   if (!nzchar(serve)) stop("carmar is not installed correctly (serve.R is missing) - reinstall the package.")
@@ -130,14 +136,45 @@ stop_kernel <- function(port = 4747) {
   invisible(ok)
 }
 
+#' Put the newest notebook where every kernel looks
+#'
+#' The contract of `run()` is "serve the latest" — not "check for updates".
+#' Downloads land in the per-user dist; a CURRENT kernel pools that folder
+#' at request time, but a long-lived kernel from an older install only
+#' scans the package's own app/ folder. So on every `run()`, whatever the
+#' newest `carmar_V*.html` on this machine is gets copied into app/ too —
+#' after that, EVERY kernel generation serves it on its very next reload.
+#'
+#' @param app The package app directory every serve.R scans.
+#' @param dist The per-user dist directory where downloads land.
+#' @return Invisibly, `TRUE` if a newer notebook was put in place.
+#' @keywords internal
+sync_notebook <- function(app = dirname(system.file("app", "kernel", package = "carmar")),
+                          dist = file.path(tools::R_user_dir("carmar", "data"), "dist")) {
+  v_of <- function(f) numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", basename(f)))
+  newest <- function(d) {
+    f <- list.files(d, pattern = "^carmar_V[0-9.]+\\.html$", full.names = TRUE)
+    if (!length(f)) return(NULL)
+    f[order(v_of(f), decreasing = TRUE)][1]
+  }
+  best <- newest(dist)
+  if (is.null(best)) return(invisible(FALSE))
+  have <- newest(app)
+  if (!is.null(have) && v_of(have) >= v_of(best)) return(invisible(FALSE))
+  # A library the user cannot write to just means this kernel serves from
+  # the per-user dist instead — file.copy returning FALSE is not an error.
+  invisible(isTRUE(suppressWarnings(
+    file.copy(best, file.path(app, basename(best)), overwrite = TRUE))))
+}
+
 #' Upgrade the CarmaR notebook
 #'
 #' Downloads the newest notebook from the course's release page into your
-#' user data folder, where the kernel finds it on the next reload. This is
-#' the FAST channel: the notebook is one small file and a release is live
-#' seconds after the instructor publishes it — no package rebuild, no
-#' r-universe wait, no reinstall. `run()` also checks quietly on every
-#' starts a kernel, so calling this yourself is only needed mid-session.
+#' user data folder. You never need to call this: `run()` does it on EVERY
+#' call — including when it reconnects to a kernel that is already running
+#' — so `run()` always serves the latest. The notebook is one small file
+#' and a release is live seconds after the instructor publishes it — no
+#' package rebuild, no r-universe wait, no reinstall.
 #'
 #' @param quiet Say nothing unless something was updated? Default `FALSE`.
 #' @return Invisibly, `TRUE` if a newer notebook was downloaded.
