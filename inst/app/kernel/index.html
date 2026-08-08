@@ -1,0 +1,96 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CarmaR kernel spike</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 1.5rem;
+         max-width: 60rem; }
+  h1 { font-size: 1rem; font-weight: 600; margin: 0 0 1rem; letter-spacing: .01em; }
+  #status { font-variant-numeric: tabular-nums; opacity: .7; font-size: .85rem; }
+  textarea { width: 100%; min-height: 7rem; font: 13px/1.5 ui-monospace, monospace;
+             padding: .6rem; box-sizing: border-box; }
+  .row { display: flex; gap: .5rem; margin: .6rem 0; align-items: center; }
+  button { font: inherit; padding: .35rem .9rem; }
+  pre { font: 12px/1.5 ui-monospace, monospace; padding: .8rem; margin: 0;
+        background: color-mix(in srgb, currentColor 6%, transparent);
+        border-radius: 4px; max-height: 26rem; overflow: auto; white-space: pre-wrap; }
+  .stderr, .warning { color: #b45309; }
+  .error { color: #b91c1c; }
+  .meta { opacity: .55; }
+  table { border-collapse: collapse; margin: .5rem 0; font-size: 12px; display: block;
+          overflow-x: auto; max-width: 100%; }
+  th, td { border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+           padding: .15rem .5rem; text-align: left; white-space: nowrap; }
+  th { font-weight: 600; opacity: .8; }
+  img { display: block; margin: .5rem 0; border-radius: 3px; }
+</style>
+
+<h1>CarmaR kernel spike <span id="status">connecting…</span></h1>
+
+<textarea id="src">for (i in 1:20) { cat("tick", i, "\n"); flush(stdout()); Sys.sleep(0.5) }</textarea>
+
+<div class="row">
+  <button id="run">Run</button>
+  <button id="stop">Stop</button>
+  <span class="meta">Stop sends SIGINT to the worker — the session survives.</span>
+</div>
+
+<pre id="out"></pre>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const ws = new WebSocket(`ws://${location.host}/ws?token=${params.get('token') ?? ''}`);
+  const out = document.getElementById('out');
+  const status = document.getElementById('status');
+  let n = 0;
+
+  const write = (text, cls) => {
+    const span = document.createElement('span');
+    if (cls) span.className = cls;
+    span.textContent = text + '\n';
+    out.appendChild(span);
+    out.scrollTop = out.scrollHeight;
+  };
+
+  ws.onopen = () => { status.textContent = 'connected'; };
+  ws.onclose = () => { status.textContent = 'disconnected'; };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'ready') status.textContent = `ready — ${msg.r} (pid ${msg.pid})`;
+    else if (msg.type === 'stdout') write(msg.text);
+    else if (msg.type === 'stderr') write(msg.text, 'stderr');
+    else if (msg.type === 'stream') write(`${msg.kind}: ${msg.text}`, msg.kind);
+    else if (msg.type === 'plot') {
+      const img = new Image();
+      img.src = `data:${msg.mime};base64,${msg.data}`;
+      img.style.maxWidth = '100%';
+      out.appendChild(img);
+    }
+    else if (msg.type === 'dataframe') {
+      const table = document.createElement('table');
+      const head = table.insertRow();
+      msg.columns.forEach((c, i) => {
+        const th = document.createElement('th');
+        th.textContent = `${c} (${msg.types[i]})`;
+        head.appendChild(th);
+      });
+      const rows = Array.isArray(msg.rows) ? msg.rows : [msg.rows];
+      rows.slice(0, 20).forEach((r) => {
+        const tr = table.insertRow();
+        msg.columns.forEach((c) => { tr.insertCell().textContent = r[c]; });
+      });
+      out.appendChild(table);
+      write(`${msg.nrow} × ${msg.ncol}${msg.truncated ? ` — showing first ${rows.length}` : ''}`, 'meta');
+    }
+    else if (msg.type === 'done') write(`— ${msg.status}${msg.message ? ': ' + msg.message : ''}`,
+                                        msg.status === 'ok' ? 'meta' : 'error');
+    else if (msg.type === 'worker-died') status.textContent = 'worker died';
+  };
+
+  document.getElementById('run').onclick = () => {
+    ws.send(JSON.stringify({ type: 'exec', id: `c${++n}`, source: document.getElementById('src').value }));
+  };
+  document.getElementById('stop').onclick = () => {
+    ws.send(JSON.stringify({ type: 'interrupt' }));
+  };
+</script>
