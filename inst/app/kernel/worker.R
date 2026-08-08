@@ -1043,6 +1043,49 @@ open_plot_device <- function(dir, seq, dims = NULL) {
   invisible(NULL)
 }
 
+#' Emit one `plot` frame for a finished page file.
+#'
+#' Report the size the device was ACTUALLY opened at. Reporting the defaults
+#' while honouring the request is worse than ignoring the request: the client
+#' lays out a 900×620 box around a 1400×500 image.
+#' `res` travels with the image because the client cannot infer it: a
+#' 1400×900 PNG at res 96 and the same PNG at res 192 are the same pixels
+#' describing different physical sizes, and the viewer needs the second
+#' number to display it at its true size instead of upscaling it.
+#'
+#' @param id Cell id.
+#' @param f Path to a finalized PNG page.
+#' @return Invisibly NULL.
+emit_plot_frame <- function(id, f, dims = NULL) {
+  emit(list(type = "plot", id = id, mime = "image/png",
+            width  = if (!is.null(dims$width))  dims$width  else PLOT_WIDTH,
+            height = if (!is.null(dims$height)) dims$height else PLOT_HEIGHT,
+            res    = if (!is.null(dims$res))    dims$res    else PLOT_RES,
+            data = jsonlite::base64_enc(readBin(f, "raw", file.info(f)$size))))
+  invisible(NULL)
+}
+
+#' Emit pages the device has finished, leaving the device open.
+#'
+#' The `%03d` png device finalizes a page's file only when the NEXT page
+#' begins (or the device closes), so every file on disk is a complete figure
+#' and the page still open on the device has no file yet. That page stays
+#' amendable: `abline()` after `seq_heatmap()` draws onto a live plot instead
+#' of erroring, and `layout()`/`par()` state survives across statements.
+#'
+#' @param id Cell id.
+#' @param dir Directory the device writes pages into.
+#' @param seen Character vector of filenames already emitted.
+#' @return The updated `seen` vector.
+harvest_finished <- function(id, dir, seen, dims = NULL) {
+  files <- list.files(dir, pattern = "\\.png$", full.names = TRUE)
+  # Only files with bytes join `seen`: a file still empty here gets another
+  # look on the next harvest instead of being remembered as already emitted.
+  drawn <- Filter(function(f) file.info(f)$size > 0L, sort(setdiff(files, seen)))
+  invisible(lapply(drawn, function(f) emit_plot_frame(id, f, dims)))
+  c(seen, drawn)
+}
+
 #' Close any open device and emit one `plot` frame per page produced.
 #'
 #' @param id Cell id.
@@ -1057,20 +1100,7 @@ harvest_plots <- function(id, dir, seen, dims = NULL) {
   fresh <- setdiff(files, seen)
   # A device always creates its first file, even with nothing drawn into it.
   drawn <- Filter(function(f) file.info(f)$size > 0L, sort(fresh))
-  invisible(lapply(drawn, function(f) {
-    # Report the size the device was ACTUALLY opened at. Reporting the defaults
-    # while honouring the request is worse than ignoring the request: the client
-    # lays out a 900×620 box around a 1400×500 image.
-    # `res` travels with the image because the client cannot infer it: a
-    # 1400×900 PNG at res 96 and the same PNG at res 192 are the same pixels
-    # describing different physical sizes, and the viewer needs the second
-    # number to display it at its true size instead of upscaling it.
-    emit(list(type = "plot", id = id, mime = "image/png",
-              width  = if (!is.null(dims$width))  dims$width  else PLOT_WIDTH,
-              height = if (!is.null(dims$height)) dims$height else PLOT_HEIGHT,
-              res    = if (!is.null(dims$res))    dims$res    else PLOT_RES,
-              data = jsonlite::base64_enc(readBin(f, "raw", file.info(f)$size))))
-  }))
+  invisible(lapply(drawn, function(f) emit_plot_frame(id, f, dims)))
   c(seen, fresh)
 }
 
@@ -1266,10 +1296,15 @@ run_cell <- function(id, source, dims = NULL) {
     withCallingHandlers(
       {
         exprs <- parse(text = source)
-        idx <- 0L
+        # ONE device for the whole cell, not one per statement. Base graphics
+        # are stateful across statements — `layout()` then two plots, `par()`
+        # then a plot, `seq_heatmap()` then `abline()` — and a per-statement
+        # device reset broke every one of those idioms ("plot.new has not
+        # been called yet"). Finished pages still stream out mid-cell via
+        # harvest_finished(); only the page being drawn waits for cell end.
+        dev_seq <- 1L
+        open_plot_device(plot_dir, dev_seq, dims)
         invisible(lapply(exprs, function(e) {
-          idx <<- idx + 1L
-          open_plot_device(plot_dir, idx, dims)
           res <- withVisible(eval(e, globalenv()))
           if (isTRUE(res$visible)) {
             v <- res$value
@@ -1278,7 +1313,15 @@ run_cell <- function(id, source, dims = NULL) {
             else if (is.matrix(v) && nrow(v) > 0L && ncol(v) > 0L) emit_dataframe(id, matrix_to_df(v))
             else print(v)
           }
-          seen <<- harvest_plots(id, plot_dir, seen, dims)
+          seen <<- harvest_finished(id, plot_dir, seen, dims)
+          # User code may close our device (an explicit dev.off() in the
+          # cell). Reopen under a FRESH sequence number: reusing e001-*.png
+          # would overwrite files already emitted, and `seen` would silently
+          # swallow the replacements.
+          if (is.null(grDevices::dev.list())) {
+            dev_seq <<- dev_seq + 1L
+            open_plot_device(plot_dir, dev_seq, dims)
+          }
         }))
       },
       warning = function(w) {
