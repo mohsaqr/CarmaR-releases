@@ -186,15 +186,29 @@ kernel_poll <- function(k, timeout_ms = 50L) {
   out <- k$proc$read_output_lines()
   err <- k$proc$read_error_lines()
 
-  from_stdout <- lapply(out, function(line) {
-    if (startsWith(line, k$sentinel)) {
-      payload <- substring(line, nchar(k$sentinel) + 1L)
-      parsed <- tryCatch(fromJSON(payload), error = function(e) NULL)
-      if (is.null(parsed)) list(type = "stdout", text = line) else parsed
-    } else {
-      list(type = "stdout", text = line)
-    }
-  })
+  # The sentinel is found ANYWHERE in the line, not only at its start.
+  #
+  # The worker deliberately does not capture output (sink() would kill
+  # streaming), so user code controls where the cursor is when the next
+  # control frame is written. A cell ending in `cat("done")` — no trailing
+  # newline — leaves the cursor mid-line, and the frame lands glued to that
+  # text: `donesentinel{"type":"done",...}`. startsWith() then missed it, the
+  # frame was reported as ordinary stdout, and the cell never finished: no
+  # `done` ever arrived and the run hung until the user pressed Stop.
+  #
+  # Splitting at the sentinel instead recovers both halves — the text before
+  # it is the user's output, the rest is the frame. This does not weaken the
+  # forgery guarantee: that rests on the sentinel being 24 unguessable
+  # characters, not on its position in the line.
+  from_stdout <- unlist(lapply(out, function(line) {
+    at <- regexpr(k$sentinel, line, fixed = TRUE)
+    if (at < 1L) return(list(list(type = "stdout", text = line)))
+    payload <- substring(line, at + nchar(k$sentinel))
+    parsed <- tryCatch(fromJSON(payload), error = function(e) NULL)
+    if (is.null(parsed)) return(list(list(type = "stdout", text = line)))
+    prefix <- substring(line, 1L, at - 1L)
+    if (nzchar(prefix)) list(list(type = "stdout", text = prefix), parsed) else list(parsed)
+  }), recursive = FALSE)
   from_stderr <- lapply(err, function(line) list(type = "stderr", text = line))
 
   c(from_stdout, from_stderr)

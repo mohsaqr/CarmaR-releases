@@ -198,7 +198,7 @@ host_ok <- function(req) {
 # until someone adds it here on purpose.
 FORWARDED <- c("env", "obj", "struct", "view", "rm", "packages", "help", "wd",
                "parse", "complete", "files", "import", "readfile", "writefile",
-               "hover", "format")
+               "hover", "format", "sniff", "choose")
 
 # A single WebSocket frame this large is not a notebook cell; it is either a
 # bug or an attempt to exhaust memory in fromJSON(). 8 MB is far above any

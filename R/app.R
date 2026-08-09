@@ -25,9 +25,14 @@ launch_r_code <- function() {
     "# The launcher runs this with the R it found on this machine.\n",
     "if (!requireNamespace(\"carmar\", quietly = TRUE)) {\n",
     "  message(\"CarmaR is not installed in this R - installing...\")\n",
-    "  options(pkgType = \"binary\")\n",
-    "  install.packages(\"carmar\",\n",
-    "    repos = c(\"https://mohsaqr.r-universe.dev\", \"https://cloud.r-project.org\"))\n",
+    "  cran <- \"https://cloud.r-project.org\"\n",
+    "  need <- c(\"httpuv\", \"jsonlite\", \"processx\")\n",
+    "  miss <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]\n",
+    "  if (length(miss)) install.packages(miss, repos = cran)\n",
+    "  github <- \"https://github.com/mohsaqr/CarmaR-releases/releases/latest/download/carmar.tar.gz\"\n",
+    "  try(install.packages(github, repos = NULL, type = \"source\"), silent = TRUE)\n",
+    "  if (!requireNamespace(\"carmar\", quietly = TRUE))\n",
+    "    install.packages(\"carmar\", repos = c(\"https://mohsaqr.r-universe.dev\", cran))\n",
     "}\n",
     "carmar::run()\n")
 }

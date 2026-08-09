@@ -96,6 +96,37 @@ outside_root_msg <- function() {
 try(utils::rc.settings(ipck = TRUE, func = TRUE, args = TRUE, files = TRUE),
     silent = TRUE)
 
+# ── the import sniffer ──────────────────────────────────────────────────────
+# Format and column-type detection lives in its own file so it can be tested
+# without starting a worker (test/import-sniff.test.R sources it directly);
+# this file runs a dispatch loop the moment it loads, so nothing inside it is
+# reachable from a test. `local = TRUE` keeps the functions in the worker's
+# private scope, where the rest of the plumbing lives — the Environment pane
+# must keep showing the user's objects and not the kernel's.
+#
+# Resolved from the WORKER'S OWN path, not the working directory: the worker
+# is started by three different launchers (kernel.R, the Chrome bridge host,
+# and the packaged inst/app/kernel) and none of them guarantee a cwd.
+import_sources <- local({
+  file_arg <- grep("^--file=", commandArgs(FALSE), value = TRUE)
+  here <- if (length(file_arg)) {
+    dirname(normalizePath(sub("^--file=", "", file_arg[1L]), mustWork = FALSE))
+  } else getwd()
+  file.path(here, c("sniff.R", "chooser.R"))
+})
+# environment(), not parent.frame(): inside a nested local() the parent frame
+# is the eval machinery's, not this file's private scope, and the functions
+# landed somewhere the handlers could not see them. Caught end-to-end, where
+# the kernel answered "this kernel is too old for the import wizard".
+# The target environment is captured HERE, at the worker's own scope. Calling
+# environment() inside the lambda would name the lambda's frame and the
+# functions would load somewhere no handler can see — the same mistake this
+# block already made once, with sniff.R, and it surfaced only end-to-end as
+# "this kernel is too old for the import wizard".
+import_env <- environment()
+invisible(lapply(Filter(file.exists, import_sources),
+                 function(f) sys.source(f, envir = import_env)))
+
 # `Rscript` starts with repos = "@CRAN@", a placeholder that resolves only by
 # ASKING the user to pick a mirror — which a non-interactive session cannot do,
 # so install.packages() fails with "trying to use CRAN without setting a
@@ -107,10 +138,13 @@ local({
   cran <- if (is.null(repos)) NA_character_ else unname(repos["CRAN"])
   unset <- is.null(repos) || is.na(cran) || !nzchar(cran) || identical(cran, "@CRAN@")
   if (unset) {
-    fill <- c(CRAN = "https://cloud.r-project.org")
     # Keep every other repo the profile declared; only CRAN was missing.
-    others <- if (is.null(repos)) character(0) else repos[names(repos) != "CRAN"]
-    options(repos = c(fill, others))
+    # modifyList says that in one verb: it replaces CRAN where it exists and
+    # appends it where it does not, leaving r-universe and institutional
+    # mirrors exactly as the user's .Rprofile left them.
+    others <- if (is.null(repos)) list() else as.list(repos)
+    options(repos = unlist(utils::modifyList(
+      others, list(CRAN = "https://cloud.r-project.org"))))
   }
 })
 
@@ -533,19 +567,77 @@ as_count <- function(x, default) {
 #' @param desc Descending order when TRUE.
 #' @param col_offset Columns to skip before the window (default 0).
 #' @param col_limit Column window size (default 30, capped at MAX_VIEW_COLS).
+#' @param query Case-insensitive text searched across every column.
+#' @param filters Named column filter strings. Numeric comparisons and ranges
+#'   are interpreted without eval; all other values use text matching.
 #' @return Named list of frame fields (no type/id — the caller owns those).
 view_payload <- function(obj, shown_name, offset = NULL, limit = NULL,
                          sort = NULL, desc = FALSE,
-                         col_offset = NULL, col_limit = NULL) {
+                         col_offset = NULL, col_limit = NULL,
+                         query = NULL, filters = NULL) {
   if (!is.data.frame(obj)) obj <- tryCatch(as.data.frame(obj, stringsAsFactors = FALSE),
                                            error = function(e) NULL)
   if (is.null(obj)) return(list(name = shown_name, error = "not a table"))
+  total_rows <- nrow(obj)
   offset <- max(0L, as_count(offset, 0L))
   limit_req <- max(1L, as_count(limit, 200L))
   limit <- min(limit_req, MAX_VIEW_ROWS)
   col_offset <- max(0L, as_count(col_offset, 0L))
   col_limit_req <- max(1L, as_count(col_limit, 30L))
   col_limit <- min(col_limit_req, MAX_VIEW_COLS)
+
+  as_search_text <- function(col) {
+    tryCatch(as.character(col), error = function(e) rep("", length(col)))
+  }
+  match_filter <- function(col, spec) {
+    spec <- trimws(as.character(spec)[1L])
+    if (!nzchar(spec)) return(rep(TRUE, length(col)))
+    if (identical(toupper(spec), "NA")) return(is.na(col))
+    if (is.logical(col)) {
+      wanted <- toupper(spec)
+      if (wanted %in% c("TRUE", "T")) return(!is.na(col) & col)
+      if (wanted %in% c("FALSE", "F")) return(!is.na(col) & !col)
+    }
+    if (is.numeric(col)) {
+      range <- strsplit(spec, "\\.\\.", perl = TRUE)[[1L]]
+      if (length(range) == 2L) {
+        lo <- suppressWarnings(as.numeric(trimws(range[1L])))
+        hi <- suppressWarnings(as.numeric(trimws(range[2L])))
+        if (!is.na(lo) && !is.na(hi)) return(!is.na(col) & col >= lo & col <= hi)
+      }
+      parts <- regmatches(spec, regexec("^\\s*(>=|<=|!=|==|=|>|<)\\s*(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\s*$", spec))[[1L]]
+      if (length(parts) == 3L) {
+        target <- as.numeric(parts[3L])
+        hit <- switch(parts[2L], ">=" = col >= target, "<=" = col <= target,
+                      "!=" = col != target, "==" = col == target, "=" = col == target,
+                      ">" = col > target, "<" = col < target)
+        return(!is.na(hit) & hit)
+      }
+      target <- suppressWarnings(as.numeric(spec))
+      if (!is.na(target)) return(!is.na(col) & col == target)
+    }
+    text <- as_search_text(col)
+    if (startsWith(spec, "=")) return(!is.na(col) & tolower(text) == tolower(substring(spec, 2L)))
+    if (startsWith(spec, "!")) return(is.na(col) | !grepl(substring(spec, 2L), text, fixed = TRUE, ignore.case = TRUE))
+    !is.na(col) & grepl(spec, text, fixed = TRUE, ignore.case = TRUE)
+  }
+
+  filter_count <- 0L
+  if (is.list(filters) && length(filters) && length(names(filters))) {
+    for (nm in intersect(names(filters), names(obj))) {
+      spec <- filters[[nm]]
+      if (length(spec) && nzchar(trimws(as.character(spec)[1L]))) {
+        obj <- obj[match_filter(obj[[nm]], spec), , drop = FALSE]
+        filter_count <- filter_count + 1L
+      }
+    }
+  }
+  query <- if (is.character(query) && length(query)) trimws(query[1L]) else ""
+  if (nzchar(query) && nrow(obj)) {
+    hits <- lapply(obj, function(col) grepl(query, as_search_text(col), fixed = TRUE, ignore.case = TRUE))
+    keep <- Reduce(`|`, hits, init = rep(FALSE, nrow(obj)))
+    obj <- obj[keep, , drop = FALSE]
+  }
   if (is.character(sort) && length(sort) == 1L && sort %in% names(obj)) {
     obj <- obj[order(obj[[sort]], decreasing = isTRUE(desc)), , drop = FALSE]
   }
@@ -573,7 +665,8 @@ view_payload <- function(obj, shown_name, offset = NULL, limit = NULL,
   }
   # `columns` describes the windowed SET only, but each description covers the
   # WHOLE column — the sparkline must show the full distribution, not a page's.
-  list(name = shown_name, nrow = nrow(obj), ncol = ncol(obj),
+  list(name = shown_name, nrow = nrow(obj), ncol = ncol(obj), totalRows = total_rows,
+       filtered = nzchar(query) || filter_count > 0L, filterCount = filter_count,
        offset = offset, limit = limit,
        colOffset = col_offset, colLimit = col_limit,
        limitClamped = limit < limit_req,
@@ -591,7 +684,7 @@ view_payload <- function(obj, shown_name, offset = NULL, limit = NULL,
 #' @param label Display name when it differs from the fetch name (View()).
 emit_view <- function(id, name, offset = NULL, limit = NULL, sort = NULL,
                       desc = FALSE, col_offset = NULL, col_limit = NULL,
-                      label = NULL) {
+                      label = NULL, query = NULL, filters = NULL) {
   shown <- if (is.null(label)) name else label
   obj <- tryCatch(eval(parse(text = name), globalenv()), error = function(e) NULL)
   if (is.null(obj)) {
@@ -602,10 +695,105 @@ emit_view <- function(id, name, offset = NULL, limit = NULL, sort = NULL,
   tryCatch(
     emit(c(list(type = "view", id = id),
            view_payload(obj, shown, offset, limit, sort, desc,
-                        col_offset, col_limit))),
+                        col_offset, col_limit, query, filters))),
     interrupt = function(i) emit(list(type = "view", id = id, name = shown,
                                       error = "interrupted"))
   )
+}
+
+#' Open the OPERATING SYSTEM's file dialog and report what was chosen.
+#'
+#' The browser cannot do this — `<input type="file">` opens the real picker but
+#' withholds the path, and the kernel needs a path. R is already running on the
+#' user's own machine, so R opens the dialog.
+#'
+#' The worker BLOCKS while the dialog is up, which is correct: the session
+#' cannot run a cell whose file has not been chosen yet, and the supervisor
+#' stays responsive throughout because it is a different process. A dialog
+#' left open all afternoon hits CHOOSER_TIMEOUT rather than wedging R.
+#'
+#' @param id Request id.
+#' @param mode "file" or "dir".
+#' @param start Directory to open in; defaults to the working directory.
+#' @param prompt Dialog title.
+#' @param probe_only Report support without opening a dialog. Older clients
+#'   discover capabilities this way; ignoring it consumes the user's first
+#'   file choice as a probe and makes the second attempt appear to work.
+#' @return Invisibly NULL. Emits one `choose` frame carrying exactly one of
+#'   `path`, `cancelled`, `unsupported` or `error`.
+emit_choose <- function(id, mode = "file", start = NULL, prompt = NULL,
+                        probe_only = FALSE) {
+  if (!exists("choose_path", inherits = TRUE)) {
+    emit(list(type = "choose", id = id, unsupported = TRUE))
+    return(invisible(NULL))
+  }
+  if (isTRUE(probe_only)) {
+    emit(list(type = "choose", id = id, supported = TRUE))
+    return(invisible(NULL))
+  }
+  mode <- if (identical(mode, "dir")) "dir" else "file"
+  begin <- if (is.character(start) && length(start) == 1L && nzchar(start)) {
+    path.expand(start)
+  } else getwd()
+  # A confined deployment must not be handed a dialog rooted outside its
+  # subtree — and whatever comes back is checked again below, because the
+  # dialog itself cannot be constrained.
+  if (!within_root(begin)) begin <- confine_root
+  res <- choose_path(mode, begin,
+                     if (is.character(prompt) && nzchar(prompt)) prompt else "Choose a file")
+  if (!is.null(res$path) && !within_root(res$path)) {
+    emit(list(type = "choose", id = id, error = outside_root_msg()))
+    return(invisible(NULL))
+  }
+  emit(c(list(type = "choose", id = id), res))
+}
+
+#' Describe a file WITHOUT reading it into the session.
+#'
+#' The import wizard's eyes. Answers with the detected format, the delimited
+#' settings, a per-column type guess (including the date format, the timezone
+#' and any day/month ambiguity) and a text preview — but assigns nothing and
+#' changes nothing. Inspecting a file the user has not yet agreed to import
+#' must not put an object in their environment, and re-inspecting it under
+#' different settings must not put twenty.
+#'
+#' Every failure is an `error` FIELD rather than a thrown condition: pointing
+#' the wizard at a 2 GB binary is a normal thing to do by accident, and it
+#' must cost a message, not the session.
+#'
+#' @param id Request id.
+#' @param path File to inspect; `~` is expanded.
+#' @param opts Overrides from the wizard (delim, quote, encoding, header,
+#'   skip, sheet, naStrings, tz). Anything absent is detected.
+#' @return Invisibly NULL. Emits one `sniff` frame.
+emit_sniff <- function(id, path = NULL, opts = NULL) {
+  fail <- function(msg) {
+    emit(list(type = "sniff", id = id, path = path, error = msg))
+    invisible(NULL)
+  }
+  if (!is.character(path) || length(path) != 1L || !nzchar(path)) return(fail("no path"))
+  # A URL is a source too. The confinement root governs the FILESYSTEM, and a
+  # remote read touches none of it — but a confined deployment is confined on
+  # purpose, so remote sources are refused there rather than quietly allowed.
+  remote <- exists("is_url", inherits = TRUE) && is_url(path)
+  if (remote) {
+    if (!is.null(confine_root)) return(fail("remote sources are disabled in this deployment"))
+    p <- path
+  } else {
+    p <- path.expand(path)
+    if (!within_root(p)) return(fail(outside_root_msg()))
+    if (!file.exists(p) || dir.exists(p)) return(fail("not a readable file"))
+  }
+  if (!exists("sniff_file", inherits = TRUE)) {
+    return(fail("this kernel is too old for the import wizard - restart CarmaR"))
+  }
+  res <- tryCatch(
+    sniff_file(p, if (is.list(opts)) opts else list()),
+    error = function(e) structure(class = "carmar_fail", list(msg = conditionMessage(e))),
+    interrupt = function(i) structure(class = "carmar_fail", list(msg = "interrupted"))
+  )
+  if (inherits(res, "carmar_fail")) return(fail(res$msg))
+  emit(c(list(type = "sniff", id = id), res))
 }
 
 #' Read a file into the session and answer with a first view of it.
@@ -730,16 +918,209 @@ emit_format <- function(id, source) {
   }
 }
 
-#' Installed and attached packages, for the Packages pane.
-emit_packages <- function(id) {
-  inst <- utils::installed.packages()[, c("Package", "Version"), drop = FALSE]
+#' Loaded namespaces by default; the larger installed inventory is opt-in.
+emit_packages <- function(id, scope = "loaded") {
+  scope <- if (is.character(scope) && length(scope) == 1L &&
+               identical(scope, "installed")) "installed" else "loaded"
+  loaded <- loadedNamespaces()
   attached <- sub("^package:", "", grep("^package:", search(), value = TRUE))
-  emit(list(type = "packages", id = id,
-            packages = lapply(seq_len(nrow(inst)), function(i) {
-              list(name = unname(inst[i, "Package"]),
-                   version = unname(inst[i, "Version"]),
-                   loaded = unname(inst[i, "Package"]) %in% attached)
-            })))
+  rss_mb <- tryCatch({
+    if (!identical(.Platform$OS.type, "unix")) NA_real_ else {
+      kb <- suppressWarnings(as.numeric(trimws(system2(
+        "ps", c("-o", "rss=", "-p", as.character(Sys.getpid())),
+        stdout = TRUE, stderr = FALSE
+      ))[1L]))
+      if (is.finite(kb)) round(kb / 1024, 1L) else NA_real_
+    }
+  }, error = function(e) NA_real_)
+  record <- function(name, version = NULL, lib = NULL, priority = NULL) {
+    if (is.null(lib)) {
+      path <- find.package(name, quiet = TRUE)
+      lib <- if (nzchar(path)) dirname(path) else ""
+    }
+    if (is.null(version)) {
+      version <- tryCatch(as.character(utils::packageVersion(name)), error = function(e) "")
+    }
+    if (is.null(priority)) {
+      priority <- tryCatch(utils::packageDescription(name, fields = "Priority"),
+                           error = function(e) "")
+    }
+    priority <- if (length(priority) && !is.na(priority[1L])) as.character(priority[1L]) else ""
+    lib_norm <- normalizePath(lib, winslash = "/", mustWork = FALSE)
+    protected <- identical(priority, "base")
+    is_attached <- name %in% attached
+    list(name = name, version = as.character(version), lib = lib,
+         loaded = is_attached, attached = is_attached,
+         namespaceLoaded = name %in% loaded,
+         writable = nzchar(lib) && file.access(lib, 2L) == 0L,
+         protected = protected, priority = priority)
+  }
+  if (identical(scope, "installed")) {
+    inst <- utils::installed.packages()[, c("Package", "Version", "LibPath", "Priority"), drop = FALSE]
+    ord <- order(!inst[, "Package"] %in% attached,
+                 !inst[, "Package"] %in% loaded,
+                 tolower(inst[, "Package"]))
+    inst <- inst[ord, , drop = FALSE]
+    packages <- lapply(seq_len(nrow(inst)), function(i) record(
+      unname(inst[i, "Package"]), unname(inst[i, "Version"]),
+      unname(inst[i, "LibPath"]), unname(inst[i, "Priority"])
+    ))
+  } else {
+    loaded <- loaded[order(!loaded %in% attached, tolower(loaded))]
+    packages <- lapply(loaded, record)
+  }
+  emit(list(type = "packages", id = id, scope = scope,
+            memoryMb = rss_mb,
+            packages = packages))
+}
+
+#' Apply one explicit package operation and report its result to the pane.
+emit_package_action <- function(id, action, name, lib = NULL) {
+  valid_name <- is.character(name) && length(name) == 1L &&
+                grepl("^[A-Za-z][A-Za-z0-9.]*$", name)
+  if (!valid_name) {
+    emit(list(type = "package_action", id = id, error = "invalid package name"))
+    return(invisible(NULL))
+  }
+  action <- if (is.character(action) && length(action) == 1L) action else ""
+  allowed <- c("load", "attach", "detach", "unload", "install", "update", "remove")
+  if (!action %in% allowed) {
+    emit(list(type = "package_action", id = id, error = "unknown package action"))
+    return(invisible(NULL))
+  }
+
+  perform <- function() {
+    attached <- sub("^package:", "", grep("^package:", search(), value = TRUE))
+    package_path <- find.package(name, quiet = TRUE)
+    installed <- length(package_path) == 1L && nzchar(package_path)
+    target_lib <- if (installed) dirname(package_path) else ""
+    if (is.character(lib) && length(lib) == 1L && nzchar(lib)) {
+      requested <- normalizePath(lib, winslash = "/", mustWork = FALSE)
+      known <- normalizePath(.libPaths(), winslash = "/", mustWork = FALSE)
+      if (!requested %in% known) stop("the selected package library is not active in this R session")
+      target_lib <- lib
+    }
+    priority <- if (installed) tryCatch(
+      utils::packageDescription(name, lib.loc = target_lib, fields = "Priority"),
+      error = function(e) "") else ""
+    protected <- installed && identical(unname(priority), "base")
+
+    if (action %in% c("detach", "unload", "update", "remove") && protected) {
+      stop("R system packages are protected")
+    }
+    if (identical(action, "load")) {
+      loadNamespace(name)
+      return(paste(name, "namespace loaded"))
+    }
+    if (identical(action, "attach")) {
+      suppressPackageStartupMessages(library(name, character.only = TRUE))
+      return(paste(name, "attached to the search path"))
+    }
+    if (identical(action, "detach")) {
+      if (!name %in% attached) return(paste(name, "is not attached"))
+      detach(paste0("package:", name), character.only = TRUE, unload = FALSE)
+      return(paste(name, "detached; its namespace remains loaded"))
+    }
+    if (identical(action, "unload")) {
+      was_attached <- name %in% attached
+      if (was_attached) detach(paste0("package:", name), character.only = TRUE, unload = FALSE)
+      if (!name %in% loadedNamespaces()) return(paste(name, "namespace is not loaded"))
+      tryCatch(unloadNamespace(name), error = function(e) {
+        if (was_attached) suppressPackageStartupMessages(library(name, character.only = TRUE))
+        stop(e)
+      })
+      return(paste(name, if (was_attached) "detached and unloaded" else "namespace unloaded"))
+    }
+    if (identical(action, "remove")) {
+      if (!installed) return(paste(name, "is not installed"))
+      if (file.access(target_lib, 2L) != 0L) stop("the package library is not writable")
+      was_attached <- name %in% attached
+      was_loaded <- name %in% loadedNamespaces()
+      tryCatch({
+        if (was_attached) detach(paste0("package:", name), character.only = TRUE, unload = FALSE)
+        if (name %in% loadedNamespaces()) unloadNamespace(name)
+        utils::remove.packages(name, lib = target_lib)
+      }, error = function(e) {
+        try(if (was_attached) suppressPackageStartupMessages(library(name, character.only = TRUE))
+            else if (was_loaded) loadNamespace(name), silent = TRUE)
+        stop(e)
+      })
+      return(paste(name, "removed from", target_lib))
+    }
+
+    repos <- getOption("repos")
+    if (!length(repos) || is.na(repos["CRAN"]) || identical(unname(repos["CRAN"]), "@CRAN@")) {
+      repos <- c(CRAN = "https://cloud.r-project.org")
+    }
+    if (identical(action, "install")) {
+      if (installed && protected) stop("R system packages are protected")
+      writable <- .libPaths()[file.access(.libPaths(), 2L) == 0L]
+      if (!length(writable)) stop("this R session has no writable package library")
+      target_lib <- writable[1L]
+      suppressWarnings(utils::install.packages(name, lib = target_lib, repos = repos,
+                                                dependencies = NA, quiet = TRUE))
+      if (!requireNamespace(name, quietly = TRUE)) stop("installation did not produce a loadable package")
+      return(paste(name, as.character(utils::packageVersion(name)), "installed"))
+    }
+    if (!installed) stop("the package is not installed")
+    if (file.access(target_lib, 2L) != 0L) stop("the package library is not writable")
+    available <- utils::available.packages(repos = repos)
+    if (!name %in% rownames(available)) stop("the package is not available from the configured repositories")
+    current <- utils::packageVersion(name, lib.loc = target_lib)
+    latest <- numeric_version(available[name, "Version"])
+    if (current >= latest) return(paste(name, as.character(current), "is current"))
+    was_attached <- name %in% attached
+    was_loaded <- name %in% loadedNamespaces()
+    updated <- tryCatch({
+      if (was_attached) detach(paste0("package:", name), character.only = TRUE, unload = FALSE)
+      if (name %in% loadedNamespaces()) unloadNamespace(name)
+      suppressWarnings(utils::install.packages(name, lib = target_lib, repos = repos,
+                                                dependencies = NA, quiet = TRUE))
+      installed_version <- utils::packageVersion(name, lib.loc = target_lib)
+      if (installed_version < latest) stop("the package update did not complete")
+      if (was_attached) suppressPackageStartupMessages(library(name, character.only = TRUE))
+      else if (was_loaded) loadNamespace(name)
+      installed_version
+    }, error = function(e) {
+      try(if (was_attached) suppressPackageStartupMessages(library(name, character.only = TRUE))
+          else if (was_loaded) loadNamespace(name), silent = TRUE)
+      stop(e)
+    })
+    paste(name, as.character(updated), "updated")
+  }
+
+  result <- tryCatch(list(message = perform()), error = function(e) list(error = conditionMessage(e)))
+  emit(c(list(type = "package_action", id = id, action = action, name = name), result))
+}
+
+#' Package metadata and documentation index for the Help pane.
+emit_package_help <- function(id, name) {
+  valid_name <- is.character(name) && length(name) == 1L &&
+                grepl("^[A-Za-z][A-Za-z0-9.]*$", name)
+  if (!valid_name) {
+    emit(list(type = "package_help", id = id, error = "invalid package name"))
+    return(invisible(NULL))
+  }
+  result <- tryCatch({
+    desc <- utils::packageDescription(name)
+    index <- do.call(utils::help, list(package = name))
+    table <- tryCatch(index$info[[2L]], error = function(e) NULL)
+    topics <- if (is.null(table) || !NROW(table)) list() else {
+      columns <- colnames(table)
+      item_col <- intersect(c("Item", "Topic"), columns)[1L]
+      title_col <- intersect(c("Title", "Description"), columns)[1L]
+      if (is.na(item_col)) list() else lapply(seq_len(NROW(table)), function(i) {
+        list(topic = unname(table[i, item_col]),
+             title = if (is.na(title_col)) "" else unname(table[i, title_col]))
+      })
+    }
+    list(title = unname(desc[["Title"]] %||% name),
+         version = unname(desc[["Version"]] %||% ""),
+         description = unname(desc[["Description"]] %||% ""),
+         license = unname(desc[["License"]] %||% ""),
+         topics = topics)
+  }, error = function(e) list(error = conditionMessage(e)))
+  emit(c(list(type = "package_help", id = id, name = name), result))
 }
 
 #' R's own help page, rendered to HTML, for the Help pane.
@@ -1120,14 +1501,78 @@ emit_dataframe <- function(id, df) {
   # (matrix_to_df) and data frames did not, so the same object printed as a
   # matrix kept its labels and printed as a frame lost them.
   df <- with_rownames(df)
-  head_df <- utils::head(df, MAX_ROWS)
+  # A returned value is a NOTEBOOK PREVIEW, not the data viewer. Bounding rows
+  # alone is insufficient: one list-column cell may contain a fitted model and
+  # one character cell may contain megabytes. Serialising either recursively
+  # blocks the R session before the browser receives a single result frame.
+  # Keep the preview deliberately small, flatten complex cells to descriptions,
+  # clip text, then enforce a final wire-size ceiling. The full object viewer
+  # remains paginated independently for assigned objects.
+  preview_rows <- 25L
+  preview_cols <- 20L
+  cell_chars <- 160L
+  preview_bytes <- 256L * 1024L
+  total_rows <- nrow(df)
+  total_cols <- ncol(df)
+  shown_cols <- if (total_cols) seq_len(min(total_cols, preview_cols)) else integer(0)
+  source_types <- if (length(shown_cols)) {
+    unname(vapply(df[shown_cols], function(col) class(col)[1L], character(1)))
+  } else character(0)
+
+  cell_preview <- function(value) {
+    text <- if (is.null(value)) {
+      "NULL"
+    } else if (is.data.frame(value) || is.matrix(value)) {
+      paste(dim(value), collapse = " x ")
+    } else if (is.function(value)) {
+      paste0("function(", formals_string(value), ")")
+    } else if (is.environment(value)) {
+      "<environment>"
+    } else if (is.atomic(value)) {
+      shown <- as.character(utils::head(value, 3L))
+      shown <- substr(shown, 1L, 48L)
+      paste0(paste(shown, collapse = ", "), if (length(value) > 3L) ", ..." else "")
+    } else {
+      paste0("<", class(value)[1L], ">")
+    }
+    substr(text, 1L, cell_chars)
+  }
+
+  safe_column <- function(col, rows) {
+    shown <- utils::head(col, rows)
+    if (is.factor(shown)) return(as.character(shown))
+    if (inherits(shown, "Date") || inherits(shown, "POSIXt")) return(format(shown))
+    if (is.atomic(shown) && is.null(dim(shown)) && !is.complex(shown) && !is.raw(shown)) {
+      if (is.character(shown)) {
+        long <- !is.na(shown) & nchar(shown, type = "chars") > cell_chars
+        shown[long] <- paste0(substr(shown[long], 1L, cell_chars - 3L), "...")
+      }
+      return(shown)
+    }
+    if (is.list(shown)) return(vapply(shown, cell_preview, character(1)))
+    if (!is.null(dim(shown)) && nrow(shown)) {
+      return(vapply(seq_len(nrow(shown)), function(i) cell_preview(shown[i, , drop = TRUE]), character(1)))
+    }
+    rep(paste0("<", class(shown)[1L], ">"), rows)
+  }
+
+  head_df <- utils::head(df[shown_cols], preview_rows)
+  if (ncol(head_df)) head_df[] <- lapply(head_df, safe_column, rows = nrow(head_df))
+  preview_json <- jsonlite::toJSON(head_df, auto_unbox = TRUE, null = "null",
+                                   na = "null", digits = NA)
+  while (nchar(preview_json, type = "bytes") > preview_bytes && nrow(head_df) > 1L) {
+    head_df <- utils::head(head_df, max(1L, as.integer(floor(nrow(head_df) / 2L))))
+    preview_json <- jsonlite::toJSON(head_df, auto_unbox = TRUE, null = "null",
+                                     na = "null", digits = NA)
+  }
   emit(list(
     type = "dataframe", id = id,
     # I(): a one-column frame must ship columns/types as arrays, not scalars.
-    columns = I(names(df)),
-    types = I(unname(vapply(df, function(col) class(col)[1L], character(1)))),
-    nrow = nrow(df), ncol = ncol(df),
-    truncated = nrow(df) > MAX_ROWS,
+    columns = I(names(head_df)),
+    types = I(source_types),
+    nrow = total_rows, ncol = total_cols,
+    shown = nrow(head_df), shownCols = ncol(head_df),
+    truncated = total_rows > nrow(head_df) || total_cols > ncol(head_df),
     rows = head_df
   ))
   invisible(NULL)
@@ -1388,9 +1833,24 @@ con <- file("stdin", open = "rt", blocking = TRUE)
 # The ready frame says WHICH R this is. A session that silently uses the wrong
 # installation looks identical to one using the right one until `library(tna)`
 # fails — so the home and the library count are reported up front.
+# The command vocabulary, announced.
+#
+# An unknown command is SILENTLY IGNORED by the dispatch loop (no else, no
+# error), which is the right call for a protocol that must not die on a
+# stray frame — but it means a client asking an older kernel for a command
+# it has never heard of waits out its own timeout and then guesses why. The
+# import wizard's `choose` allowed 320 s for a human at a file dialog, so an
+# old kernel turned "Import Data…" into five minutes of nothing.
+#
+# Advertising the vocabulary lets a client know instantly. Kernels older than
+# this simply omit the field, and clients fall back to probing.
 emit(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
           # I(): a single library path must still ship as an array.
           home = R.home(), libs = I(.libPaths()),
+          commands = I(c("exec", "env", "obj", "struct", "parse", "format",
+                         "complete", "packages", "package_action", "package_help",
+                         "help", "hover", "wd", "files", "choose", "sniff",
+                         "import", "readfile", "writefile", "view", "rm")),
           packages = length(rownames(utils::installed.packages()))))
 
 repeat {
@@ -1426,11 +1886,16 @@ repeat {
   if (identical(cmd$type, "parse"))    emit_parse(cmd$id, cmd$source)
   if (identical(cmd$type, "format"))   emit_format(cmd$id, cmd$source)
   if (identical(cmd$type, "complete")) emit_complete(cmd$id, cmd$line, cmd$cursor)
-  if (identical(cmd$type, "packages")) emit_packages(cmd$id)
+  if (identical(cmd$type, "packages")) emit_packages(cmd$id, cmd$scope)
+  if (identical(cmd$type, "package_action")) emit_package_action(cmd$id, cmd$action, cmd$name, cmd$lib)
+  if (identical(cmd$type, "package_help")) emit_package_help(cmd$id, cmd$name)
   if (identical(cmd$type, "help"))     emit_help(cmd$id, cmd$topic)
   if (identical(cmd$type, "hover"))    emit_hover(cmd$id, cmd$name)
   if (identical(cmd$type, "wd"))       emit_wd(cmd$id, cmd$path)
   if (identical(cmd$type, "files"))    emit_files(cmd$id, cmd$path)
+  if (identical(cmd$type, "choose"))   emit_choose(cmd$id, cmd$mode, cmd$start, cmd$prompt,
+                                                    cmd$probeOnly)
+  if (identical(cmd$type, "sniff"))    emit_sniff(cmd$id, cmd$path, cmd$opts)
   if (identical(cmd$type, "import"))   emit_import(cmd$id, cmd$path, cmd$name)
   if (identical(cmd$type, "readfile"))  emit_readfile(cmd$id, cmd$path)
   if (identical(cmd$type, "writefile")) emit_writefile(cmd$id, cmd$path, cmd$text)
@@ -1441,7 +1906,9 @@ repeat {
                                                  sort = cmd$sort,
                                                  desc = isTRUE(cmd$desc),
                                                  col_offset = cmd$colOffset,
-                                                 col_limit = cmd$colLimit)
+                                                 col_limit = cmd$colLimit,
+                                                 query = cmd$query,
+                                                 filters = cmd$filters)
   if (identical(cmd$type, "rm"))       emit_rm(cmd$id, cmd$names)
   invisible(NULL)
   }
