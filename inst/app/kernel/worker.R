@@ -1495,12 +1495,6 @@ harvest_plots <- function(id, dir, seen, dims = NULL) {
 #' @param df A data.frame.
 #' @return Invisibly NULL.
 emit_dataframe <- function(id, df) {
-  # Row names travel when they carry information. `head(mtcars)` prints the car
-  # names and a table of the same frame without them is a different table; a
-  # regression frame's row names are the terms. Matrices already did this
-  # (matrix_to_df) and data frames did not, so the same object printed as a
-  # matrix kept its labels and printed as a frame lost them.
-  df <- with_rownames(df)
   # A returned value is a NOTEBOOK PREVIEW, not the data viewer. Bounding rows
   # alone is insufficient: one list-column cell may contain a fitted model and
   # one character cell may contain megabytes. Serialising either recursively
@@ -1513,8 +1507,19 @@ emit_dataframe <- function(id, df) {
   cell_chars <- 160L
   preview_bytes <- 256L * 1024L
   total_rows <- nrow(df)
-  total_cols <- ncol(df)
-  shown_cols <- if (total_cols) seq_len(min(total_cols, preview_cols)) else integer(0)
+  data_cols <- ncol(df)
+
+  # R stores default 1..n row names compactly. Calling rownames(df) expands that
+  # ALTREP to millions of strings, and the old identical(... seq_len(n)) check
+  # built a second vector just to decide there was nothing to show. type=1 asks
+  # R whether names are automatic without materialising them; explicit names
+  # are sliced from the raw attribute only AFTER the 25-row preview is taken.
+  explicit_rownames <- .row_names_info(df, type = 1L) > 0L
+  total_cols <- data_cols + as.integer(explicit_rownames)
+  data_col_cap <- max(0L, preview_cols - as.integer(explicit_rownames))
+  shown_cols <- if (data_cols && data_col_cap) {
+    seq_len(min(data_cols, data_col_cap))
+  } else integer(0)
   source_types <- if (length(shown_cols)) {
     unname(vapply(df[shown_cols], function(col) class(col)[1L], character(1)))
   } else character(0)
@@ -1558,6 +1563,17 @@ emit_dataframe <- function(id, df) {
 
   head_df <- utils::head(df[shown_cols], preview_rows)
   if (ncol(head_df)) head_df[] <- lapply(head_df, safe_column, rows = nrow(head_df))
+  # Informative row names are data (car names in mtcars, coefficient terms in
+  # model summaries), but only their preview travels. Never cbind them onto the
+  # full frame: that copies every column before head() and makes display time
+  # scale with the entire object rather than the 25 cells the user will see.
+  if (explicit_rownames) {
+    raw_names <- attr(df, "row.names", exact = TRUE)
+    shown_names <- as.character(utils::head(raw_names, nrow(head_df)))
+    head_df <- cbind(data.frame(rowname = shown_names, stringsAsFactors = FALSE),
+                     head_df)
+    source_types <- c("character", source_types)
+  }
   preview_json <- jsonlite::toJSON(head_df, auto_unbox = TRUE, null = "null",
                                    na = "null", digits = NA)
   while (nchar(preview_json, type = "bytes") > preview_bytes && nrow(head_df) > 1L) {
@@ -1576,24 +1592,6 @@ emit_dataframe <- function(id, df) {
     rows = head_df
   ))
   invisible(NULL)
-}
-
-#' Promote informative row names to a leading `rowname` column.
-#'
-#' "Informative" excludes the two cases where row names are an artefact rather
-#' than data: absent, and the default 1..n that every frame built without them
-#' carries. Blank names — what `summary.data.frame()` produces — are excluded
-#' too, since a column of empty strings is noise in every view that renders it.
-#'
-#' @param df A data frame.
-#' @return The frame, with `rowname` first when the names said something.
-with_rownames <- function(df) {
-  rn <- rownames(df)
-  informative <- !is.null(rn) &&
-    !identical(rn, as.character(seq_len(nrow(df)))) &&
-    any(nzchar(trimws(rn)))
-  if (!informative) return(df)
-  cbind(rowname = rn, df, stringsAsFactors = FALSE)
 }
 
 #' Files named by an htmltools dependency slot, whatever shape it arrived in.

@@ -24,6 +24,8 @@
 #' \dontrun{
 #' carmar::run()
 #' }
+#' @importFrom httpuv startServer
+#' @importFrom openssl rand_bytes
 #' @export
 run <- function(port = 4747, open = TRUE) {
   stopifnot(is.numeric(port), length(port) == 1L, port > 0, port < 65536)
