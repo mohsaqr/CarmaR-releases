@@ -1,6 +1,6 @@
 \name{upgrade}
 \alias{upgrade}
-\title{Upgrade the CarmaR notebook}
+\title{Upgrade CarmaR --- the notebook and the package}
 \usage{
 upgrade(quiet = FALSE)
 }
@@ -8,12 +8,15 @@ upgrade(quiet = FALSE)
 \item{quiet}{Say nothing unless something was updated? Default \code{FALSE}.}
 }
 \value{
-Invisibly, \code{TRUE} if a newer notebook was downloaded.
+Invisibly, \code{TRUE} if anything was updated.
 }
 \description{
-Downloads the newest notebook from the course's release page into your user
-data folder, where the kernel finds it on the next reload. This is the fast
-channel: the notebook is one small file and a release is live seconds after
-the instructor publishes it --- no package rebuild, no reinstall.
-\code{run()} also checks quietly whenever it starts a kernel.
+Reads the release feed once and updates BOTH halves of an installation: the
+newest notebook is downloaded into your user data folder, and when the
+release is newer than the installed carmar package, the release's own
+package is installed too. You never need to call this: \code{run()} does it
+on EVERY call --- the launcher icon included, since the icon is \code{run()}
+with a picture on it --- so every click checks for updated versions.
+Neither check may block or fail a launch: any trouble is a quiet no-op and
+CarmaR starts on what it has.
 }

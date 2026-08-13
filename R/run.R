@@ -169,33 +169,43 @@ sync_notebook <- function(app = dirname(system.file("app", "kernel", package = "
     file.copy(best, file.path(app, basename(best)), overwrite = TRUE))))
 }
 
-#' Upgrade the CarmaR notebook
+#' Upgrade CarmaR — the notebook and the package
 #'
-#' Downloads the newest notebook from the course's release page into your
-#' user data folder. You never need to call this: `run()` does it on EVERY
-#' call — including when it reconnects to a kernel that is already running
-#' — so `run()` always serves the latest. The notebook is one small file
-#' and a release is live seconds after the instructor publishes it — no
-#' package rebuild, no r-universe wait, no reinstall.
+#' Reads the release feed once and updates BOTH halves of an installation:
+#' the newest notebook is downloaded into your user data folder, and when the
+#' release is newer than the installed carmar package, the release's own
+#' package is installed too. You never need to call this: `run()` does it on
+#' EVERY call — the launcher icon included, since the icon is `run()` with a
+#' picture on it — so every click checks for updated versions. Neither check
+#' may block or fail a launch: any trouble is a quiet no-op and CarmaR starts
+#' on what it has.
 #'
 #' @param quiet Say nothing unless something was updated? Default `FALSE`.
-#' @return Invisibly, `TRUE` if a newer notebook was downloaded.
+#' @return Invisibly, `TRUE` if anything was updated.
 #' @export
 upgrade <- function(quiet = FALSE) {
   say <- function(...) if (!quiet) message(...)
   feed <- Sys.getenv("CARMAR_FEED",
     "https://api.github.com/repos/mohsaqr/CarmaR-releases/releases/latest")
-  dist <- file.path(tools::R_user_dir("carmar", "data"), "dist")
-  dir.create(dist, recursive = TRUE, showWarnings = FALSE)
-
   rel <- tryCatch(jsonlite::fromJSON(paste(slurp(feed), collapse = "\n"),
                                      simplifyVector = FALSE),
                   error = function(e) NULL)
   if (is.null(rel)) { say("The release page is unreachable - no update check."); return(invisible(FALSE)) }
+  nb <- upgrade_notebook(rel, say)
+  pkg <- upgrade_package(rel, say)
+  invisible(isTRUE(nb) || isTRUE(pkg))
+}
+
+#' The notebook half of `upgrade()`: newest `carmar_V*.html` into the
+#' per-user dist. One release JSON in, `TRUE` if a newer file landed.
+#' @keywords internal
+upgrade_notebook <- function(rel, say) {
+  dist <- file.path(tools::R_user_dir("carmar", "data"), "dist")
+  dir.create(dist, recursive = TRUE, showWarnings = FALSE)
   assets <- rel$assets %||% list()
   names_ <- vapply(assets, function(a) a$name %||% "", character(1))
   hit <- grepl("^carmar_V[0-9.]+\\.html$", names_)
-  if (!any(hit)) { say("No notebook in the latest release."); return(invisible(FALSE)) }
+  if (!any(hit)) { say("No notebook in the latest release."); return(FALSE) }
   best <- which(hit)[order(numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", names_[hit])),
                            decreasing = TRUE)][1]
   want_name <- names_[[best]]
@@ -204,7 +214,7 @@ upgrade <- function(quiet = FALSE) {
   have <- list.files(c(dist, dirname(system.file("app", "kernel", package = "carmar"))),
                      pattern = "^carmar_V.*\\.html$")
   have_v <- if (length(have)) max(numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", have))) else numeric_version("0")
-  if (want_v <= have_v) { say("CarmaR is up to date (", as.character(have_v), ")."); return(invisible(FALSE)) }
+  if (want_v <= have_v) { say("CarmaR is up to date (", as.character(have_v), ")."); return(FALSE) }
 
   target <- file.path(dist, want_name)
   part <- paste0(target, ".part")
@@ -216,11 +226,53 @@ upgrade <- function(quiet = FALSE) {
   if (ok && file.exists(part) && file.size(part) > 10000) {
     file.rename(part, target)
     say("Updated to ", want_name, " - reload the CarmaR tab (or run carmar::run()).")
-    return(invisible(TRUE))
+    return(TRUE)
   }
   unlink(part)
   say("The update download failed - CarmaR keeps working on its current version.")
-  invisible(FALSE)
+  FALSE
+}
+
+#' The package half of `upgrade()`: when the release tag outruns the
+#' installed carmar, install the release's own `carmar.tar.gz` — the same
+#' payload the feed announced, so the check and the install can never
+#' disagree about what "latest" means. The kernel a launch spawns AFTER this
+#' reads serve.R from the new files, so the update takes effect immediately;
+#' only the R code of the session that ran the update stays old until the
+#' next launch. Verified by re-reading the installed version — a failed
+#' `R CMD INSTALL` only warns, it does not throw.
+#' @keywords internal
+upgrade_package <- function(rel, say) {
+  want <- tryCatch(numeric_version(sub("^[vV]", "", rel$tag_name %||% "")),
+                   error = function(e) NULL)
+  have <- tryCatch(utils::packageVersion("carmar"), error = function(e) NULL)
+  if (is.null(want) || is.null(have) || want <= have) return(FALSE)
+  assets <- rel$assets %||% list()
+  names_ <- vapply(assets, function(a) a$name %||% "", character(1))
+  hit <- which(names_ == "carmar.tar.gz")
+  if (!length(hit)) return(FALSE)
+
+  say("Updating the carmar package ", as.character(have), " -> ",
+      as.character(want), " ...")
+  part <- tempfile("carmar-", fileext = ".tar.gz")
+  on.exit(unlink(part), add = TRUE)
+  got <- tryCatch({
+    old <- options(timeout = 300); on.exit(options(old), add = TRUE)
+    utils::download.file(assets[[hit[1]]]$browser_download_url, part,
+                         mode = "wb", quiet = TRUE) == 0
+  }, error = function(e) FALSE)
+  if (!got || !file.exists(part) || file.size(part) < 1000) {
+    say("The package update download failed - CarmaR keeps its current version.")
+    return(FALSE)
+  }
+  ok <- tryCatch({
+    suppressWarnings(utils::install.packages(part, repos = NULL,
+                                             type = "source", quiet = TRUE))
+    isTRUE(utils::packageVersion("carmar") >= want)
+  }, error = function(e) FALSE)
+  if (ok) say("The carmar package is now ", as.character(want), ".")
+  else say("The package update could not be installed - CarmaR keeps its current version.")
+  ok
 }
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
