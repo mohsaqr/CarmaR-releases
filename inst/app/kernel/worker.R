@@ -1848,8 +1848,10 @@ emit(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
           commands = I(c("exec", "env", "obj", "struct", "parse", "format",
                          "complete", "packages", "package_action", "package_help",
                          "help", "hover", "wd", "files", "choose", "sniff",
-                         "import", "readfile", "writefile", "view", "rm")),
-          packages = length(rownames(utils::installed.packages()))))
+                         "import", "readfile", "writefile", "view", "rm"))))
+# (No package count here on purpose: installed.packages() reads every
+# package's DESCRIPTION — 0.3–1.8 s on a big library — and no client ever
+# consumed the number. The packages PANE asks the `packages` op on demand.)
 
 repeat {
   line <- read_command(con)

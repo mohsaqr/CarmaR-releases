@@ -68,7 +68,7 @@ audit <- function(event, ...) {
           append = TRUE), silent = TRUE)
 }
 
-k <- kernel_start(file.path(here, "worker.R"))
+k <- kernel_start(file.path(here, "worker-boot.R"))
 sockets <- new.env(parent = emptyenv())
 # Each connection is a RECORD (an environment), not a bare ws: the MCP plane
 # below needs to know which socket is a notebook page and which is an agent,
@@ -87,6 +87,22 @@ sockets$mcp_pending <- new.env(parent = emptyenv())
 # Subscription chats: id → record of one running `claude -p` process, owned by
 # the page socket that asked. See the agent-chat frames in handle_frame.
 sockets$chats <- new.env(parent = emptyenv())
+# Idle linger: a kernel nobody is connected to stops itself, so closing the
+# notebook tab does not strand an R process (and five stranded days do not
+# greet day six with the capacity prompt). The clock starts when the LAST
+# socket — page or agent — closes, and only while the worker is idle: a run
+# someone left cooking finishes first, and the finished session then waits a
+# full grace period for its page to come back (a reload or auto-reattach
+# cancels the clock). CARMAR_LINGER is the grace in seconds; 0 or negative
+# disables. The clock never starts before the first connection ever, so a
+# slow browser launch cannot lose the kernel it was opening.
+linger_s <- suppressWarnings(as.numeric(Sys.getenv("CARMAR_LINGER", "600")))
+if (!length(linger_s) || !is.finite(linger_s)) linger_s <- 600
+# Runs in flight: exec id → TRUE, cleared when the worker's done frame for
+# that id comes back through pump(). This is the busy guard's whole evidence.
+sockets$running <- new.env(parent = emptyenv())
+sockets$ever_connected <- FALSE
+sockets$idle_since <- NULL
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
@@ -325,6 +341,7 @@ app <- list(
     rec$role <- "page"
     rec$name <- ""
     sockets$open <- c(sockets$open, rec)
+    sockets$ever_connected <- TRUE
     audit("socket-open", sockets = length(sockets$open))
     if (!is.null(sockets$hello)) try(ws$send(sockets$hello), silent = TRUE)
     # Replay the agent roster too — same lesson as the ready frame: a page
@@ -670,6 +687,7 @@ handle_frame <- function(message, rec) {
   if (identical(cmd$type, "exec")) {
     if (!scalar_chr(cmd$id) || !scalar_chr(cmd$source)) return(invisible(NULL))
     audit("exec", id = cmd$id, bytes = nchar(cmd$source, type = "bytes"))
+    assign(cmd$id, TRUE, envir = sockets$running)
     return(invisible(kernel_exec(k, cmd$id, cmd$source, cmd$dims)))
   }
   if (identical(cmd$type, "interrupt")) {
@@ -682,8 +700,11 @@ handle_frame <- function(message, rec) {
   if (identical(cmd$type, "restart")) {
     audit("restart")
     try(kernel_stop(k, grace = 1), silent = TRUE)
-    k <<- kernel_start(file.path(here, "worker.R"))
+    k <<- kernel_start(file.path(here, "worker-boot.R"))
     sockets$hello <- NULL
+    # In-flight runs died with the old worker; the new one will never emit
+    # their done frames, and a stuck entry would block idle linger forever.
+    rm(list = ls(sockets$running), envir = sockets$running)
     return(invisible(NULL))
   }
   if (cmd$type %in% FORWARDED) {
@@ -713,6 +734,14 @@ pump <- function() {
   payload <- vapply(events, function(e) toJSON(e, auto_unbox = TRUE), character(1))
   ready_at <- which(vapply(events, function(e) identical(e$type, "ready"), logical(1)))
   if (length(ready_at) > 0L) sockets$hello <- payload[[ready_at[[1L]]]]
+  # A done frame retires its run from the in-flight set even when no socket
+  # is left to deliver it to — that is the moment the idle clock may start.
+  lapply(events, function(e) {
+    if (identical(e$type, "done") && length(e$id) == 1L && is.character(e$id) &&
+        exists(e$id, envir = sockets$running, inherits = FALSE)) {
+      rm(list = e$id, envir = sockets$running)
+    }
+  })
   lapply(sockets$open, function(r) {
     lapply(payload, function(p) try(r$ws$send(p), silent = TRUE))
   })
@@ -771,12 +800,32 @@ if ("--open" %in% commandArgs(trailingOnly = TRUE)) {
   try(utils::browseURL(file_url), silent = TRUE)
 }
 
+#' Idle linger, decided once per loop turn: nobody connected, nothing running,
+#' grace elapsed → the same deliberate shutdown /shutdown performs. Any open
+#' socket or in-flight run resets the clock entirely.
+linger_check <- function() {
+  if (linger_s <= 0 || !isTRUE(sockets$ever_connected)) return(invisible(NULL))
+  idle <- length(sockets$open) == 0L && length(ls(sockets$running)) == 0L
+  if (!idle) { sockets$idle_since <- NULL; return(invisible(NULL)) }
+  now <- Sys.time()
+  if (is.null(sockets$idle_since)) {
+    sockets$idle_since <- now
+    return(invisible(NULL))
+  }
+  if (as.numeric(difftime(now, sockets$idle_since, units = "secs")) >= linger_s) {
+    audit("linger-shutdown", grace = linger_s)
+    sockets$quit <- TRUE
+  }
+  invisible(NULL)
+}
+
 # The event loop. `service()` returns at least every 50ms whatever the worker is
 # doing, because the worker is a different process — that is the whole design.
 repeat {
   httpuv::service(50)
   pump()
   pump_chats()
+  linger_check()
   if (isTRUE(sockets$quit)) break
   if (!k$proc$is_alive()) {
     lapply(sockets$open, function(r)

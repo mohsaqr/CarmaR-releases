@@ -148,26 +148,92 @@ run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
   invisible(page)
 }
 
+#' List CarmaR sessions
+#'
+#' Every CarmaR kernel recorded on this machine — package launches (the
+#' `url-<port>` state records) and every other door (the shared
+#' `~/.carmar/run/kernel-<port>.json` runtime registry) — one row per port,
+#' each health-checked at call time. Read-only: dead records are reported,
+#' not removed (`run()` prunes them on its next launch). Kernels also stop
+#' themselves after sitting idle with no notebook attached (`CARMAR_LINGER`,
+#' default 600 seconds), so a dead row is the ordinary afterlife of a
+#' closed tab.
+#'
+#' @return A `data.frame`, one row per recorded session, ports ascending:
+#'   `port` (integer), `alive` (logical), `page` (the notebook file URL that
+#'   reopens the session; `NA` when it is not running), `source`
+#'   (`"package"` for `run()` launches, `"runtime"` for other doors).
+#' @examples
+#' \dontrun{
+#' carmar::sessions()
+#' carmar::stop_kernel("all")
+#' }
+#' @export
+sessions <- function() {
+  state <- tools::R_user_dir("carmar", "data")
+  runtime_dir <- Sys.getenv("CARMAR_RUNTIME_DIR",
+                            file.path(path.expand("~"), ".carmar", "run"))
+  state_files <- list.files(state, pattern = "^url-[0-9]+$", full.names = TRUE)
+  runtime_files <- list.files(runtime_dir, pattern = "^kernel-[0-9]+\\.json$",
+                              full.names = TRUE)
+  read_url <- function(f) {
+    u <- if (grepl("[.]json$", f)) {
+      tryCatch(jsonlite::fromJSON(f, simplifyVector = TRUE)$url,
+               error = function(e) NULL)
+    } else {
+      tryCatch(readLines(f, warn = FALSE, n = 1L), error = function(e) NULL)
+    }
+    if (length(u) == 1L && is.character(u) && nzchar(u)) u else ""
+  }
+  files <- c(state_files, runtime_files)
+  origin <- rep(c("package", "runtime"),
+                c(length(state_files), length(runtime_files)))
+  ports <- as.integer(sub("^(url-|kernel-)([0-9]+).*$", "\\2", basename(files)))
+  keep <- !duplicated(ports)
+  o <- order(ports[keep])
+  files <- files[keep][o]; origin <- origin[keep][o]; ports <- ports[keep][o]
+  urls <- vapply(files, read_url, character(1), USE.NAMES = FALSE)
+  alive <- vapply(urls, function(u) nzchar(u) && kernel_alive(u), logical(1),
+                  USE.NAMES = FALSE)
+  page <- rep(NA_character_, length(ports))
+  page[alive] <- vapply(urls[alive], function(u)
+    tryCatch(notebook_launch_url(u, state), error = function(e) NA_character_),
+    character(1), USE.NAMES = FALSE)
+  data.frame(port = ports, alive = alive, page = page, source = origin,
+             stringsAsFactors = FALSE)
+}
+
 #' Stop the CarmaR kernel
 #'
 #' Asks the kernel on `port` to shut down through its loopback-only `/shutdown`
-#' endpoint — the clean path, the same one the notebook's Quit uses.
+#' endpoint — the clean path, the same one the notebook's Quit uses. Pass
+#' `"all"` to stop every live session `sessions()` can see.
 #'
-#' @param port The port `run()` used. Default 4747.
+#' @param port The port `run()` used (default 4747), or `"all"`.
 #' @return Invisibly, `TRUE` if a kernel was asked to stop, `FALSE` if none
-#'   was running.
+#'   was running; for `"all"`, one such value per live session (empty when
+#'   none were running).
 #' @export
 stop_kernel <- function(port = 4747) {
+  if (identical(port, "all")) {
+    live <- sessions()
+    live <- live[live$alive, , drop = FALSE]
+    if (!nrow(live)) { message("No CarmaR kernels are running."); return(invisible(logical(0))) }
+    return(invisible(vapply(live$port, stop_kernel, logical(1))))
+  }
+  stopifnot(is.numeric(port), length(port) == 1L, port > 0, port < 65536)
+  port <- as.integer(port)
   state <- tools::R_user_dir("carmar", "data")
   url_file <- file.path(state, paste0("url-", port))
-  if (!file.exists(url_file)) { message("No CarmaR kernel recorded on port ", port, "."); return(invisible(FALSE)) }
-  u <- readLines(url_file, warn = FALSE)[1]
-  if (!nzchar(u) || !kernel_alive(u)) {
+  known <- sessions()
+  row <- known[known$port == port, , drop = FALSE]
+  if (!nrow(row)) { message("No CarmaR kernel recorded on port ", port, "."); return(invisible(FALSE)) }
+  if (!row$alive[[1]]) {
     unlink(url_file)
     message("No CarmaR kernel is running on port ", port, ".")
     return(invisible(FALSE))
   }
-  ask <- paste0(kernel_base(u), "/shutdown")
+  ask <- sprintf("http://127.0.0.1:%d/shutdown", port)
   ok <- tryCatch({ slurp(ask); TRUE }, error = function(e) FALSE)
   if (ok) { unlink(url_file); message("CarmaR kernel on port ", port, " is stopping.") }
   invisible(ok)
