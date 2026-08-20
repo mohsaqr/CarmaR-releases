@@ -1,17 +1,16 @@
 Package: carmar
 Type: Package
 Title: CarmaR - an R Notebook That Runs on Your Own R
-Version: 0.35
+Version: 0.41.0
 Authors@R: person("Mohammed", "Saqr", email = "saqr@saqr.me", role = c("aut", "cre"))
 Description: A single-file R notebook served from a local kernel: your R, your
     packages, your files. The package carries the notebook and its kernel;
-    carmar::run() starts the kernel (or reuses a running one) and opens the
+    carmar::run() starts an independent kernel and opens the
     notebook in the browser. Built for classrooms: one install, one call.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Imports:
     httpuv,
     jsonlite,
-    openssl,
     processx
 RoxygenNote: 7.3.2

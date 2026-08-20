@@ -24,7 +24,7 @@ launch_r_code <- function() {
     "# CarmaR bootstrap - written by carmar::install_app().\n",
     "# The launcher runs this with the R it found on this machine.\n",
     "cran <- \"https://cloud.r-project.org\"\n",
-    "need <- c(\"httpuv\", \"jsonlite\", \"openssl\", \"processx\")\n",
+    "need <- c(\"httpuv\", \"jsonlite\", \"processx\")\n",
     "miss <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]\n",
     "if (length(miss)) {\n",
     "  message(\"CarmaR is preparing this R installation: \", paste(miss, collapse = \", \"), \" ...\")\n",

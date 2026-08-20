@@ -10,8 +10,9 @@
 
 #' Launch CarmaR
 #'
-#' Starts the local CarmaR kernel — or reuses one already running on the same
-#' port — and opens the notebook in the default browser. The kernel is a
+#' Starts an independent local CarmaR kernel and opens the notebook in the
+#' default browser. Up to five sessions start directly; starting a sixth asks
+#' first. The kernel is a
 #' separate R process; closing the R session that called `run()` does not
 #' close the notebook.
 #'
@@ -19,19 +20,26 @@
 #'   browsers keep a page's saved notebooks per address, so a kernel that
 #'   moved ports would greet the student with an empty notebook every time.
 #' @param open Open the browser once the kernel answers? Default `TRUE`.
-#' @return Invisibly, the notebook URL (with its access token).
+#' @param new Start an independent session? Default `TRUE`. Set `FALSE` to
+#'   reopen a live session on `port` when there is one.
+#' @param allow_more Confirmation override after five live sessions. Leave
+#'   `NULL` for an explicit prompt, `TRUE` to allow, or `FALSE` to reopen the
+#'   newest existing session.
+#' @return Invisibly, the versioned notebook file URL with its kernel selected.
 #' @examples
 #' \dontrun{
 #' carmar::run()
+#' carmar::run(new = FALSE) # reopen the session on port 4747
 #' }
 #' @importFrom httpuv startServer
-#' @importFrom openssl rand_bytes
 #' @export
-run <- function(port = 4747, open = TRUE) {
+run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
   stopifnot(is.numeric(port), length(port) == 1L, port > 0, port < 65536)
+  stopifnot(is.logical(new), length(new) == 1L, !is.na(new))
+  if (!is.null(allow_more)) stopifnot(is.logical(allow_more), length(allow_more) == 1L,
+                                      !is.na(allow_more))
   state <- tools::R_user_dir("carmar", "data")
   dir.create(state, recursive = TRUE, showWarnings = FALSE)
-  url_file <- file.path(state, paste0("url-", port))
 
   # The fast channel runs on EVERY call — including the reuse path below.
   # The first version upgraded only on a fresh launch, and the reuse branch
@@ -44,15 +52,34 @@ run <- function(port = 4747, open = TRUE) {
   # the very next reload.
   try(sync_notebook(), silent = TRUE)
 
-  # Second call means "take me back", never "start a second kernel".
-  if (file.exists(url_file)) {
-    u <- readLines(url_file, warn = FALSE)[1]
-    if (nzchar(u) && kernel_alive(u)) {
-      if (open) utils::browseURL(u)
-      message("CarmaR is already running: ", u)
-      return(invisible(u))
-    }
+  live <- live_kernel_urls(state)
+  at_port <- live[vapply(live, kernel_port, integer(1)) == as.integer(port)]
+  if (!new && length(at_port)) {
+    u <- unname(at_port[[1]])
+    page <- notebook_launch_url(u, state)
+    if (open) utils::browseURL(page)
+    message("CarmaR is already running behind: ", page)
+    return(invisible(page))
   }
+
+  if (new && length(live) >= 5L && !confirm_more_sessions(length(live), allow_more)) {
+    u <- unname(live[[1]])
+    page <- notebook_launch_url(u, state)
+    if (open) utils::browseURL(page)
+    message("Kept the existing ", length(live), " CarmaR sessions; reopened: ", page)
+    return(invisible(page))
+  }
+
+  # Independent sessions get stable adjacent origins. That preserves browser
+  # storage per session while making the ordinary five predictable.
+  used <- vapply(live, kernel_port, integer(1))
+  chosen <- NA_integer_
+  for (candidate in seq.int(as.integer(port), 65535L)) {
+    if (!candidate %in% used && port_is_free(candidate)) { chosen <- candidate; break }
+  }
+  port <- chosen
+  if (is.na(port)) stop("No free local port is available for another CarmaR session.")
+  url_file <- file.path(state, paste0("url-", port))
 
   serve <- system.file("app", "kernel", "serve.R", package = "carmar")
   if (!nzchar(serve)) stop("carmar is not installed correctly (serve.R is missing) - reinstall the package.")
@@ -72,10 +99,15 @@ run <- function(port = 4747, open = TRUE) {
   # just line one — a startup warning ahead of the announcement must not make
   # a healthy kernel look dead.
   u <- NULL
+  page <- NULL
   for (i in seq_len(240)) {
     lines <- tryCatch(readLines(log, warn = FALSE), error = function(e) character(0))
-    hit <- unlist(regmatches(lines, regexpr('"url":"[^"]+"', lines)))
-    if (length(hit)) { u <- sub('"$', "", sub('^"url":"', "", hit[1])); break }
+    hit <- grep('"url"', lines, value = TRUE)
+    if (length(hit)) {
+      rec <- tryCatch(jsonlite::fromJSON(hit[[1]], simplifyVector = TRUE),
+                      error = function(e) NULL)
+      if (!is.null(rec$url)) { u <- rec$url; page <- rec$file %||% NULL; break }
+    }
     if (!p$is_alive()) break
     Sys.sleep(0.5)
   }
@@ -93,7 +125,8 @@ run <- function(port = 4747, open = TRUE) {
          if (length(tail_lines)) paste0("\nLast lines:\n",
            paste(utils::tail(tail_lines, 5), collapse = "\n")) else "")
   }
-  # serve.R falls back to a random free port when the asked-for one is busy —
+  # serve.R still falls back to a random free port if a race claims the chosen
+  # port between our check and startup —
   # better than dying, but saved notebooks are kept PER PORT (per browser
   # origin), so a silent fallback greets the student with an empty notebook.
   # Say it in plain words instead.
@@ -104,19 +137,21 @@ run <- function(port = 4747, open = TRUE) {
             "live per port - to get your usual notebook back, quit whatever ",
             "uses port ", port, " and run carmar::run() again.")
   }
+  if (!is.na(got) && got != port) url_file <- file.path(state, paste0("url-", got))
   writeLines(u, url_file)
-  if (open) utils::browseURL(u)
+  if (is.null(page) || !nzchar(page)) page <- notebook_launch_url(u, state)
+  if (open) utils::browseURL(page)
   # ALWAYS printed, clickable in the RStudio console — the browser not
   # opening (locked-down default browser, broken association) must never
   # strand a student without the address.
-  message("CarmaR is running. If no browser tab opened, click or copy:\n  ", u)
-  invisible(u)
+  message("CarmaR is running behind this notebook file:\n  ", page)
+  invisible(page)
 }
 
 #' Stop the CarmaR kernel
 #'
-#' Asks the kernel on `port` to shut down, through its own token-gated
-#' `/shutdown` — the clean path, the same one the notebook's Quit uses.
+#' Asks the kernel on `port` to shut down through its loopback-only `/shutdown`
+#' endpoint — the clean path, the same one the notebook's Quit uses.
 #'
 #' @param port The port `run()` used. Default 4747.
 #' @return Invisibly, `TRUE` if a kernel was asked to stop, `FALSE` if none
@@ -132,7 +167,7 @@ stop_kernel <- function(port = 4747) {
     message("No CarmaR kernel is running on port ", port, ".")
     return(invisible(FALSE))
   }
-  ask <- sub("/\\?token=", "/shutdown?token=", u, fixed = FALSE)
+  ask <- paste0(kernel_base(u), "/shutdown")
   ok <- tryCatch({ slurp(ask); TRUE }, error = function(e) FALSE)
   if (ok) { unlink(url_file); message("CarmaR kernel on port ", port, " is stopping.") }
   invisible(ok)
@@ -279,8 +314,91 @@ upgrade_package <- function(rel, say) {
 
 #' Is the kernel behind this notebook URL answering? @noRd
 kernel_alive <- function(u) {
-  health <- sub("/\\?token=.*$", "/health", u)
+  health <- paste0(kernel_base(u), "/health")
   tryCatch(length(slurp(health)) > 0, error = function(e) FALSE)
+}
+
+#' URL origin for both current clean records and legacy tokenized records. @noRd
+kernel_base <- function(u) sub("/+$", "", sub("/\\?token=.*$", "", u))
+
+#' Versioned notebook file with a hidden kernel selector in its fragment. @noRd
+notebook_launch_url <- function(kernel_url,
+                                state = tools::R_user_dir("carmar", "data")) {
+  app <- dirname(system.file("app", "kernel", package = "carmar"))
+  dirs <- unique(c(file.path(state, "dist"), if (nzchar(app)) app,
+                   file.path(getwd(), "dist")))
+  files <- unlist(lapply(dirs, function(d)
+    list.files(d, pattern = "^carmar_V[0-9.]+\\.html$", full.names = TRUE)))
+  if (!length(files)) stop("The versioned CarmaR notebook file is missing; reinstall CarmaR.")
+  versions <- numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", basename(files)))
+  file <- normalizePath(files[order(versions, decreasing = TRUE)][1], winslash = "/")
+  prefix <- if (startsWith(file, "/")) "file://" else "file:///"
+  paste0(prefix, utils::URLencode(file, reserved = FALSE),
+         "#kernel=", kernel_port(kernel_url))
+}
+
+#' Port number carried by a clean CarmaR URL. @noRd
+kernel_port <- function(u) {
+  hit <- regmatches(u, regexpr("(?<=:)[0-9]+(?=/|$)", u, perl = TRUE))
+  if (!length(hit)) NA_integer_ else suppressWarnings(as.integer(hit))
+}
+
+#' Live package-launched kernels, newest records first. @noRd
+live_kernel_urls <- function(state = tools::R_user_dir("carmar", "data")) {
+  state_files <- list.files(state, pattern = "^url-[0-9]+$", full.names = TRUE)
+  runtime_dir <- Sys.getenv("CARMAR_RUNTIME_DIR",
+                            file.path(path.expand("~"), ".carmar", "run"))
+  runtime_files <- list.files(runtime_dir, pattern = "^kernel-[0-9]+\\.json$",
+                              full.names = TRUE)
+  files <- c(state_files, runtime_files)
+  if (!length(files)) return(character())
+  files <- files[order(file.info(files)$mtime, decreasing = TRUE)]
+  urls <- vapply(files, function(f) {
+    u <- if (grepl("[.]json$", f)) tryCatch(
+      jsonlite::fromJSON(f, simplifyVector = TRUE)$url %||% "",
+      error = function(e) "") else tryCatch(
+      readLines(f, warn = FALSE, n = 1L), error = function(e) "")
+    if (length(u) && nzchar(u[[1]]) && kernel_alive(u[[1]])) u[[1]]
+    else {
+      # Package state is ours to prune. Runtime discovery files are shared
+      # across every launcher; remove only a record whose kernel is dead.
+      unlink(f)
+      ""
+    }
+  }, character(1))
+  live <- unname(urls[nzchar(urls)])
+  live[!duplicated(vapply(live, kernel_base, character(1)))]
+}
+
+#' Is a loopback port unused? @noRd
+port_is_free <- function(port) {
+  con <- suppressWarnings(tryCatch(socketConnection("127.0.0.1", port,
+    open = "r+", blocking = TRUE, timeout = 1), error = function(e) NULL))
+  if (is.null(con)) return(TRUE)
+  close(con)
+  FALSE
+}
+
+#' Explicitly authorize a sixth-or-later independent session. @noRd
+confirm_more_sessions <- function(count, allow_more = NULL) {
+  if (!is.null(allow_more)) return(isTRUE(allow_more))
+  question <- paste0(count, " CarmaR sessions are already running. Start another?")
+  env <- tolower(Sys.getenv("CARMAR_ALLOW_MORE", ""))
+  if (env %in% c("1", "true", "yes")) return(TRUE)
+  if (env %in% c("0", "false", "no")) return(FALSE)
+  if (interactive()) return(isTRUE(utils::askYesNo(question, default = FALSE)))
+  if (identical(Sys.info()[["sysname"]], "Darwin") && nzchar(Sys.which("osascript"))) {
+    script <- paste0('display dialog "', question,
+      '" buttons {"Keep five", "Start another"} default button "Keep five"')
+    answer <- suppressWarnings(system2("osascript", c("-e", shQuote(script)),
+      stdout = TRUE, stderr = FALSE))
+    return(any(grepl("button returned:Start another", answer, fixed = TRUE)))
+  }
+  if (.Platform$OS.type == "windows") {
+    return(identical(utils::winDialog("yesno", question), "YES"))
+  }
+  stop(question, " Run carmar::run(allow_more = TRUE) only if you want that.",
+       call. = FALSE)
 }
 
 #' readLines over http with a short timeout, connection always closed. @noRd

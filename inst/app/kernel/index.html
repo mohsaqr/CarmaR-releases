@@ -39,7 +39,7 @@
 
 <script>
   const params = new URLSearchParams(location.search);
-  const ws = new WebSocket(`ws://${location.host}/ws?token=${params.get('token') ?? ''}`);
+  const ws = new WebSocket(`ws://${location.host}/ws`);
   const out = document.getElementById('out');
   const status = document.getElementById('status');
   let n = 0;

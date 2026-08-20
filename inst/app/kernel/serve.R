@@ -30,7 +30,7 @@ host <- "127.0.0.1"
 #' to know why the last one forgot everything.
 #'
 #' A fixed loopback port is not a weaker position than a random one — the
-#' security boundary here is the CSPRNG token and the Host check below, not the
+#' browser boundary here is the Host + Origin/Sec-Fetch checks below, not the
 #' port number, which any local process can enumerate in milliseconds either
 #' way. If something else already holds it, fall back rather than refuse to
 #' start; that session gets its own storage, which is the old behaviour and is
@@ -47,40 +47,6 @@ port <- local({
   if (port_taken(wanted)) httpuv::randomPort() else wanted
 })
 
-#' A session token from the operating system's CSPRNG.
-#'
-#' `sample()` was wrong here and the reason is not pedantry: R's Mersenne
-#' Twister is seeded from the clock and the pid, both of which an attacker on
-#' the same machine can narrow to a small range, and MT state is recoverable
-#' from its own output. This token is the ONLY thing standing between a local
-#' process and arbitrary code execution in the user's R session, so it comes
-#' from /dev/urandom (or the Windows CSPRNG via openssl), and refuses to start
-#' rather than silently fall back to a guessable one.
-#'
-#' @param n Bytes of entropy; 24 bytes = 192 bits, hex-encoded to 48 chars.
-#' @return A hex string.
-random_token <- function(n = 24L) {
-  bytes <- NULL
-  if (file.exists("/dev/urandom")) {
-    # raw = TRUE: without it R warns that this is not a regular file, and that
-    # warning printed BEFORE the {"url":...} line the app launcher reads.
-    con <- file("/dev/urandom", open = "rb", raw = TRUE)
-    on.exit(close(con), add = TRUE)
-    bytes <- tryCatch(readBin(con, "raw", n = n), error = function(e) NULL)
-  }
-  if ((is.null(bytes) || length(bytes) != n) &&
-      requireNamespace("openssl", quietly = TRUE)) {
-    bytes <- tryCatch(openssl::rand_bytes(n), error = function(e) NULL)
-  }
-  if (is.null(bytes) || length(bytes) != n) {
-    stop("CarmaR could not obtain cryptographic randomness for its session ",
-         "token (no /dev/urandom and no openssl package). Refusing to start ",
-         "with a guessable token.", call. = FALSE)
-  }
-  paste(sprintf("%02x", as.integer(bytes)), collapse = "")
-}
-
-token <- random_token()
 origin_ok <- sprintf("http://%s:%d", host, port)
 # What a browser may claim to be talking to. Anything else is a DNS-rebinding
 # attempt: the attacker's page keeps its own origin while its hostname is
@@ -104,11 +70,23 @@ audit <- function(event, ...) {
 
 k <- kernel_start(file.path(here, "worker.R"))
 sockets <- new.env(parent = emptyenv())
+# Each connection is a RECORD (an environment), not a bare ws: the MCP plane
+# below needs to know which socket is a notebook page and which is an agent,
+# and httpuv's WebSocket objects are locked R6 instances that refuse new
+# fields. rec$ws is the socket; rec$role is "page" until the client declares
+# itself with mcp-hello; rec$name is the agent's self-description for the UI.
 sockets$open <- list()
 # The worker announces itself once, at server startup — long before any browser
 # connects. Without replaying it, every page that opens later sits on
 # "connecting…" forever waiting for a frame that was broadcast to nobody.
 sockets$hello <- NULL
+# MCP routing state: which page most recently claimed to be the user's active
+# window, and which agent socket is waiting for which request id.
+sockets$active_page <- NULL
+sockets$mcp_pending <- new.env(parent = emptyenv())
+# Subscription chats: id → record of one running `claude -p` process, owned by
+# the page socket that asked. See the agent-chat frames in handle_frame.
+sockets$chats <- new.env(parent = emptyenv())
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
@@ -139,11 +117,44 @@ notebook_page <- function() {
   file.path(here, "index.html")
 }
 
-#' Pull `token` out of a raw query string.
-query_token <- function(qs) {
-  if (is.null(qs) || !nzchar(qs)) return("")
-  hit <- regmatches(qs, regexpr("(?<=[?&])token=[^&]*", qs, perl = TRUE))
-  if (length(hit) == 0L) "" else sub("^token=", "", hit)
+#' Where the carmar-mcp stdio server lives on THIS machine, so the setup
+#' dialog can show a command that works verbatim. Repo layout first
+#' (tools/mcp beside spike/), then a distribution copy beside serve.R.
+#' Empty when neither exists — the dialog then shows a placeholder path.
+mcp_server_path <- function() {
+  for (p in c(file.path(here, "..", "tools", "mcp", "carmar-mcp.mjs"),
+              file.path(here, "mcp", "carmar-mcp.mjs"))) {
+    if (file.exists(p)) return(normalizePath(p))
+  }
+  ""
+}
+
+#' Find a binary the way a launcher must: an app-bundle supervisor inherits a
+#' minimal PATH, so Sys.which alone misses user-local installs.
+find_binary <- function(name, extra = character()) {
+  hit <- Sys.which(name)
+  if (nzchar(hit)) return(unname(hit))
+  for (p in c(extra, file.path(path.expand("~"), ".local", "bin", name),
+              file.path("/opt/homebrew/bin", name),
+              file.path("/usr/local/bin", name))) {
+    if (file.exists(p)) return(p)
+  }
+  ""
+}
+
+#' The Claude Code CLI, if this machine has one. CARMAR_CLAUDE_BIN overrides —
+#' that is also how tests substitute a deterministic stub.
+claude_bin <- function() {
+  override <- Sys.getenv("CARMAR_CLAUDE_BIN", "")
+  if (nzchar(override) && file.exists(override)) return(override)
+  find_binary("claude")
+}
+
+#' The Codex CLI, if this machine has one. CARMAR_CODEX_BIN overrides (tests).
+codex_bin <- function() {
+  override <- Sys.getenv("CARMAR_CODEX_BIN", "")
+  if (nzchar(override) && file.exists(override)) return(override)
+  find_binary("codex")
 }
 
 #' Any other query parameter, percent-decoded.
@@ -153,20 +164,6 @@ query_param <- function(qs, name) {
   hit <- regmatches(qs, regexpr(pat, qs, perl = TRUE))
   if (length(hit) == 0L) return("")
   utils::URLdecode(sub(paste0("^", name, "="), "", hit))
-}
-
-#' Compare two secrets in time that does not depend on where they differ.
-#'
-#' `identical()` stops at the first differing byte. Over loopback, with R's own
-#' overhead on top, extracting a token that way is not a practical attack — but
-#' "not practical today" is not a property worth relying on, and constant time
-#' costs four lines.
-secret_equal <- function(a, b) {
-  a <- as.character(a %||% ""); b <- as.character(b %||% "")
-  ab <- charToRaw(a); bb <- charToRaw(b)
-  if (length(ab) != length(bb)) return(FALSE)
-  if (length(ab) == 0L) return(FALSE)          # an empty token is never valid
-  sum(as.integer(xor(ab, bb))) == 0L
 }
 
 #' Reject with a reason, and record it.
@@ -191,6 +188,23 @@ reject <- function(reason, detail = NULL) {
 host_ok <- function(req) {
   h <- tolower(req$HTTP_HOST %||% "")
   nzchar(h) && h %in% hosts_ok
+}
+
+#' Refuse browser-mediated control requests from any other site.
+#'
+#' Native same-user clients (the app launcher, R, curl, the MCP bridge) do not
+#' send Origin or Sec-Fetch-Site and remain valid. Browsers do: a foreign page
+#' cannot stop a kernel or ask it to open a file, while CarmaR keeps the clean,
+#' stable localhost URL users expect.
+control_rejection <- function(req, allow_file = FALSE) {
+  origin <- req$HTTP_ORIGIN %||% ""
+  if (nzchar(origin) && !identical(origin, origin_ok) &&
+      !(allow_file && identical(origin, "null"))) {
+    return(reject("bad origin", origin))
+  }
+  site <- tolower(req$HTTP_SEC_FETCH_SITE %||% "")
+  if (identical(site, "cross-site")) return(reject("cross-site request", site))
+  NULL
 }
 
 # Commands the supervisor is willing to forward. An allow-list, not a
@@ -230,15 +244,15 @@ resp <- function(status, type, body, extra = list()) {
 app <- list(
   onHeaders = function(req) {
     # The Host check applies to the upgrade too — a rebound page trying to
-    # open a socket loses here even before the token is considered.
+    # open a socket loses before httpuv creates it.
     if (!host_ok(req)) return(reject("bad host", req$HTTP_HOST %||% "(none)"))
     upgrading <- identical(tolower(req$HTTP_UPGRADE %||% ""), "websocket")
     if (!upgrading) return(NULL)
-    if (!secret_equal(query_token(req$QUERY_STRING), token)) return(reject("bad token"))
     # WebSockets are exempt from the same-origin policy: without this, any site
     # the user happens to visit could open a socket here and run R.
     origin <- req$HTTP_ORIGIN
-    if (!is.null(origin) && !identical(origin, origin_ok)) {
+    if (!is.null(origin) && !identical(origin, origin_ok) &&
+        !identical(origin, "null")) {
       return(reject("bad origin", origin))
     }
     if (length(sockets$open) >= MAX_SOCKETS) return(reject("too many connections"))
@@ -251,24 +265,39 @@ app <- list(
       return(resp(200L, "application/json",
                   toJSON(list(ok = TRUE, worker = k$proc$is_alive()), auto_unbox = TRUE)))
     }
-    # Token-gated shutdown: the notebook's Quit, and how an app-bundle launcher
+    # Same-origin shutdown: the notebook's Quit, and how an app-bundle launcher
     # ends a background kernel without hunting processes. The flag is honored
     # by the event loop so this response still gets delivered.
     if (identical(req$PATH_INFO, "/shutdown")) {
-      if (!secret_equal(query_token(req$QUERY_STRING), token)) return(reject("bad token"))
+      blocked <- control_rejection(req, allow_file = TRUE)
+      if (!is.null(blocked)) return(blocked)
       audit("shutdown")
       sockets$quit <- TRUE
       return(resp(200L, "application/json",
                   toJSON(list(ok = TRUE, stopping = TRUE), auto_unbox = TRUE)))
     }
-    # The double-click door: /open?token=…&file=/abs/path.qmd. This is how
+    # Loopback-only: where is the MCP server on this machine, and is the
+    # discovery file in place? The setup dialog renders the answer as the
+    # exact `claude mcp add` / `codex mcp add` command for THIS install.
+    if (identical(req$PATH_INFO, "/mcp-info")) {
+      blocked <- control_rejection(req, allow_file = TRUE)
+      if (!is.null(blocked)) return(blocked)
+      return(resp(200L, "application/json",
+                  toJSON(list(server = mcp_server_path(),
+                              runtime = nzchar(runtime_file),
+                              claude = nzchar(claude_bin()),
+                              codex = nzchar(codex_bin())), auto_unbox = TRUE),
+                  extra = list("Access-Control-Allow-Origin" = "null")))
+    }
+    # The double-click door: /open?file=/abs/path.qmd. This is how
     # CarmaR.app hands a Finder-opened document to the notebook — the server
     # only VALIDATES and redirects; the page itself asks the worker for the
     # text (the readfile op, which enforces its own path rules) and imports.
-    # Token-gated like /shutdown: a drive-by page must not be able to make
-    # the notebook open files by guessing paths.
+    # Origin/Sec-Fetch gated like /shutdown: a drive-by page must not be able
+    # to make the notebook open files by guessing paths.
     if (identical(req$PATH_INFO, "/open")) {
-      if (!secret_equal(query_token(req$QUERY_STRING), token)) return(reject("bad token"))
+      blocked <- control_rejection(req)
+      if (!is.null(blocked)) return(blocked)
       f <- query_param(req$QUERY_STRING, "file")
       openable <- nzchar(f) && file.exists(f) && !dir.exists(f) &&
         grepl("\\.(qmd|rmd|md|markdown)$", f, ignore.case = TRUE)
@@ -277,7 +306,7 @@ app <- list(
         return(resp(400L, "text/plain", "not an openable document (.qmd, .Rmd, .md)"))
       }
       audit("open", detail = f)
-      loc <- paste0("/?token=", token, "&open=",
+      loc <- paste0("/?open=",
                     utils::URLencode(normalizePath(f), reserved = TRUE))
       return(resp(302L, "text/plain", "", extra = list(Location = loc)))
     }
@@ -291,24 +320,247 @@ app <- list(
   },
 
   onWSOpen = function(ws) {
-    sockets$open <- c(sockets$open, ws)
+    rec <- new.env(parent = emptyenv())
+    rec$ws <- ws
+    rec$role <- "page"
+    rec$name <- ""
+    sockets$open <- c(sockets$open, rec)
     audit("socket-open", sockets = length(sockets$open))
     if (!is.null(sockets$hello)) try(ws$send(sockets$hello), silent = TRUE)
+    # Replay the agent roster too — same lesson as the ready frame: a page
+    # opened AFTER an agent connected must still learn the agent is there,
+    # or its chip lies by omission.
+    agents <- mcp_recs()
+    if (length(agents) > 0L) {
+      try(ws$send(toJSON(list(
+        type = "mcp-clients", count = length(agents),
+        names = I(vapply(agents, function(r) r$name %||% "agent", character(1)))
+      ), auto_unbox = TRUE)), silent = TRUE)
+    }
     # The whole handler is wrapped: a malformed frame must cost that frame and
     # nothing else. Before this, `{"type":5}` or a bare JSON number reached
     # `cmd$type` on an atomic vector and threw inside httpuv's callback.
     ws$onMessage(function(binary, message) {
-      tryCatch(handle_frame(message), error = function(e) {
+      tryCatch(handle_frame(message, rec), error = function(e) {
         audit("frame-error", detail = conditionMessage(e))
       })
       invisible(NULL)
     })
     ws$onClose(function() {
-      sockets$open <- Filter(function(s) !identical(s, ws), sockets$open)
+      sockets$open <- Filter(function(r) !identical(r, rec), sockets$open)
+      if (identical(sockets$active_page, rec)) sockets$active_page <- NULL
+      # A page that goes away takes its Claude conversations with it — an
+      # orphan `claude -p` would keep billing a turn nobody can see.
+      for (id in ls(sockets$chats)) {
+        if (identical(sockets$chats[[id]]$rec, rec)) chat_kill(id)
+      }
+      # An agent that vanishes must not leave its request ids parked forever.
+      pending <- ls(sockets$mcp_pending)
+      for (id in pending) {
+        if (identical(sockets$mcp_pending[[id]], rec)) rm(list = id, envir = sockets$mcp_pending)
+      }
       audit("socket-close", sockets = length(sockets$open))
+      if (identical(rec$role, "mcp")) notify_mcp_clients()
     })
   }
 )
+
+page_recs <- function() Filter(function(r) identical(r$role, "page"), sockets$open)
+mcp_recs  <- function() Filter(function(r) identical(r$role, "mcp"), sockets$open)
+
+#' The page an agent's request should land on: the one the user most recently
+#' focused, else the most recently opened page. NULL when no notebook window is
+#' connected at all — which is an ANSWER (the agent is told), never silence.
+target_page <- function() {
+  if (!is.null(sockets$active_page) &&
+      any(vapply(sockets$open, function(r) identical(r, sockets$active_page), logical(1)))) {
+    return(sockets$active_page)
+  }
+  pages <- page_recs()
+  if (length(pages) == 0L) NULL else pages[[length(pages)]]
+}
+
+# ── the subscription chat: the pane talks to the user's own Claude Code ─────
+#
+# One conversation turn = one `claude -p` process, spawned HERE (never in the
+# worker: a model turn must not block or be blocked by a running cell). The
+# CLI owns its own login — the supervisor passes a prompt on stdin, streams
+# the CLI's stream-json lines back to the asking page verbatim, and that is
+# the whole exchange. Credentials are never read, stored, or proxied.
+#
+# The spawned session gets the carmar MCP tools, pinned to THIS kernel via a
+# 0600 config file (never argv — argv is visible to every local user in ps),
+# and the document tools. The embedded Claude process is a document agent, not
+# a chatbot that prints a draft for the user to move by hand. Inserts and
+# replacements cross the page's revision/contract gateway and remain
+# provisional with Keep/Reject; runs use the ordinary visible chunk path.
+AGENT_CHAT_TOOLS <- paste(
+  "mcp__carmar__carmar_status", "mcp__carmar__notebook_read",
+  "mcp__carmar__chunk_read", "mcp__carmar__chunk_insert",
+  "mcp__carmar__chunk_update", "mcp__carmar__chunk_run",
+  "mcp__carmar__file_list", "mcp__carmar__file_read",
+  sep = ",")
+MAX_CHATS <- 3L
+
+chat_send <- function(rec, id, ...) {
+  frame <- toJSON(list(type = "agent-chat", id = id, ...), auto_unbox = TRUE)
+  try(rec$ws$send(frame), silent = TRUE)
+}
+
+#' The two subscription CLIs the pane can ride. `client` travels in the
+#' agent-chat frame ("claude" is the default for frames that predate Codex).
+#' Codex has no system-prompt flag and no mcp-config FILE: its developer
+#' instructions and its MCP server travel as `-c key=value` overrides (the
+#' values are TOML — a JSON string literal IS a TOML basic string — and carry
+#' no secret: the MCP URL is the kernel origin, nothing more). Every Codex
+#' turn gets a private 0700 scratch directory as its working root, removed
+#' with the turn, so the CLI's sandbox never sits in the user's project.
+chat_client <- function(cmd) if (identical(cmd$client, "codex")) "codex" else "claude"
+chat_cli_label <- function(client) if (identical(client, "codex")) "Codex" else "Claude Code"
+
+#' Start one turn. Answers with streamed `line` frames and a final `done`.
+chat_start <- function(rec, cmd) {
+  id <- cmd$id
+  client <- chat_client(cmd)
+  label <- chat_cli_label(client)
+  bin <- if (identical(client, "codex")) codex_bin() else claude_bin()
+  if (!nzchar(bin)) {
+    chat_send(rec, id, done = TRUE, code = -1L,
+      error = sprintf("%s is not installed on this machine (the `%s` CLI was not found).",
+                      label, if (identical(client, "codex")) "codex" else "claude"))
+    return(invisible(NULL))
+  }
+  if (length(ls(sockets$chats)) >= MAX_CHATS) {
+    chat_send(rec, id, done = TRUE, code = -1L,
+      error = "Too many agent conversations are already running. Stop one first.")
+    return(invisible(NULL))
+  }
+
+  cfg <- ""        # claude: the 0600 mcp-config file; codex: the 0700 scratch workdir
+  server <- mcp_server_path()
+  node <- find_binary("node")
+  if (identical(client, "codex")) {
+    cfg <- tempfile("carmar-codex-")
+    dir.create(cfg, mode = "0700")
+    toml_str <- function(x) as.character(toJSON(x, auto_unbox = TRUE))
+    args <- c("exec", "--json", "--ephemeral", "--skip-git-repo-check",
+              "--ignore-user-config", "--approve-for-me", "-C", cfg)
+    if (scalar_chr(cmd$system) && nzchar(cmd$system)) {
+      args <- c(args, "-c", paste0("developer_instructions=", toml_str(cmd$system)))
+    }
+    if (scalar_chr(cmd$model) && nzchar(cmd$model) && !identical(cmd$model, "default")) {
+      args <- c(args, "-m", cmd$model)
+    }
+    if (nzchar(server) && nzchar(node)) {
+      args <- c(args,
+        "-c", paste0("mcp_servers.carmar.command=", toml_str(node)),
+        "-c", paste0("mcp_servers.carmar.args=[", toml_str(server), "]"),
+        "-c", paste0("mcp_servers.carmar.env={CARMAR_MCP_URL=", toml_str(paste0(origin_ok, "/")), "}"))
+    }
+    args <- c(args, "-")                     # the prompt arrives on stdin
+  } else {
+    args <- c("-p", "--output-format", "stream-json", "--verbose",
+              "--include-partial-messages")
+    if (scalar_chr(cmd$system) && nzchar(cmd$system)) {
+      args <- c(args, "--append-system-prompt", cmd$system)
+    }
+    if (scalar_chr(cmd$model) && nzchar(cmd$model) && !identical(cmd$model, "default")) {
+      args <- c(args, "--model", cmd$model)
+    }
+    if (nzchar(server) && nzchar(node)) {
+      cfg <- tempfile("carmar-chat-", fileext = ".json")
+      writeLines(toJSON(list(mcpServers = list(carmar = list(
+        command = node, args = I(server),
+        env = list(CARMAR_MCP_URL = paste0(origin_ok, "/"))
+      ))), auto_unbox = TRUE), cfg)
+      Sys.chmod(cfg, mode = "0600")
+      args <- c(args, "--mcp-config", cfg, "--strict-mcp-config",
+                "--allowedTools", AGENT_CHAT_TOOLS)
+    }
+  }
+
+  proc <- tryCatch(
+    processx::process$new(bin, args, stdin = "|", stdout = "|", stderr = "|"),
+    error = function(e) e)
+  if (inherits(proc, "error")) {
+    if (nzchar(cfg)) unlink(cfg, recursive = TRUE)
+    chat_send(rec, id, done = TRUE, code = -1L,
+      error = paste0("Could not start ", label, ": ", conditionMessage(proc)))
+    return(invisible(NULL))
+  }
+
+  # The prompt goes on stdin (argv leaks to `ps`, and long contexts overflow
+  # it); EOF tells the CLI the prompt is complete. write_input is
+  # non-blocking and returns what did not fit — same lesson as kernel_write.
+  sent <- tryCatch({
+    left <- proc$write_input(paste0(cmd$prompt, "\n"))
+    deadline <- Sys.time() + 10
+    while (length(left) > 0L && Sys.time() < deadline) { Sys.sleep(0.01); left <- proc$write_input(left) }
+    close(proc$get_input_connection())
+    length(left) == 0L
+  }, error = function(e) FALSE)
+  if (!isTRUE(sent)) {
+    try(proc$kill(), silent = TRUE)
+    if (nzchar(cfg)) unlink(cfg, recursive = TRUE)
+    chat_send(rec, id, done = TRUE, code = -1L, error = paste(label, "did not accept the prompt."))
+    return(invisible(NULL))
+  }
+
+  audit("agent-chat", id = id, client = client)
+  sockets$chats[[id]] <- list2env(list(proc = proc, rec = rec, cfg = cfg,
+                                       stderr_tail = character()),
+                                  parent = emptyenv())
+  invisible(NULL)
+}
+
+chat_kill <- function(id, notify = FALSE) {
+  ch <- sockets$chats[[id]]
+  if (is.null(ch)) return(invisible(NULL))
+  try(ch$proc$kill(), silent = TRUE)
+  if (nzchar(ch$cfg)) unlink(ch$cfg, recursive = TRUE)
+  rm(list = id, envir = sockets$chats)
+  if (notify) chat_send(ch$rec, id, done = TRUE, code = -2L, stopped = TRUE)
+  invisible(NULL)
+}
+
+#' Drain every running chat: stream stdout lines to the owner, keep a stderr
+#' tail for the post-mortem, and close out finished processes.
+pump_chats <- function() {
+  for (id in ls(sockets$chats)) {
+    ch <- sockets$chats[[id]]
+    ch$proc$poll_io(0L)
+    lines <- tryCatch(ch$proc$read_output_lines(), error = function(e) character())
+    for (line in lines) chat_send(ch$rec, id, line = line)
+    err <- tryCatch(ch$proc$read_error_lines(), error = function(e) character())
+    if (length(err)) ch$stderr_tail <- utils::tail(c(ch$stderr_tail, err), 20L)
+    if (!ch$proc$is_alive()) {
+      leftover <- tryCatch(ch$proc$read_output_lines(), error = function(e) character())
+      for (line in leftover) chat_send(ch$rec, id, line = line)
+      code <- as.integer(tryCatch(ch$proc$get_exit_status(), error = function(e) -1L) %||% -1L)
+      if (!identical(code, 0L) && length(ch$stderr_tail)) {
+        chat_send(ch$rec, id, done = TRUE, code = code,
+                  error = paste(ch$stderr_tail, collapse = "\n"))
+      } else {
+        chat_send(ch$rec, id, done = TRUE, code = code)
+      }
+      audit("agent-chat-done", id = id, detail = as.character(code))
+      if (nzchar(ch$cfg)) unlink(ch$cfg, recursive = TRUE)
+      rm(list = id, envir = sockets$chats)
+    }
+  }
+  invisible(NULL)
+}
+
+#' Tell every notebook page who is connected, so the UI can show it.
+notify_mcp_clients <- function() {
+  agents <- mcp_recs()
+  frame <- toJSON(list(
+    type = "mcp-clients", count = length(agents),
+    names = I(vapply(agents, function(r) r$name %||% "agent", character(1)))
+  ), auto_unbox = TRUE)
+  lapply(page_recs(), function(r) try(r$ws$send(frame), silent = TRUE))
+  invisible(NULL)
+}
 
 #' Is this a single, plain string? Every command field is one, and R's coercion
 #' rules are exactly permissive enough to turn a JSON array or object into
@@ -316,7 +568,7 @@ app <- list(
 scalar_chr <- function(x) is.character(x) && length(x) == 1L && !is.na(x)
 
 #' Act on one WebSocket frame. Validates, then forwards; never evaluates.
-handle_frame <- function(message) {
+handle_frame <- function(message, rec) {
   if (is.raw(message)) return(invisible(NULL))           # binary: not our protocol
   if (nchar(message, type = "bytes") > MAX_FRAME_BYTES) {
     audit("frame-too-large", bytes = nchar(message, type = "bytes"))
@@ -324,6 +576,96 @@ handle_frame <- function(message) {
   }
   cmd <- tryCatch(fromJSON(message, simplifyVector = TRUE), error = function(e) NULL)
   if (!is.list(cmd) || !scalar_chr(cmd$type)) return(invisible(NULL))
+
+  # ── the MCP plane ─────────────────────────────────────────────────────────
+  # A local agent (Claude Code / Codex via tools/mcp/carmar-mcp.mjs) connects
+  # through the same loopback/Origin/Host gates as a page, then DECLARES itself.
+  # From then on it may only ASK (mcp-request, routed to the active notebook
+  # window) and use the read-side FORWARDED ops; pages may only ANSWER.
+  # Declared agents are refused exec/interrupt/restart below on purpose: an
+  # agent's runs go through a chunk in the notebook, where the user can see
+  # them, or they do not happen.
+  if (identical(cmd$type, "mcp-hello")) {
+    rec$role <- "mcp"
+    rec$name <- if (scalar_chr(cmd$client)) substr(cmd$client, 1L, 64L) else "agent"
+    audit("mcp-hello", detail = rec$name)
+    reply <- toJSON(list(type = "mcp-hello",
+                         id = if (scalar_chr(cmd$id)) cmd$id else "hello",
+                         ok = TRUE, pages = length(page_recs())), auto_unbox = TRUE)
+    try(rec$ws$send(reply), silent = TRUE)
+    notify_mcp_clients()
+    return(invisible(NULL))
+  }
+  if (identical(cmd$type, "mcp-active")) {
+    if (identical(rec$role, "page")) sockets$active_page <- rec
+    return(invisible(NULL))
+  }
+  if (identical(cmd$type, "mcp-request")) {
+    if (!identical(rec$role, "mcp")) {
+      audit("mcp-refused", reason = "mcp-request from a non-agent socket")
+      return(invisible(NULL))
+    }
+    if (!scalar_chr(cmd$id) || !scalar_chr(cmd$tool)) return(invisible(NULL))
+    page <- target_page()
+    audit("mcp-request", id = cmd$id, detail = cmd$tool)
+    if (is.null(page)) {
+      reply <- toJSON(list(type = "mcp-response", id = cmd$id, ok = FALSE,
+        error = "No CarmaR notebook window is connected to this kernel. Open the notebook first."),
+        auto_unbox = TRUE)
+      try(rec$ws$send(reply), silent = TRUE)
+      return(invisible(NULL))
+    }
+    sockets$mcp_pending[[cmd$id]] <- rec
+    try(page$ws$send(message), silent = TRUE)          # forwarded verbatim
+    return(invisible(NULL))
+  }
+  if (identical(cmd$type, "mcp-response")) {
+    if (identical(rec$role, "mcp")) return(invisible(NULL))   # agents ask, pages answer
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    asker <- sockets$mcp_pending[[cmd$id]]
+    if (!is.null(asker)) {
+      rm(list = cmd$id, envir = sockets$mcp_pending)
+      try(asker$ws$send(message), silent = TRUE)
+    }
+    return(invisible(NULL))
+  }
+
+  # A pane conversation with the user's own Claude Code. Pages only: a
+  # declared agent asking the kernel to spawn ANOTHER agent is a loop nobody
+  # ordered, and the CLI process acts with the user's full subscription.
+  if (identical(cmd$type, "agent-chat")) {
+    if (!identical(rec$role, "page")) {
+      audit("mcp-refused", reason = "agent-chat from a non-page socket")
+      return(invisible(NULL))
+    }
+    if (!scalar_chr(cmd$id) || !scalar_chr(cmd$prompt) || !nzchar(cmd$prompt)) {
+      return(invisible(NULL))
+    }
+    if (!is.null(sockets$chats[[cmd$id]])) return(invisible(NULL))   # id reuse: ignore
+    chat_start(rec, cmd)
+    return(invisible(NULL))
+  }
+  if (identical(cmd$type, "agent-chat-stop")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    ch <- sockets$chats[[cmd$id]]
+    # Only the socket that started a conversation may stop it.
+    if (!is.null(ch) && identical(ch$rec, rec)) {
+      audit("agent-chat-stop", id = cmd$id)
+      chat_kill(cmd$id, notify = TRUE)
+    }
+    return(invisible(NULL))
+  }
+
+  if (cmd$type %in% c("exec", "interrupt", "restart") && identical(rec$role, "mcp")) {
+    audit("mcp-refused", reason = paste("agent asked for", cmd$type))
+    if (scalar_chr(cmd$id)) {
+      reply <- toJSON(list(type = cmd$type, id = cmd$id,
+        error = "Agents run code through notebook chunks (chunk_run), not raw exec."),
+        auto_unbox = TRUE)
+      try(rec$ws$send(reply), silent = TRUE)
+    }
+    return(invisible(NULL))
+  }
 
   if (identical(cmd$type, "exec")) {
     if (!scalar_chr(cmd$id) || !scalar_chr(cmd$source)) return(invisible(NULL))
@@ -356,7 +698,7 @@ handle_frame <- function(message) {
     if (!is.null(failed)) {
       audit("forward-failed", id = cmd$id, detail = failed)
       reply <- toJSON(list(type = cmd$type, id = cmd$id, error = failed), auto_unbox = TRUE)
-      lapply(sockets$open, function(ws) try(ws$send(reply), silent = TRUE))
+      lapply(sockets$open, function(r) try(r$ws$send(reply), silent = TRUE))
     }
     return(invisible(NULL))
   }
@@ -371,8 +713,8 @@ pump <- function() {
   payload <- vapply(events, function(e) toJSON(e, auto_unbox = TRUE), character(1))
   ready_at <- which(vapply(events, function(e) identical(e$type, "ready"), logical(1)))
   if (length(ready_at) > 0L) sockets$hello <- payload[[ready_at[[1L]]]]
-  lapply(sockets$open, function(ws) {
-    lapply(payload, function(p) try(ws$send(p), silent = TRUE))
+  lapply(sockets$open, function(r) {
+    lapply(payload, function(p) try(r$ws$send(p), silent = TRUE))
   })
   invisible(NULL)
 }
@@ -380,16 +722,53 @@ pump <- function() {
 server <- httpuv::startServer(host, port, app)
 on.exit({ httpuv::stopServer(server); kernel_stop(k) }, add = TRUE)
 
-url <- sprintf("%s/?token=%s", origin_ok, token)
+url <- paste0(origin_ok, "/")
+
+# The notebook is a CarmNote-style FILE. The loopback address above is private
+# transport metadata for MCP/native health checks; it is never the page the
+# launcher opens. The fragment selects the independent kernel without sending
+# anything to a web server.
+notebook_file <- normalizePath(notebook_page())
+file_url <- paste0("file://", utils::URLencode(notebook_file, reserved = FALSE),
+                   "#kernel=", port)
+
+#' Discovery for local agents — the Jupyter runtime-dir pattern.
+#'
+#' `tools/mcp/carmar-mcp.mjs` (the stdio server Claude Code / Codex spawn) has
+#' no stdout to read the URL from, so the kernel writes one small file a local
+#' process owned by the SAME user can find: ~/.carmar/run/kernel-<port>.json,
+#' mode 0600. This is discovery metadata, not a browser credential. A same-user
+#' local process was never outside the trust line — it could already exec
+#' anything. Removed on clean shutdown;
+#' consumers must health-check before trusting a file (kills leave litter).
+#' CARMAR_RUNTIME_DIR relocates it (tests use a scratch dir);
+#' CARMAR_NO_RUNTIME_FILE=1 turns it off.
+runtime_file <- ""
+if (!identical(Sys.getenv("CARMAR_NO_RUNTIME_FILE"), "1")) {
+  runtime_dir <- Sys.getenv("CARMAR_RUNTIME_DIR",
+                            file.path(path.expand("~"), ".carmar", "run"))
+  made <- dir.exists(runtime_dir) ||
+    dir.create(runtime_dir, recursive = TRUE, showWarnings = FALSE)
+  if (made) {
+    candidate <- file.path(runtime_dir, sprintf("kernel-%d.json", port))
+    wrote <- tryCatch({
+      writeLines(toJSON(list(url = url, file = file_url, port = port, pid = Sys.getpid(),
+                             started = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")),
+                        auto_unbox = TRUE), candidate)
+      Sys.chmod(candidate, mode = "0600")
+      TRUE
+    }, error = function(e) FALSE)
+    if (wrote) runtime_file <- candidate
+  }
+}
+
 audit("started", port = port, r = R.version.string, root = Sys.getenv("CARMAR_ROOT", ""))
-cat(toJSON(list(url = url), auto_unbox = TRUE), "\n")
+cat(toJSON(list(url = url, file = file_url), auto_unbox = TRUE), "\n")
 flush(stdout())
 
-# --open: launch the default browser at the tokenized URL — the one-double-
-# click path a distribution copy's Start script uses. Off by default so the
-# supervisor stays headless under tests and scripts.
+# --open: open the notebook FILE. The kernel remains hidden transport plumbing.
 if ("--open" %in% commandArgs(trailingOnly = TRUE)) {
-  try(utils::browseURL(url), silent = TRUE)
+  try(utils::browseURL(file_url), silent = TRUE)
 }
 
 # The event loop. `service()` returns at least every 50ms whatever the worker is
@@ -397,10 +776,19 @@ if ("--open" %in% commandArgs(trailingOnly = TRUE)) {
 repeat {
   httpuv::service(50)
   pump()
+  pump_chats()
   if (isTRUE(sockets$quit)) break
   if (!k$proc$is_alive()) {
-    lapply(sockets$open, function(ws)
-      try(ws$send(toJSON(list(type = "worker-died"), auto_unbox = TRUE)), silent = TRUE))
+    lapply(sockets$open, function(r)
+      try(r$ws$send(toJSON(list(type = "worker-died"), auto_unbox = TRUE)), silent = TRUE))
     break
   }
 }
+
+# The loop only breaks on a deliberate shutdown or a dead worker — take the
+# discovery file with us so agents stop finding a kernel that is gone. A
+# SIGKILL skips this, which is why readers must health-check before trusting
+# a runtime file (stale files are litter, not authority). Running Claude
+# conversations die with the kernel — nothing may keep billing after Quit.
+for (id in ls(sockets$chats)) chat_kill(id)
+if (nzchar(runtime_file)) unlink(runtime_file)

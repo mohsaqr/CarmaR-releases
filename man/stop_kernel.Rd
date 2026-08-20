@@ -12,6 +12,6 @@ Invisibly, \code{TRUE} if a kernel was asked to stop, \code{FALSE} if none
 was running.
 }
 \description{
-Asks the kernel on \code{port} to shut down, through its own token-gated
-\code{/shutdown} --- the clean path, the same one the notebook's Quit uses.
+Asks the kernel on \code{port} to shut down through its loopback-only
+\code{/shutdown} endpoint --- the clean path, the same one the notebook's Quit uses.
 }

@@ -590,7 +590,7 @@ preview_rows <- function(data, nms) {
   if (!ncol(data)) return(list())
   head_df <- utils::head(data, MAX_PREVIEW_ROWS)
   lapply(seq_len(nrow(head_df)), function(i)
-    as.list(setNames(as.character(unlist(head_df[i, ], use.names = FALSE)), nms)))
+    as.list(stats::setNames(as.character(unlist(head_df[i, ], use.names = FALSE)), nms)))
 }
 
 #' An Excel workbook: which sheets it has, and what the chosen one holds.

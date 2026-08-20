@@ -1488,8 +1488,8 @@ harvest_plots <- function(id, dir, seen, dims = NULL) {
 #' Emit a data.frame as structured rows the notebook can put in a real table.
 #'
 #' Printing a data.frame gives the caller aligned text; a notebook needs
-#' columns and types. Capped at MAX_ROWS with the true row count reported, so a
-#' million-row frame never becomes a million-row JSON payload.
+#' columns and types. Capped to a small preview with the true row count
+#' reported, so a million-row frame never becomes a million-row JSON payload.
 #'
 #' @param id Cell id.
 #' @param df A data.frame.
@@ -1502,7 +1502,7 @@ emit_dataframe <- function(id, df) {
   # Keep the preview deliberately small, flatten complex cells to descriptions,
   # clip text, then enforce a final wire-size ceiling. The full object viewer
   # remains paginated independently for assigned objects.
-  preview_rows <- 25L
+  preview_rows <- 10L
   preview_cols <- 20L
   cell_chars <- 160L
   preview_bytes <- 256L * 1024L
@@ -1513,7 +1513,7 @@ emit_dataframe <- function(id, df) {
   # ALTREP to millions of strings, and the old identical(... seq_len(n)) check
   # built a second vector just to decide there was nothing to show. type=1 asks
   # R whether names are automatic without materialising them; explicit names
-  # are sliced from the raw attribute only AFTER the 25-row preview is taken.
+  # are sliced from the raw attribute only AFTER the 10-row preview is taken.
   explicit_rownames <- .row_names_info(df, type = 1L) > 0L
   total_cols <- data_cols + as.integer(explicit_rownames)
   data_col_cap <- max(0L, preview_cols - as.integer(explicit_rownames))
@@ -1566,7 +1566,7 @@ emit_dataframe <- function(id, df) {
   # Informative row names are data (car names in mtcars, coefficient terms in
   # model summaries), but only their preview travels. Never cbind them onto the
   # full frame: that copies every column before head() and makes display time
-  # scale with the entire object rather than the 25 cells the user will see.
+  # scale with the entire object rather than the preview cells the user will see.
   if (explicit_rownames) {
     raw_names <- attr(df, "row.names", exact = TRUE)
     shown_names <- as.character(utils::head(raw_names, nrow(head_df)))
