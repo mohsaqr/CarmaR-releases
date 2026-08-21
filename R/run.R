@@ -34,7 +34,8 @@
 #' @importFrom httpuv startServer
 #' @export
 run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
-  stopifnot(is.numeric(port), length(port) == 1L, port > 0, port < 65536)
+  stopifnot(is.numeric(port), length(port) == 1L, is.finite(port),
+            port == as.integer(port), port > 0, port < 65536)
   stopifnot(is.logical(new), length(new) == 1L, !is.na(new))
   if (!is.null(allow_more)) stopifnot(is.logical(allow_more), length(allow_more) == 1L,
                                       !is.na(allow_more))
@@ -138,7 +139,19 @@ run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
             "uses port ", port, " and run carmar::run() again.")
   }
   if (!is.na(got) && got != port) url_file <- file.path(state, paste0("url-", got))
-  writeLines(u, url_file)
+  # Discovery state is read concurrently by new R sessions. Publish with a
+  # rename so readers see either the previous complete record or the new one,
+  # never a half-written URL after a crash.
+  part <- paste0(url_file, ".part")
+  writeLines(u, part, useBytes = TRUE)
+  if (!file.rename(part, url_file)) {
+    # Windows cannot atomically rename over an existing file. A stale record
+    # on this just-claimed port is harmless; retain a portable fallback.
+    copied <- file.copy(part, url_file, overwrite = TRUE)
+    unlink(part)
+    if (!isTRUE(copied)) stop(
+      "CarmaR started, but its session record could not be saved: ", url_file)
+  }
   if (is.null(page) || !nzchar(page)) page <- notebook_launch_url(u, state)
   if (open) utils::browseURL(page)
   # ALWAYS printed, clickable in the RStudio console — the browser not
@@ -176,25 +189,36 @@ sessions <- function() {
   state_files <- list.files(state, pattern = "^url-[0-9]+$", full.names = TRUE)
   runtime_files <- list.files(runtime_dir, pattern = "^kernel-[0-9]+\\.json$",
                               full.names = TRUE)
-  read_url <- function(f) {
+  read_record <- function(f, expected_port) {
+    declared <- expected_port
     u <- if (grepl("[.]json$", f)) {
-      tryCatch(jsonlite::fromJSON(f, simplifyVector = TRUE)$url,
-               error = function(e) NULL)
-    } else {
-      tryCatch(readLines(f, warn = FALSE, n = 1L), error = function(e) NULL)
-    }
-    if (length(u) == 1L && is.character(u) && nzchar(u)) u else ""
+      rec <- tryCatch(jsonlite::fromJSON(f, simplifyVector = TRUE),
+                      error = function(e) NULL)
+      if (is.null(rec) || !is.list(rec)) return(list(url = "", valid = FALSE))
+      if (!is.null(rec$port)) declared <- suppressWarnings(as.integer(rec$port))
+      rec$url %||% ""
+    } else tryCatch(readLines(f, warn = FALSE, n = 1L),
+                    error = function(e) "")
+    u <- if (length(u) == 1L && is.character(u)) u else ""
+    list(url = u, valid = valid_kernel_url(u, expected_port) &&
+           length(declared) == 1L && !is.na(declared) && declared == expected_port)
   }
   files <- c(state_files, runtime_files)
   origin <- rep(c("package", "runtime"),
                 c(length(state_files), length(runtime_files)))
   ports <- as.integer(sub("^(url-|kernel-)([0-9]+).*$", "\\2", basename(files)))
-  keep <- !duplicated(ports)
-  o <- order(ports[keep])
-  files <- files[keep][o]; origin <- origin[keep][o]; ports <- ports[keep][o]
-  urls <- vapply(files, read_url, character(1), USE.NAMES = FALSE)
-  alive <- vapply(urls, function(u) nzchar(u) && kernel_alive(u), logical(1),
-                  USE.NAMES = FALSE)
+  records <- Map(read_record, files, ports)
+  urls <- vapply(records, `[[`, character(1), "url")
+  valid <- vapply(records, `[[`, logical(1), "valid")
+  alive <- valid & vapply(seq_along(urls), function(i)
+    isTRUE(valid[[i]]) && kernel_alive(urls[[i]]), logical(1))
+  # Validate all duplicates before choosing. A malformed package record must
+  # not hide a live runtime record for the same port.
+  priority <- order(ports, -as.integer(alive), -as.integer(valid),
+                    match(origin, c("package", "runtime")))
+  keep <- priority[!duplicated(ports[priority])]
+  keep <- keep[order(ports[keep])]
+  ports <- ports[keep]; origin <- origin[keep]; urls <- urls[keep]; alive <- alive[keep]
   page <- rep(NA_character_, length(ports))
   page[alive] <- vapply(urls[alive], function(u)
     tryCatch(notebook_launch_url(u, state), error = function(e) NA_character_),
@@ -221,7 +245,8 @@ stop_kernel <- function(port = 4747) {
     if (!nrow(live)) { message("No CarmaR kernels are running."); return(invisible(logical(0))) }
     return(invisible(vapply(live$port, stop_kernel, logical(1))))
   }
-  stopifnot(is.numeric(port), length(port) == 1L, port > 0, port < 65536)
+  stopifnot(is.numeric(port), length(port) == 1L, is.finite(port),
+            port == as.integer(port), port > 0, port < 65536)
   port <- as.integer(port)
   state <- tools::R_user_dir("carmar", "data")
   url_file <- file.path(state, paste0("url-", port))
@@ -380,8 +405,23 @@ upgrade_package <- function(rel, say) {
 
 #' Is the kernel behind this notebook URL answering? @noRd
 kernel_alive <- function(u) {
+  if (!valid_kernel_url(u)) return(FALSE)
   health <- paste0(kernel_base(u), "/health")
-  tryCatch(length(slurp(health)) > 0, error = function(e) FALSE)
+  tryCatch({
+    rec <- jsonlite::fromJSON(paste(slurp(health), collapse = "\n"),
+                              simplifyVector = TRUE)
+    is.list(rec) && isTRUE(rec$ok) && isTRUE(rec$worker)
+  }, error = function(e) FALSE)
+}
+
+#' Is this a loopback-only CarmaR transport URL, optionally on one port? @noRd
+valid_kernel_url <- function(u, expected_port = NULL) {
+  if (!is.character(u) || length(u) != 1L || is.na(u) || !nzchar(u)) return(FALSE)
+  ok <- grepl("^http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):[0-9]{1,5}/?(\\?token=[^#[:space:]]*)?$",
+              u, perl = TRUE)
+  p <- kernel_port(u)
+  ok && !is.na(p) && p > 0L && p < 65536L &&
+    (is.null(expected_port) || identical(p, as.integer(expected_port)))
 }
 
 #' URL origin for both current clean records and legacy tokenized records. @noRd
@@ -420,11 +460,21 @@ live_kernel_urls <- function(state = tools::R_user_dir("carmar", "data")) {
   if (!length(files)) return(character())
   files <- files[order(file.info(files)$mtime, decreasing = TRUE)]
   urls <- vapply(files, function(f) {
-    u <- if (grepl("[.]json$", f)) tryCatch(
-      jsonlite::fromJSON(f, simplifyVector = TRUE)$url %||% "",
-      error = function(e) "") else tryCatch(
-      readLines(f, warn = FALSE, n = 1L), error = function(e) "")
-    if (length(u) && nzchar(u[[1]]) && kernel_alive(u[[1]])) u[[1]]
+    expected <- suppressWarnings(as.integer(sub(
+      "^(url-|kernel-)([0-9]+).*$", "\\2", basename(f))))
+    declared <- expected
+    u <- if (grepl("[.]json$", f)) {
+      rec <- tryCatch(jsonlite::fromJSON(f, simplifyVector = TRUE),
+                      error = function(e) NULL)
+      if (is.null(rec) || !is.list(rec)) "" else {
+        if (!is.null(rec$port)) declared <- suppressWarnings(as.integer(rec$port))
+        rec$url %||% ""
+      }
+    } else tryCatch(readLines(f, warn = FALSE, n = 1L), error = function(e) "")
+    valid <- length(u) == 1L && is.character(u) &&
+      valid_kernel_url(u, expected) && length(declared) == 1L &&
+      !is.na(declared) && declared == expected
+    if (valid && kernel_alive(u)) u
     else {
       # Package state is ours to prune. Runtime discovery files are shared
       # across every launcher; remove only a record whose kernel is dead.

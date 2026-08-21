@@ -62,9 +62,20 @@ kernel_start <- function(worker_path, sentinel = NULL, rscript = detect_rscript(
     c("--no-save", "--no-restore", "--no-site-file", worker_path, sentinel),
     stdin = "|", stdout = "|", stderr = "|",
     env = clean_env,
-    supervise = TRUE
+    supervise = TRUE,
+    # The desktop launcher may itself inherit the C locale from launchd.
+    # Decode the protocol pipes by their actual wire encoding instead of the
+    # supervisor's locale, or non-ASCII output can be escaped before framing.
+    encoding = "UTF-8"
   )
-  list(proc = proc, sentinel = sentinel, rscript = rscript)
+  # processx's line reader waits for a complete line before releasing it. A
+  # large JSON view/plot frame can therefore sit in its internal buffer long
+  # enough to starve the supervisor. Keep our own incremental framing state
+  # in an environment so it remains mutable through R's copied list handle.
+  io <- new.env(parent = emptyenv())
+  io$out <- ""
+  io$err <- ""
+  list(proc = proc, sentinel = sentinel, rscript = rscript, io = io)
 }
 
 #' Send a cell to the worker.
@@ -183,8 +194,29 @@ kernel_stop <- function(k, grace = 2) {
 #'   "done"/"ready".
 kernel_poll <- function(k, timeout_ms = 50L) {
   k$proc$poll_io(timeout_ms)
-  out <- k$proc$read_output_lines()
-  err <- k$proc$read_error_lines()
+  # Drain available bytes, not complete processx lines. Control frames can be
+  # hundreds of KB; incremental draining prevents the child from blocking on
+  # a full pipe while the parent waits for that same frame's newline.
+  take_lines <- function(field, chunk, flush = FALSE) {
+    incoming <- if (length(chunk)) paste0(chunk, collapse = "") else ""
+    data <- paste0(k$io[[field]], incoming)
+    nl <- gregexpr("\n", data, fixed = TRUE)[[1L]]
+    if (length(nl) == 1L && nl[[1L]] < 0L) {
+      if (flush && nzchar(data)) { k$io[[field]] <- ""; return(data) }
+      k$io[[field]] <- data
+      return(character())
+    }
+    last <- nl[[length(nl)]]
+    complete <- if (last > 1L) substring(data, 1L, last - 1L) else ""
+    k$io[[field]] <- if (last < nchar(data)) substring(data, last + 1L) else ""
+    # Appending a marker preserves a final empty line, which base strsplit()
+    # would otherwise discard (cat("\n") is real stdout).
+    lines <- strsplit(paste0(complete, "\001"), "\n", fixed = TRUE)[[1L]]
+    lines[[length(lines)]] <- sub("\001$", "", lines[[length(lines)]])
+    sub("\r$", "", lines)
+  }
+  out <- take_lines("out", k$proc$read_output(), !k$proc$is_alive())
+  err <- take_lines("err", k$proc$read_error(), !k$proc$is_alive())
 
   # The sentinel is found ANYWHERE in the line, not only at its start.
   #

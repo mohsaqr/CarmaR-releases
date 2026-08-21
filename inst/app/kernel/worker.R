@@ -23,6 +23,18 @@
 # whether a cell plots by grepping its source for "plot(" misses plots drawn
 # inside functions and fires on a variable named `myplot`.
 
+# Finder/launchd can start the app with LC_CTYPE=C even on a UTF-8 Mac. In that
+# locale R prints box drawing and other non-ASCII text as escapes, and knit can
+# only preserve the already-corrupted output. Select an installed UTF-8 CTYPE
+# inside the worker; keep every other locale category (numbers, dates, sorting)
+# untouched. The candidates cover current Linux, macOS, and older R builds.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  for (candidate in c("C.UTF-8", "en_US.UTF-8", "UTF-8")) {
+    suppressWarnings(try(Sys.setlocale("LC_CTYPE", candidate), silent = TRUE))
+    if (isTRUE(l10n_info()[["UTF-8"]])) break
+  }
+}
+
 # jsonlite is used via :: only — attaching it would put it on the USER's search
 # path, and the worker must leave no trace in the session it hosts.
 stopifnot(requireNamespace("jsonlite", quietly = TRUE))
@@ -46,7 +58,9 @@ MAX_ROWS <- 500L
 # clamped, so the UI never has to guess what it actually received.
 MAX_VIEW_ROWS <- 500L
 MAX_VIEW_COLS <- 100L
-MAX_VIEW_BYTES <- 2000000L
+MAX_VIEW_BYTES <- 512L * 1024L
+MAX_VIEW_CELL_CHARS <- 512L
+MAX_VIEW_LABEL_CHARS <- 128L
 MAX_STRUCT_CHILDREN <- 200L
 MAX_COMPLETIONS <- 200L
 
@@ -440,7 +454,7 @@ describe_column <- function(col, name) {
     tab <- sort(table(as.character(col[!is.na(col)])), decreasing = TRUE)
     top <- utils::head(tab, 12L)
     c(base, list(kind = "categorical", bins = I(as.integer(top)),
-                 levels = I(as.character(names(top))),
+                 levels = I(substr(as.character(names(top)), 1L, MAX_VIEW_LABEL_CHARS)),
                  nlevels = length(tab),
                  stat = sprintf("%d level%s", length(tab), if (length(tab) == 1L) "" else "s")))
   }
@@ -646,9 +660,34 @@ view_payload <- function(obj, shown_name, offset = NULL, limit = NULL,
   idx <- seq.int(from = offset + 1L,
                  length.out = max(0L, min(limit, nrow(obj) - offset)))
   page <- obj[idx, cidx, drop = FALSE]
+  source_names <- names(obj)[cidx]
+  display_names <- make.unique(substr(source_names, 1L, MAX_VIEW_LABEL_CHARS))
+  names(page) <- display_names
   # Row names would ride along as a `_row` field in the JSON; the offset
   # already says where the page sits, so they are noise.
   rownames(page) <- NULL
+  # A single cell can dwarf the row/column caps (logs, embedded documents,
+  # accidental blobs). The viewer is a preview, so clip display values before
+  # JSON encoding. This also gives a hard upper bound when the page has only
+  # one row and row shedding cannot help.
+  clipped_cells <- 0L
+  page[] <- lapply(page, function(col) {
+    if (is.factor(col)) col <- as.character(col)
+    if (is.list(col) && !is.data.frame(col)) {
+      col <- vapply(col, function(value) {
+        tryCatch(as.character(jsonlite::toJSON(value, auto_unbox = TRUE,
+                                                null = "null", na = "null")),
+                 error = function(e) paste(capture.output(str(value,
+                   max.level = 1L, give.attr = FALSE)), collapse = " "))
+      }, character(1))
+    }
+    if (is.character(col)) {
+      too_long <- !is.na(col) & nchar(col) > MAX_VIEW_CELL_CHARS
+      clipped_cells <<- clipped_cells + sum(too_long)
+      col[too_long] <- paste0(substr(col[too_long], 1L, MAX_VIEW_CELL_CHARS), "…")
+    }
+    col
+  })
   # Payload guard: the caps above bound CELLS, not bytes — 500 rows of 20 KB
   # strings is still a 10 MB frame that would stall the socket. Measure the
   # page as it will actually ship and shed rows until it fits, reporting the
@@ -671,7 +710,9 @@ view_payload <- function(obj, shown_name, offset = NULL, limit = NULL,
        colOffset = col_offset, colLimit = col_limit,
        limitClamped = limit < limit_req,
        colLimitClamped = col_limit < col_limit_req,
-       columns = lapply(names(obj)[cidx], function(nm) describe_column(obj[[nm]], nm)),
+       clippedCells = clipped_cells,
+       columns = Map(function(index, display)
+         describe_column(obj[[index]], display), cidx, display_names),
        rows = page, shown = nrow(page), shownCols = ncol(page))
 }
 
@@ -1726,6 +1767,91 @@ matrix_to_df <- function(m) {
 #'
 #' @param id Cell identifier echoed back in the done frame.
 #' @param source R source text.
+#' One frame's local variables: name, class, and a short shape.
+#'
+#' Read-only and defensive. `mget` with `ifnotfound` never forces a promise
+#' that would error, the value summary is a class-and-dimension line rather
+#' than a print (printing a frame's locals could take minutes and megabytes),
+#' and everything is capped. A debugger that hangs the session it is
+#' debugging has made things worse.
+frame_vars <- function(env, max_vars = 40L) {
+  if (!is.environment(env)) return(list())
+  names_here <- tryCatch(ls(envir = env, all.names = FALSE), error = function(e) character(0))
+  if (!length(names_here)) return(list())
+  if (length(names_here) > max_vars) names_here <- names_here[seq_len(max_vars)]
+  lapply(names_here, function(nm) {
+    v <- tryCatch(mget(nm, envir = env, ifnotfound = list(NULL))[[1L]],
+                  error = function(e) NULL)
+    cls <- tryCatch(paste(class(v), collapse = "/"), error = function(e) "?")
+    shape <- tryCatch({
+      if (is.null(v)) "NULL"
+      else if (is.data.frame(v)) sprintf("%d x %d", nrow(v), ncol(v))
+      else if (is.function(v)) "function"
+      else if (is.atomic(v) && length(v) == 1L) {
+        t <- paste(format(v), collapse = " ")
+        if (nchar(t) > 60L) paste0(substr(t, 1L, 57L), "...") else t
+      } else sprintf("length %d", length(v))
+    }, error = function(e) "?")
+    list(name = nm, class = cls, value = shape)
+  })
+}
+
+#' The call stack at the moment of an error, as frames a UI can click.
+#'
+#' Stage 5 slice 1. Two details make this useful rather than decorative:
+#'
+#'   IT RUNS BEFORE THE UNWIND. Called from a `withCallingHandlers` error
+#'   handler, so `sys.calls()` still holds the stack. From `tryCatch` it would
+#'   be empty, which is why R users are told to call `traceback()` afterwards.
+#'
+#'   THE HARNESS IS TRIMMED. The bottom frames are this file's own
+#'   (`run_cell`, `withCallingHandlers`, the `lapply` over expressions) and
+#'   showing them teaches the reader that their error came from CarmaR. Frames
+#'   are dropped up to and including the last `eval(e, globalenv())`, which is
+#'   the boundary between our code and theirs.
+#'
+#' @return A list of list(call, file, line) — innermost LAST, the order
+#'   `traceback()` prints and the order people read a stack in.
+capture_trace <- function(max_frames = 40L) {
+  calls <- sys.calls()
+  if (!length(calls)) return(list())
+  texts <- vapply(calls, function(cl) {
+    d <- tryCatch(paste(deparse(cl), collapse = " "), error = function(e) "<call>")
+    if (nchar(d) > 300L) paste0(substr(d, 1L, 297L), "...") else d
+  }, character(1))
+  # Everything up to the user's own evaluation belongs to the harness.
+  # startsWith, not grepl(fixed = TRUE): with fixed = TRUE the `^` is a
+  # LITERAL caret and the pattern never matches, which silently shipped the
+  # whole boot stack to the browser.
+  boundary <- which(startsWith(texts, "withVisible(eval(") |
+                    startsWith(texts, "eval(e, globalenv())"))
+  from <- if (length(boundary)) max(boundary) + 1L else 1L
+  # And the handler frames at the very top are ours too.
+  to <- length(texts)
+  while (to >= from && grepl("^(capture_trace|\\.handleSimpleError|h\\(simpleError|stop\\()", texts[[to]])) {
+    to <- to - 1L
+  }
+  if (to < from) return(list())
+  idx <- seq.int(from, to)
+  if (length(idx) > max_frames) idx <- utils::tail(idx, max_frames)
+  frames <- sys.frames()
+  lapply(idx, function(k) {
+    ref <- utils::getSrcref(calls[[k]])
+    list(call = texts[[k]],
+         # The frame's own variables, so "what was `n` at the time?" has an
+         # answer without re-running anything. `ls()` and `class()` only — no
+         # user code is evaluated here, and the values are capped hard because
+         # a frame can hold a 2 GB data frame and this rides the same stdout
+         # the cell's output does.
+         vars = if (k <= length(frames)) frame_vars(frames[[k]]) else list(),
+         file = if (is.null(ref)) NULL else {
+           f <- attr(ref, "srcfile")
+           if (is.null(f) || is.null(f$filename) || !nzchar(f$filename)) NULL else f$filename
+         },
+         line = if (is.null(ref)) NULL else as.integer(ref[[1L]]))
+  })
+}
+
 #' @return Invisibly NULL. Emits exactly one `done` frame.
 run_cell <- function(id, source, dims = NULL) {
   stopifnot(is.character(source), length(source) == 1L)
@@ -1735,10 +1861,21 @@ run_cell <- function(id, source, dims = NULL) {
   dir.create(plot_dir)
   seen <- character(0)
 
+  # Where the error happened, captured WHILE it happens. By the time
+  # tryCatch's handler runs the stack has already unwound, so a traceback
+  # taken there is empty — this is the whole reason for the extra calling
+  # handler below, and the reason `at_line` is tracked around each top-level
+  # expression rather than derived afterwards.
+  at_line <- NA_integer_
+  trace_frames <- list()
+
   tryCatch(
     withCallingHandlers(
       {
-        exprs <- parse(text = source)
+        # keep.source so every top-level expression knows its own line, which
+        # is what "jump from the error to the source" actually needs.
+        exprs <- parse(text = source, keep.source = TRUE)
+        srcrefs <- attr(exprs, "srcref")
         # ONE device for the whole cell, not one per statement. Base graphics
         # are stateful across statements — `layout()` then two plots, `par()`
         # then a plot, `seq_heatmap()` then `abline()` — and a per-statement
@@ -1747,7 +1884,14 @@ run_cell <- function(id, source, dims = NULL) {
         # harvest_finished(); only the page being drawn waits for cell end.
         dev_seq <- 1L
         open_plot_device(plot_dir, dev_seq, dims)
-        invisible(lapply(exprs, function(e) {
+        invisible(lapply(seq_along(exprs), function(.i) {
+          e <- exprs[[.i]]
+          at_line <<- if (!is.null(srcrefs) && length(srcrefs) >= .i &&
+                          !is.null(srcrefs[[.i]])) {
+            as.integer(srcrefs[[.i]][[1L]])
+          } else {
+            NA_integer_
+          }
           res <- withVisible(eval(e, globalenv()))
           if (isTRUE(res$visible)) {
             v <- res$value
@@ -1776,11 +1920,28 @@ run_cell <- function(id, source, dims = NULL) {
         emit(list(type = "stream", id = id, kind = "message",
                   text = sub("\n$", "", conditionMessage(m))))
         invokeRestart("muffleMessage")
+      },
+      # The traceback, taken BEFORE the stack unwinds. A calling handler runs
+      # inside the erroring frame; tryCatch's handler runs after the unwind,
+      # where sys.calls() is empty. This one only RECORDS — it does not handle
+      # the error, so the tryCatch below still decides the cell's fate.
+      error = function(e) {
+        trace_frames <<- capture_trace()
       }
     ),
     error = function(e) {
       status <<- "error"
       detail <<- conditionMessage(e)
+      # A parse error has no stack and no expression index; its position comes
+      # from the message instead, exactly as the analyzer reads it.
+      emit(list(type = "traceback", id = id,
+                message = conditionMessage(e),
+                # 1-based line WITHIN this chunk's source. NA when the failure
+                # happened outside any top-level expression (a parse error).
+                line = if (is.na(at_line)) NULL else at_line,
+                call = tryCatch(paste(deparse(conditionCall(e)), collapse = " "),
+                                error = function(x) NULL),
+                frames = trace_frames))
     },
     interrupt = function(i) {
       status <<- "interrupted"

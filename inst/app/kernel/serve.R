@@ -101,6 +101,22 @@ if (!length(linger_s) || !is.finite(linger_s)) linger_s <- 600
 # Runs in flight: exec id → TRUE, cleared when the worker's done frame for
 # that id comes back through pump(). This is the busy guard's whole evidence.
 sockets$running <- new.env(parent = emptyenv())
+# Browser request ids are only unique inside one tab (both tabs begin at c1,
+# env-1, ...). The worker sees supervisor-owned ids; this table maps each one
+# back to the socket and id that originated it. That makes isolation a server
+# guarantee, including for older browser bundles that still accept any frame.
+sockets$worker_routes <- new.env(parent = emptyenv())
+sockets$route_seq <- 0L
+sockets$worker_queue <- list()
+sockets$worker_active <- NULL
+sockets$worker_terminal <- NULL
+# The analysis plane keeps its own routes and queue: its replies must never be
+# mistaken for the evaluating session's, and a stuck analysis must never block
+# a run (or the reverse).
+sockets$analyzer <- NULL
+sockets$analyze_routes <- new.env(parent = emptyenv())
+sockets$analyze_queue <- list()
+sockets$analyze_active <- NULL
 sockets$ever_connected <- FALSE
 sockets$idle_since <- NULL
 
@@ -226,9 +242,24 @@ control_rejection <- function(req, allow_file = FALSE) {
 # Commands the supervisor is willing to forward. An allow-list, not a
 # deny-list: a worker command added later is unreachable from the browser
 # until someone adds it here on purpose.
-FORWARDED <- c("env", "obj", "struct", "view", "rm", "packages", "help", "wd",
+FORWARDED <- c("env", "obj", "struct", "view", "rm", "packages",
+               "package_action", "package_help", "help", "wd",
                "parse", "complete", "files", "import", "readfile", "writefile",
                "hover", "format", "sniff", "choose")
+
+# The ANALYSIS plane is a SECOND allow-list, deliberately kept apart from the
+# one above and deliberately tiny. Commands here are routed to spike/analyze.R
+# — a process that reads R and never runs it — instead of to the evaluating
+# session, which is the whole point: syntax checking must keep working while a
+# cell is inside a long calculation (docs/stages/stage-2-intelligence-v1.md).
+#
+# Two separate lists rather than one flag on a shared list, because the
+# question "may the browser ask for this?" and the question "which process
+# answers it?" have different answers and different consequences. A command
+# added to the wrong one either reaches the user's session when it should not,
+# or reaches a process that cannot do it. Adding to EITHER list is a security
+# decision (CLAUDE.md, "FORWARDED in serve.R is an allow-list").
+ANALYZE_FORWARDED <- c("analyze", "analyze_ping", "analyze_workspace")
 
 # A single WebSocket frame this large is not a notebook cell; it is either a
 # bug or an attempt to exhaust memory in fromJSON(). 8 MB is far above any
@@ -375,6 +406,28 @@ app <- list(
       pending <- ls(sockets$mcp_pending)
       for (id in pending) {
         if (identical(sockets$mcp_pending[[id]], rec)) rm(list = id, envir = sockets$mcp_pending)
+      }
+      # Do not spend R time on commands whose only recipient has gone away.
+      abandoned <- vapply(sockets$worker_queue, function(item) {
+        route <- sockets$worker_routes[[item$wire_id]]
+        !is.null(route) && identical(route$rec, rec)
+      }, logical(1))
+      if (any(abandoned)) {
+        ids <- vapply(sockets$worker_queue[abandoned], `[[`, character(1), "wire_id")
+        sockets$worker_queue <- sockets$worker_queue[!abandoned]
+        lapply(ids, drop_worker_route)
+      }
+      a_abandoned <- vapply(sockets$analyze_queue, function(item) {
+        route <- sockets$analyze_routes[[item$wire_id]]
+        !is.null(route) && identical(route$rec, rec)
+      }, logical(1))
+      if (any(a_abandoned)) {
+        a_ids <- vapply(sockets$analyze_queue[a_abandoned], `[[`, character(1), "wire_id")
+        sockets$analyze_queue <- sockets$analyze_queue[!a_abandoned]
+        lapply(a_ids, drop_analyze_route)
+      }
+      for (wid in ls(sockets$analyze_routes)) {
+        if (identical(sockets$analyze_routes[[wid]]$rec, rec)) drop_analyze_route(wid)
       }
       audit("socket-close", sockets = length(sockets$open))
       if (identical(rec$role, "mcp")) notify_mcp_clients()
@@ -584,6 +637,215 @@ notify_mcp_clients <- function() {
 #' something that runs but is not what anybody meant.
 scalar_chr <- function(x) is.character(x) && length(x) == 1L && !is.na(x)
 
+#' Give a browser command a session-unique worker id and remember its owner.
+route_command <- function(cmd, rec, kind) {
+  sockets$route_seq <- sockets$route_seq + 1L
+  wire_id <- paste0("wire-", sockets$route_seq)
+  route <- new.env(parent = emptyenv())
+  route$rec <- rec
+  route$client_id <- cmd$id
+  route$kind <- kind
+  route$response_type <- cmd$type
+  sockets$worker_routes[[wire_id]] <- route
+  cmd$id <- wire_id
+  list(cmd = cmd, wire_id = wire_id)
+}
+
+drop_worker_route <- function(wire_id) {
+  if (exists(wire_id, envir = sockets$worker_routes, inherits = FALSE)) {
+    rm(list = wire_id, envir = sockets$worker_routes)
+  }
+  if (exists(wire_id, envir = sockets$running, inherits = FALSE)) {
+    rm(list = wire_id, envir = sockets$running)
+  }
+  invisible(NULL)
+}
+
+# R is serial, so the supervisor owns one global command queue. Besides
+# avoiding blocked stdin writes, this gives otherwise id-less stdout/stderr a
+# single unambiguous socket owner.
+dispatch_worker_queue <- function() {
+  if (!is.null(sockets$worker_active) || !length(sockets$worker_queue)) {
+    return(invisible(NULL))
+  }
+  item <- sockets$worker_queue[[1L]]
+  sockets$worker_queue <- sockets$worker_queue[-1L]
+  sockets$worker_active <- item$wire_id
+  failed <- tryCatch({ kernel_send(k, item$cmd); NULL },
+                     error = function(e) conditionMessage(e))
+  if (!is.null(failed)) {
+    route <- sockets$worker_routes[[item$wire_id]]
+    if (!is.null(route)) {
+      frame <- if (identical(route$kind, "exec"))
+        list(type = "done", id = route$client_id, status = "error", message = failed)
+      else list(type = item$cmd$type, id = route$client_id, error = failed)
+      try(route$rec$ws$send(toJSON(frame, auto_unbox = TRUE)), silent = TRUE)
+    }
+    drop_worker_route(item$wire_id)
+    sockets$worker_active <- NULL
+    return(dispatch_worker_queue())
+  }
+  invisible(NULL)
+}
+
+enqueue_worker_command <- function(cmd, wire_id) {
+  sockets$worker_queue <- c(sockets$worker_queue,
+                            list(list(cmd = cmd, wire_id = wire_id)))
+  dispatch_worker_queue()
+}
+
+# ── the analysis plane ─────────────────────────────────────────────────────
+# A second child, spawned on FIRST USE rather than at startup: a notebook that
+# never asks for a diagnostic should not pay for a second R process, and a
+# lazily started one also restarts itself for free after a crash.
+ensure_analyzer <- function() {
+  if (!is.null(sockets$analyzer) && sockets$analyzer$proc$is_alive()) {
+    return(sockets$analyzer)
+  }
+  if (!is.null(sockets$analyzer)) {
+    # It died. Anything still in flight will never be answered by it.
+    fail_analyze_routes("the analysis worker stopped")
+    sockets$analyze_active <- NULL
+    sockets$analyze_queue <- list()
+    audit("analyzer-restart")
+  }
+  started <- tryCatch(kernel_start(file.path(here, "analyze.R")),
+                      error = function(e) NULL)
+  sockets$analyzer <- started
+  if (is.null(started)) audit("analyzer-start-failed")
+  started
+}
+
+drop_analyze_route <- function(wire_id) {
+  if (exists(wire_id, envir = sockets$analyze_routes, inherits = FALSE)) {
+    rm(list = wire_id, envir = sockets$analyze_routes)
+  }
+  invisible(NULL)
+}
+
+fail_analyze_routes <- function(reason) {
+  for (wire_id in ls(sockets$analyze_routes)) {
+    route <- sockets$analyze_routes[[wire_id]]
+    try(route$rec$ws$send(toJSON(
+      list(type = route$response_type, id = route$client_id, error = reason),
+      auto_unbox = TRUE)), silent = TRUE)
+    drop_analyze_route(wire_id)
+  }
+  invisible(NULL)
+}
+
+# One in flight at a time, like the worker queue: the analyzer is a single R
+# process, so a second large source written while it is mid-parse could block
+# the SUPERVISOR inside kernel_write — the one thing this event loop may never
+# do. Analysis is milliseconds, so the queue is nearly always empty.
+dispatch_analyze_queue <- function() {
+  if (!is.null(sockets$analyze_active) || !length(sockets$analyze_queue)) {
+    return(invisible(NULL))
+  }
+  a <- ensure_analyzer()
+  item <- sockets$analyze_queue[[1L]]
+  if (is.null(a)) {
+    sockets$analyze_queue <- sockets$analyze_queue[-1L]
+    route <- sockets$analyze_routes[[item$wire_id]]
+    if (!is.null(route)) {
+      try(route$rec$ws$send(toJSON(
+        list(type = route$response_type, id = route$client_id,
+             error = "the analysis worker could not start"),
+        auto_unbox = TRUE)), silent = TRUE)
+    }
+    drop_analyze_route(item$wire_id)
+    return(dispatch_analyze_queue())
+  }
+  sockets$analyze_queue <- sockets$analyze_queue[-1L]
+  sockets$analyze_active <- item$wire_id
+  failed <- tryCatch({
+    kernel_write(a, paste0(toJSON(item$cmd, auto_unbox = TRUE), "\n"))
+    NULL
+  }, error = function(e) conditionMessage(e))
+  if (!is.null(failed)) {
+    route <- sockets$analyze_routes[[item$wire_id]]
+    if (!is.null(route)) {
+      try(route$rec$ws$send(toJSON(
+        list(type = route$response_type, id = route$client_id, error = failed),
+        auto_unbox = TRUE)), silent = TRUE)
+    }
+    drop_analyze_route(item$wire_id)
+    sockets$analyze_active <- NULL
+    return(dispatch_analyze_queue())
+  }
+  invisible(NULL)
+}
+
+enqueue_analyze_command <- function(cmd, wire_id) {
+  sockets$analyze_queue <- c(sockets$analyze_queue,
+                             list(list(cmd = cmd, wire_id = wire_id)))
+  dispatch_analyze_queue()
+}
+
+#' Route one analysis command, mirroring route_command's ownership rules.
+route_analyze <- function(cmd, rec) {
+  sockets$route_seq <- sockets$route_seq + 1L
+  wire_id <- paste0("awire-", sockets$route_seq)
+  route <- new.env(parent = emptyenv())
+  route$rec <- rec
+  route$client_id <- cmd$id
+  # The analyzer answers `analyze_ping` with a `pong` frame; the browser waits
+  # on the type it asked for, so the reply type is recorded here, not guessed.
+  route$response_type <- if (identical(cmd$type, "analyze_ping")) "pong"
+    else if (identical(cmd$type, "analyze_workspace")) "workspace"
+    else "analyze"
+  sockets$analyze_routes[[wire_id]] <- route
+  cmd$id <- wire_id
+  # The wire name is the analyzer's vocabulary, not the browser's.
+  if (identical(cmd$type, "analyze_ping")) cmd$type <- "ping"
+  if (identical(cmd$type, "analyze_workspace")) cmd$type <- "workspace"
+  list(cmd = cmd, wire_id = wire_id)
+}
+
+#' Drain the analyzer and send each reply to the browser that asked.
+pump_analyzer <- function() {
+  a <- sockets$analyzer
+  if (is.null(a)) return(invisible(NULL))
+  if (!a$proc$is_alive()) {
+    fail_analyze_routes("the analysis worker stopped")
+    sockets$analyze_active <- NULL
+    return(invisible(NULL))
+  }
+  for (e in kernel_poll(a, 0L)) {
+    # analyze.R writes nothing to stdout but control frames, so anything
+    # without an id is a boot notice, not a user's output.
+    if (!scalar_chr(e$id)) next
+    wire_id <- e$id
+    if (!exists(wire_id, envir = sockets$analyze_routes, inherits = FALSE)) next
+    route <- sockets$analyze_routes[[wire_id]]
+    e$id <- route$client_id
+    # `null = "null"` is not cosmetic here. jsonlite's DEFAULT renders a NULL
+    # field as `{}`, and this reply is full of deliberately-nullable fields:
+    # `failed` (absent on success), and `line`/`col` on a diagnostic R could
+    # not place. An empty object is truthy in JavaScript, so the default turns
+    # "nothing went wrong" into "something went wrong" and an unplaceable
+    # position into NaN. The analyzer already emits null; re-encoding here must
+    # not undo that.
+    try(route$rec$ws$send(toJSON(e, auto_unbox = TRUE, null = "null", na = "null")),
+        silent = TRUE)
+    drop_analyze_route(wire_id)
+    if (identical(sockets$analyze_active, wire_id)) sockets$analyze_active <- NULL
+  }
+  dispatch_analyze_queue()
+  invisible(NULL)
+}
+
+fail_worker_routes <- function(reason) {
+  for (wire_id in ls(sockets$worker_routes)) {
+    route <- sockets$worker_routes[[wire_id]]
+    frame <- if (identical(route$kind, "exec"))
+      list(type = "done", id = route$client_id, status = "error", message = reason)
+    else list(type = route$response_type, id = route$client_id, error = reason)
+    try(route$rec$ws$send(toJSON(frame, auto_unbox = TRUE)), silent = TRUE)
+  }
+  invisible(NULL)
+}
+
 #' Act on one WebSocket frame. Validates, then forwards; never evaluates.
 handle_frame <- function(message, rec) {
   if (is.raw(message)) return(invisible(NULL))           # binary: not our protocol
@@ -687,11 +949,35 @@ handle_frame <- function(message, rec) {
   if (identical(cmd$type, "exec")) {
     if (!scalar_chr(cmd$id) || !scalar_chr(cmd$source)) return(invisible(NULL))
     audit("exec", id = cmd$id, bytes = nchar(cmd$source, type = "bytes"))
-    assign(cmd$id, TRUE, envir = sockets$running)
-    return(invisible(kernel_exec(k, cmd$id, cmd$source, cmd$dims)))
+    routed <- route_command(cmd, rec, "exec")
+    assign(routed$wire_id, TRUE, envir = sockets$running)
+    enqueue_worker_command(routed$cmd, routed$wire_id)
+    return(invisible(NULL))
   }
   if (identical(cmd$type, "interrupt")) {
-    audit("interrupt")
+    audit("interrupt", id = cmd$id %||% "")
+    # New clients identify their run. Refuse to interrupt another tab's active
+    # command; a queued run can be cancelled without signalling R at all.
+    if (scalar_chr(cmd$id)) {
+      candidates <- Filter(function(wire_id) {
+        route <- sockets$worker_routes[[wire_id]]
+        !is.null(route) && identical(route$rec, rec) &&
+          identical(route$client_id, cmd$id) && identical(route$kind, "exec")
+      }, ls(sockets$worker_routes))
+      if (!length(candidates)) return(invisible(NULL))
+      wire_id <- candidates[[1L]]
+      if (identical(wire_id, sockets$worker_active)) {
+        return(invisible(kernel_interrupt(k)))
+      }
+      sockets$worker_queue <- Filter(function(item) !identical(item$wire_id, wire_id),
+                                     sockets$worker_queue)
+      try(rec$ws$send(toJSON(list(type = "done", id = cmd$id,
+        status = "interrupted", message = "Execution interrupted"),
+        auto_unbox = TRUE)), silent = TRUE)
+      drop_worker_route(wire_id)
+      return(invisible(NULL))
+    }
+    # Compatibility for an older notebook bundle with id-less Stop.
     return(invisible(kernel_interrupt(k)))
   }
   # Restart: a NEW worker process — fresh globalenv, fresh packages. The stored
@@ -699,57 +985,98 @@ handle_frame <- function(message, rec) {
   # replaces it via pump() and reaches every open socket.
   if (identical(cmd$type, "restart")) {
     audit("restart")
+    fail_worker_routes("R was restarted — this request was abandoned.")
     try(kernel_stop(k, grace = 1), silent = TRUE)
     k <<- kernel_start(file.path(here, "worker-boot.R"))
     sockets$hello <- NULL
     # In-flight runs died with the old worker; the new one will never emit
     # their done frames, and a stuck entry would block idle linger forever.
     rm(list = ls(sockets$running), envir = sockets$running)
+    rm(list = ls(sockets$worker_routes), envir = sockets$worker_routes)
+    sockets$worker_queue <- list()
+    sockets$worker_active <- NULL
+    sockets$worker_terminal <- NULL
+    return(invisible(NULL))
+  }
+  if (cmd$type %in% ANALYZE_FORWARDED) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    audit(cmd$type, id = cmd$id)
+    routed <- route_analyze(cmd, rec)
+    enqueue_analyze_command(routed$cmd, routed$wire_id)
     return(invisible(NULL))
   }
   if (cmd$type %in% FORWARDED) {
     if (!scalar_chr(cmd$id)) return(invisible(NULL))
     audit(cmd$type, id = cmd$id)
-    # A command that cannot be handed to the worker is ANSWERED, with the
-    # reason. Silence here is indistinguishable from a slow answer, so the page
-    # sat on a spinner until its own timeout and then said "R did not answer" —
-    # true, and useless.
-    failed <- tryCatch({ kernel_send(k, cmd); NULL },
-                       error = function(e) conditionMessage(e))
-    if (!is.null(failed)) {
-      audit("forward-failed", id = cmd$id, detail = failed)
-      reply <- toJSON(list(type = cmd$type, id = cmd$id, error = failed), auto_unbox = TRUE)
-      lapply(sockets$open, function(r) try(r$ws$send(reply), silent = TRUE))
-    }
+    routed <- route_command(cmd, rec, "request")
+    enqueue_worker_command(routed$cmd, routed$wire_id)
     return(invisible(NULL))
   }
   audit("unknown-command", detail = cmd$type)
   invisible(NULL)
 }
 
-#' Forward everything the worker produced to every connected page.
+#' Route worker replies only to the browser that originated the command.
 pump <- function() {
+  # The analysis plane drains first and independently: it must not wait behind
+  # the evaluating worker's frames, which is the entire reason it exists.
+  pump_analyzer()
   events <- kernel_poll(k, 0L)
-  if (length(events) == 0L) return(invisible(NULL))
-  payload <- vapply(events, function(e) toJSON(e, auto_unbox = TRUE), character(1))
-  ready_at <- which(vapply(events, function(e) identical(e$type, "ready"), logical(1)))
-  if (length(ready_at) > 0L) sockets$hello <- payload[[ready_at[[1L]]]]
-  # A done frame retires its run from the in-flight set even when no socket
-  # is left to deliver it to — that is the moment the idle clock may start.
-  lapply(events, function(e) {
-    if (identical(e$type, "done") && length(e$id) == 1L && is.character(e$id) &&
-        exists(e$id, envir = sockets$running, inherits = FALSE)) {
-      rm(list = e$id, envir = sockets$running)
+  if (length(events) == 0L) {
+    # stdout and stderr are separate OS pipes. A done/response frame can be
+    # observed just before the final stderr bytes become readable, so retire
+    # its owner only after one completely empty drain cycle.
+    if (!is.null(sockets$worker_terminal)) {
+      terminal <- sockets$worker_terminal
+      wire_id <- terminal$wire_id
+      try(terminal$route$rec$ws$send(toJSON(terminal$frame, auto_unbox = TRUE)),
+          silent = TRUE)
+      drop_worker_route(wire_id)
+      if (identical(sockets$worker_active, wire_id)) sockets$worker_active <- NULL
+      sockets$worker_terminal <- NULL
+      dispatch_worker_queue()
     }
-  })
-  lapply(sockets$open, function(r) {
-    lapply(payload, function(p) try(r$ws$send(p), silent = TRUE))
+    return(invisible(NULL))
+  }
+  lapply(events, function(e) {
+    # Plain stdout/stderr has no protocol id. The worker is serial, so it
+    # belongs to the oldest execution still in flight.
+    had_id <- scalar_chr(e$id)
+    wire_id <- if (had_id) e$id else
+      if (e$type %in% c("stdout", "stderr")) sockets$worker_active else NULL
+    route <- if (!is.null(wire_id) &&
+                 exists(wire_id, envir = sockets$worker_routes, inherits = FALSE))
+      sockets$worker_routes[[wire_id]] else NULL
+
+    if (!is.null(route)) {
+      e$id <- route$client_id
+      is_terminal <- (identical(route$kind, "request") && had_id) ||
+        identical(e$type, "done")
+      if (is_terminal) {
+        # Hold the terminal frame until the pipes are quiescent. Otherwise the
+        # browser settles the result before a trailing stderr frame arrives.
+        sockets$worker_terminal <- list(wire_id = wire_id, route = route, frame = e)
+      } else {
+        try(route$rec$ws$send(toJSON(e, auto_unbox = TRUE)), silent = TRUE)
+      }
+      return(invisible(NULL))
+    }
+
+    # Session-wide lifecycle frames have no owner and must reach every tab.
+    payload <- toJSON(e, auto_unbox = TRUE)
+    if (identical(e$type, "ready")) sockets$hello <- payload
+    lapply(sockets$open, function(r) try(r$ws$send(payload), silent = TRUE))
+    invisible(NULL)
   })
   invisible(NULL)
 }
 
 server <- httpuv::startServer(host, port, app)
-on.exit({ httpuv::stopServer(server); kernel_stop(k) }, add = TRUE)
+on.exit({
+  httpuv::stopServer(server)
+  kernel_stop(k)
+  if (!is.null(sockets$analyzer)) try(kernel_stop(sockets$analyzer), silent = TRUE)
+}, add = TRUE)
 
 url <- paste0(origin_ok, "/")
 
