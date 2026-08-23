@@ -11,8 +11,8 @@
 #' Launch CarmaR
 #'
 #' Starts an independent local CarmaR kernel and opens the notebook in the
-#' default browser. Up to five sessions start directly; starting a sixth asks
-#' first. The kernel is a
+#' default browser. `run()` never asks permission to do what it was told: you
+#' typed the command, so the session starts. The kernel is a
 #' separate R process; closing the R session that called `run()` does not
 #' close the notebook.
 #'
@@ -22,9 +22,9 @@
 #' @param open Open the browser once the kernel answers? Default `TRUE`.
 #' @param new Start an independent session? Default `TRUE`. Set `FALSE` to
 #'   reopen a live session on `port` when there is one.
-#' @param allow_more Confirmation override after five live sessions. Leave
-#'   `NULL` for an explicit prompt, `TRUE` to allow, or `FALSE` to reopen the
-#'   newest existing session.
+#' @param allow_more What to do when `MAX_SESSIONS` are already live. `NULL`
+#'   (default) and `TRUE` both start the session; `FALSE` reopens the newest
+#'   existing one instead. Never a prompt.
 #' @return Invisibly, the versioned notebook file URL with its kernel selected.
 #' @examples
 #' \dontrun{
@@ -33,6 +33,20 @@
 #' }
 #' @importFrom httpuv startServer
 #' @export
+#' The point at which `run()` starts SAYING how many sessions are live.
+#'
+#' Each session is a whole R process plus a browser origin of its own, so the
+#' number is about the machine. It is no longer a gate here: a dialog on a
+#' typed command is a question whose answer the user already gave, and the one
+#' it kept asking was wrong anyway — until 0.60.1 a kernel could not tell a
+#' closed laptop from an attached notebook, so sessions nobody had open kept
+#' answering, kept counting, and pushed every launch into a prompt about
+#' sessions that did not exist. The real cap lives in the supervisor, where
+#' the caller is a WEB PAGE rather than a person: an uncapped sibling-start on
+#' a browser's say-so is a resource-exhaustion button (see MAX_SESSIONS in
+#' spike/serve.R, enforced there and unchanged).
+MAX_SESSIONS <- 10L
+
 run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
   stopifnot(is.numeric(port), length(port) == 1L, is.finite(port),
             port == as.integer(port), port > 0, port < 65536)
@@ -63,7 +77,12 @@ run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
     return(invisible(page))
   }
 
-  if (new && length(live) >= 5L && !confirm_more_sessions(length(live), allow_more)) {
+  if (new && length(live) >= MAX_SESSIONS) {
+    message(length(live), " CarmaR sessions are already running. ",
+            "carmar::stop_kernel(\"all\") stops them all; ",
+            "carmar::sessions() lists them.")
+  }
+  if (new && length(live) >= MAX_SESSIONS && !confirm_more_sessions(length(live), allow_more)) {
     u <- unname(live[[1]])
     page <- notebook_launch_url(u, state)
     if (open) utils::browseURL(page)
@@ -72,7 +91,7 @@ run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
   }
 
   # Independent sessions get stable adjacent origins. That preserves browser
-  # storage per session while making the ordinary five predictable.
+  # storage per session while making the ordinary ten predictable.
   used <- vapply(live, kernel_port, integer(1))
   chosen <- NA_integer_
   for (candidate in seq.int(as.integer(port), 65535L)) {
@@ -159,6 +178,48 @@ run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
   # strand a student without the address.
   message("CarmaR is running behind this notebook file:\n  ", page)
   invisible(page)
+}
+
+#' Start CarmaR for a published book
+#'
+#' Reuses a pairing-capable kernel on `port`. If that port contains an older
+#' CarmaR kernel from before published-page pairing was added, it is cleanly
+#' restarted from the currently installed package first. This avoids the
+#' misleading local `/pair` 404 that an otherwise healthy stale process would
+#' return after the package itself had been upgraded.
+#'
+#' @param port Fixed loopback port used by the published page (default 4747).
+#' @param open Open the full local notebook too? Published books normally leave
+#'   this `FALSE`.
+#' @return Invisibly, the local notebook URL returned by [run()].
+#' @export
+run_published <- function(port = 4747, open = FALSE) {
+  stopifnot(is.numeric(port), length(port) == 1L, is.finite(port),
+            port == as.integer(port), port > 0, port < 65536)
+  port <- as.integer(port)
+  state <- tools::R_user_dir("carmar", "data")
+  live <- live_kernel_urls(state)
+  at_port <- live[vapply(live, kernel_port, integer(1)) == port]
+
+  if (length(at_port) && !kernel_supports_published_pairing(at_port[[1]])) {
+    message("Restarting the older CarmaR kernel on port ", port,
+            " so published pages can pair with it.")
+    if (!isTRUE(stop_kernel(port))) {
+      stop("The older CarmaR kernel on port ", port,
+           " could not be stopped. Run carmar::stop_kernel(", port,
+           ") and try again.", call. = FALSE)
+    }
+    for (i in seq_len(50L)) {
+      if (port_is_free(port)) break
+      Sys.sleep(0.1)
+    }
+    if (!port_is_free(port)) {
+      stop("Port ", port, " did not become available after CarmaR stopped.",
+           call. = FALSE)
+    }
+  }
+
+  run(port = port, open = open, new = FALSE)
 }
 
 #' List CarmaR sessions
@@ -404,14 +465,26 @@ upgrade_package <- function(rel, say) {
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
 #' Is the kernel behind this notebook URL answering? @noRd
-kernel_alive <- function(u) {
+kernel_health <- function(u) {
   if (!valid_kernel_url(u)) return(FALSE)
   health <- paste0(kernel_base(u), "/health")
   tryCatch({
-    rec <- jsonlite::fromJSON(paste(slurp(health), collapse = "\n"),
-                              simplifyVector = TRUE)
-    is.list(rec) && isTRUE(rec$ok) && isTRUE(rec$worker)
-  }, error = function(e) FALSE)
+    jsonlite::fromJSON(paste(slurp(health), collapse = "\n"),
+                       simplifyVector = TRUE)
+  }, error = function(e) NULL)
+}
+
+#' Is the kernel behind this notebook URL answering? @noRd
+kernel_alive <- function(u) {
+  rec <- kernel_health(u)
+  is.list(rec) && isTRUE(rec$ok) && isTRUE(rec$worker)
+}
+
+#' Can this live kernel host the published-page consent bridge? @noRd
+kernel_supports_published_pairing <- function(u) {
+  rec <- kernel_health(u)
+  is.list(rec) && isTRUE(rec$ok) && isTRUE(rec$worker) &&
+    "published-pairing-v3" %in% (rec$capabilities %||% character())
 }
 
 #' Is this a loopback-only CarmaR transport URL, optionally on one port? @noRd
@@ -496,25 +569,21 @@ port_is_free <- function(port) {
 }
 
 #' Explicitly authorize a sixth-or-later independent session. @noRd
+#' Whether a launch past the cap proceeds. It does, unless someone said not to.
+#'
+#' This used to raise a dialog — `askYesNo`, an osascript panel, `winDialog`,
+#' or an outright `stop()` — every single launch once the count was reached.
+#' Three things were wrong with it. The count included kernels that were dead
+#' to everyone except the health check; the question interrupted a command the
+#' user had just typed, which is not consent-seeking but nagging; and refusing
+#' silently reopened some OTHER session, so the answer to "start another?" was
+#' a notebook the reader did not ask for. Explicit refusal still works, for
+#' scripts that want it: `allow_more = FALSE`, or CARMAR_ALLOW_MORE=0.
 confirm_more_sessions <- function(count, allow_more = NULL) {
   if (!is.null(allow_more)) return(isTRUE(allow_more))
-  question <- paste0(count, " CarmaR sessions are already running. Start another?")
   env <- tolower(Sys.getenv("CARMAR_ALLOW_MORE", ""))
-  if (env %in% c("1", "true", "yes")) return(TRUE)
   if (env %in% c("0", "false", "no")) return(FALSE)
-  if (interactive()) return(isTRUE(utils::askYesNo(question, default = FALSE)))
-  if (identical(Sys.info()[["sysname"]], "Darwin") && nzchar(Sys.which("osascript"))) {
-    script <- paste0('display dialog "', question,
-      '" buttons {"Keep five", "Start another"} default button "Keep five"')
-    answer <- suppressWarnings(system2("osascript", c("-e", shQuote(script)),
-      stdout = TRUE, stderr = FALSE))
-    return(any(grepl("button returned:Start another", answer, fixed = TRUE)))
-  }
-  if (.Platform$OS.type == "windows") {
-    return(identical(utils::winDialog("yesno", question), "YES"))
-  }
-  stop(question, " Run carmar::run(allow_more = TRUE) only if you want that.",
-       call. = FALSE)
+  TRUE
 }
 
 #' readLines over http with a short timeout, connection always closed. @noRd

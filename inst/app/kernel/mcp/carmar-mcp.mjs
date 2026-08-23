@@ -125,6 +125,7 @@ let clientName = "agent";        // learned from the CLI's initialize call
 let connection = null;           // { sock, pending: Map, hello }
 
 function dropConnection() {
+  if (connection && connection.beat) clearInterval(connection.beat);
   if (connection && connection.sock) { try { connection.sock.close(); } catch { /* gone */ } }
   connection = null;
 }
@@ -148,7 +149,19 @@ async function kernelConnection() {
     clearTimeout(waiter.timer);
     waiter.resolve(frame);
   });
+  // An agent holds its socket for the whole CLI session and can go a long time
+  // without asking anything, so it beats like a page does. Without this, a
+  // Claude Code or Codex process that is killed on a half-open link would keep
+  // the kernel believing someone is attached — the agent plane would strand
+  // exactly the sessions the notebook plane no longer does.
+  conn.beat = setInterval(() => {
+    if (sock.readyState !== 1) return;
+    try { sock.send(JSON.stringify({ type: "hb" })); } catch { /* closing */ }
+  }, 25_000);
+  conn.beat.unref?.();
+
   sock.addEventListener("close", () => {
+    clearInterval(conn.beat);
     for (const waiter of pending.values()) {
       clearTimeout(waiter.timer);
       waiter.reject(new Error("The kernel connection closed."));

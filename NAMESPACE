@@ -1,4 +1,5 @@
 export(run)
+export(run_published)
 export(sessions)
 export(stop_kernel)
 export(upgrade)

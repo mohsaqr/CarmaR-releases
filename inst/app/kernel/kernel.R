@@ -36,6 +36,33 @@ detect_rscript <- function() {
 #'   the worker — e.g. `c(CARMAR_ROOT = "/srv/project")`, which confines every
 #'   file command to that subtree. Managed deployments set it; tests set it to
 #'   prove the confinement holds.
+#' A UTF-8 character locale, whatever the launcher handed us.
+#'
+#' The desktop app is started by launchd, which supplies no locale at all, so
+#' R falls back to C — and a C locale is not "English", it is "no character
+#' encoding". In that state jsonlite escapes every high byte of a string whose
+#' declared encoding is unknown, so `35 – 1158` reaches the browser as
+#' `35 <e2><80><93> 1158`, a column called `région` mangles the same way, and R
+#' source containing a non-ASCII identifier does not even parse.
+#'
+#' Both ENDS need this. The supervisor calls it for itself (it parses and
+#' re-encodes every frame on the wire); `kernel_start` puts it in each child's
+#' environment. Fixing only one end fixes nothing: the mangling simply moves.
+#'
+#' Surgical: LC_CTYPE alone, so the user's own locale keeps deciding number and
+#' date formatting, and only when what we have is not already UTF-8 — a
+#' deliberate de_DE.UTF-8 is never overridden.
+#'
+#' @return The locale name now in force for LC_CTYPE.
+utf8_ctype <- function() {
+  current <- Sys.getlocale("LC_CTYPE")
+  if (grepl("utf-?8", current, ignore.case = TRUE)) return(current)
+  for (candidate in c("C.UTF-8", "en_US.UTF-8", "UTF-8")) {
+    if (nzchar(suppressWarnings(Sys.setlocale("LC_CTYPE", candidate)))) return(candidate)
+  }
+  current                                  # nothing available: carry on as-is
+}
+
 kernel_start <- function(worker_path, sentinel = NULL, rscript = detect_rscript(),
                          env_extra = character()) {
   stopifnot(file.exists(worker_path), nzchar(rscript))
@@ -49,6 +76,44 @@ kernel_start <- function(worker_path, sentinel = NULL, rscript = detect_rscript(
   parent_env <- Sys.getenv()
   clean_env <- parent_env[!grepl("^R_(HOME|LIBS|LIBS_USER|LIBS_SITE|PROFILE|ENVIRON|DOC_DIR|INCLUDE_DIR|SHARE_DIR)",
                                  names(parent_env))]
+  # ── the child must speak UTF-8, whatever launched the parent ────────────
+  # The desktop launcher inherits launchd's C locale, and a child R in a C
+  # locale is not merely English — it cannot represent non-ASCII at all:
+  #
+  #   * a string literal in worker.R with an en dash parses to encoding
+  #     "unknown", and jsonlite serialises it as `35 <e2><80><93> 1158`, which
+  #     is what the variables panel showed;
+  #   * a data frame with a column called `région` mangles the same way;
+  #   * a source file containing a non-ASCII IDENTIFIER does not even parse.
+  #
+  # `encoding = "UTF-8"` on the pipes below fixes only the supervisor's READING
+  # of the wire. This fixes the child's PRODUCING of it, which is the half that
+  # was missing.
+  #
+  # Surgical on purpose: only LC_CTYPE (the character encoding), so a user's
+  # own locale keeps deciding number and date formatting; only when the
+  # inherited locale is not already UTF-8, so a deliberate de_DE.UTF-8 is never
+  # overridden; and LC_ALL is DROPPED when it is the non-UTF-8 culprit, because
+  # LC_ALL outranks LC_CTYPE and would otherwise win silently.
+  utf8_locale <- function(x) grepl("utf-?8", x, ignore.case = TRUE)
+  # `Sys.getenv()` is a named CHARACTER VECTOR, and `x[["missing"]]` on one
+  # throws "subscript out of bounds" — it does not return NULL the way a list
+  # does. LC_ALL is unset on most machines, so reading it directly errored on
+  # the common path and took the kernel down at startup.
+  from_env <- function(name) if (name %in% names(clean_env)) clean_env[[name]] else ""
+  lc_all <- from_env("LC_ALL")
+  effective <- if (nzchar(lc_all)) lc_all else {
+    ctype <- from_env("LC_CTYPE")
+    if (nzchar(ctype)) ctype else Sys.getlocale("LC_CTYPE")
+  }
+  if (!utf8_locale(effective)) {
+    # LC_ALL outranks LC_CTYPE, so a non-UTF-8 LC_ALL would win silently.
+    if (nzchar(lc_all) && !utf8_locale(lc_all)) {
+      clean_env <- clean_env[names(clean_env) != "LC_ALL"]
+    }
+    clean_env[["LC_CTYPE"]] <- utf8_ctype()
+  }
+
   if (length(env_extra)) {
     stopifnot(is.character(env_extra), !is.null(names(env_extra)))
     clean_env <- c(clean_env[setdiff(names(clean_env), names(env_extra))], env_extra)
@@ -207,16 +272,38 @@ kernel_poll <- function(k, timeout_ms = 50L) {
       return(character())
     }
     last <- nl[[length(nl)]]
+    # `last = nchar(data)` is NOT redundant. substring()'s default last is
+    # 1000000L, so a two-argument substring() SILENTLY TRUNCATES at exactly one
+    # million characters — see the note on the payload slice below, which this
+    # is the other half of. Here it would drop the tail of any partial line
+    # longer than 1 MB still waiting for its newline.
     complete <- if (last > 1L) substring(data, 1L, last - 1L) else ""
-    k$io[[field]] <- if (last < nchar(data)) substring(data, last + 1L) else ""
+    k$io[[field]] <- if (last < nchar(data))
+      substring(data, last + 1L, nchar(data)) else ""
     # Appending a marker preserves a final empty line, which base strsplit()
     # would otherwise discard (cat("\n") is real stdout).
     lines <- strsplit(paste0(complete, "\001"), "\n", fixed = TRUE)[[1L]]
     lines[[length(lines)]] <- sub("\001$", "", lines[[length(lines)]])
     sub("\r$", "", lines)
   }
-  out <- take_lines("out", k$proc$read_output(), !k$proc$is_alive())
-  err <- take_lines("err", k$proc$read_error(), !k$proc$is_alive())
+  # DRAIN the pipe, do not sip from it. read_output() returns whatever one
+  # read yields — around 64 KB — and this function is called once per event
+  # loop tick, so a big frame arrived at one chunk per tick. Measured: a
+  # 2.3 MB plot payload needs ~370 reads, which at the loop's cadence took
+  # SIXTEEN SECONDS to deliver something R had drawn in 0.27 s. The dpi was
+  # never the cost; the number of ticks was, and it scales with payload, so
+  # every large plot, every wide data frame and every long print paid it.
+  drain <- function(read) {
+    parts <- character(0)
+    repeat {
+      piece <- tryCatch(read(), error = function(e) "")
+      if (!length(piece) || !nzchar(piece)) break
+      parts[[length(parts) + 1L]] <- piece
+    }
+    if (length(parts)) paste0(parts, collapse = "") else ""
+  }
+  out <- take_lines("out", drain(function() k$proc$read_output()), !k$proc$is_alive())
+  err <- take_lines("err", drain(function() k$proc$read_error()), !k$proc$is_alive())
 
   # The sentinel is found ANYWHERE in the line, not only at its start.
   #
@@ -235,9 +322,31 @@ kernel_poll <- function(k, timeout_ms = 50L) {
   from_stdout <- unlist(lapply(out, function(line) {
     at <- regexpr(k$sentinel, line, fixed = TRUE)
     if (at < 1L) return(list(list(type = "stdout", text = line)))
-    payload <- substring(line, at + nchar(k$sentinel))
+    # `nchar(line)` is NOT redundant: substring()'s default `last` is
+    # 1000000L, so the two-argument form silently truncates at exactly one
+    # million characters. Every control frame bigger than 1 MB — which means
+    # EVERY PLOT above roughly 750 KB of PNG — came out chopped mid-string,
+    # failed to parse, and fell through to the branch below that reports the
+    # line as ordinary stdout. The plot vanished with no error anywhere: the
+    # cell finished "ok", the sentinel and the raw JSON were printed into the
+    # output, and the figure simply never appeared. Measured: a 0.25 MB frame
+    # arrived, a 0.75 MB frame did not.
+    payload <- substring(line, at + nchar(k$sentinel), nchar(line))
     parsed <- tryCatch(fromJSON(payload), error = function(e) NULL)
     if (is.null(parsed)) return(list(list(type = "stdout", text = line)))
+    # The EXACT bytes ride along with the parsed frame, because the supervisor
+    # relays this to a browser and re-encoding it there is lossy in three ways
+    # at once: jsonlite's default `digits = 4` rounded every number the worker
+    # sent (1.2e-5 arrived as 0, and exports wrote that zero), the default
+    # `null` rendering turned an absent field into `{}` rather than null, and
+    # the simplification above collapses `bins: [500]` back to `bins: 500` —
+    # undoing the very I() wrapping worker.R applies to prevent it.
+    #
+    # The parse stays: routing reads $type and $id, and a faithful re-encode
+    # from a nested list measures 225 ms/frame against 4 ms, far too slow for
+    # a single-threaded event loop. So the supervisor routes on the parse and
+    # forwards the ORIGINAL text. See relay_frame() in serve.R.
+    attr(parsed, "raw") <- payload
     prefix <- substring(line, 1L, at - 1L)
     if (nzchar(prefix)) list(list(type = "stdout", text = prefix), parsed) else list(parsed)
   }), recursive = FALSE)

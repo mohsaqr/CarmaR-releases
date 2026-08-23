@@ -18,6 +18,16 @@ here <- dirname(normalizePath(sub("^--file=", "",
   grep("^--file=", commandArgs(FALSE), value = TRUE)[1])))
 source(file.path(here, "kernel.R"))
 
+# Before anything reads or writes a frame. The supervisor parses every browser
+# message and re-encodes every worker reply, so its own character locale
+# decides whether `région` survives the round trip — and launchd hands a
+# desktop app no locale at all. See utf8_ctype() in kernel.R.
+# `invisible`: a bare call at the top level of a script AUTO-PRINTS its value,
+# and this stdout is a protocol channel — the launcher reads it to find the
+# {"url": ...} line. A stray [1] "UTF-8" ahead of that is noise at best and an
+# unparseable first line at worst.
+invisible(utf8_ctype())
+
 host <- "127.0.0.1"
 
 #' A STABLE port, because the browser partitions storage by ORIGIN.
@@ -98,6 +108,24 @@ sockets$chats <- new.env(parent = emptyenv())
 # slow browser launch cannot lose the kernel it was opening.
 linger_s <- suppressWarnings(as.numeric(Sys.getenv("CARMAR_LINGER", "600")))
 if (!length(linger_s) || !is.finite(linger_s)) linger_s <- 600
+# A socket that stopped answering is not a connection, and until 0.60.1 the
+# supervisor could not tell the difference. `ws$onClose` is the ONLY thing that
+# ever removed a page from `sockets$open`, and it fires on an orderly TCP close:
+# a laptop that sleeps, a Wi-Fi change, a browser that is force-quit all leave a
+# HALF-OPEN socket whose entry stays forever. `linger_check()` then sees a
+# connection that no longer exists, never arms its clock, and the kernel becomes
+# immortal — which is how a machine ends up with eight live R sessions and one
+# open notebook, every one of them counting against the launcher's cap.
+#
+# httpuv 1.6 exposes no WebSocket ping (send/close/onMessage/onClose is the
+# whole surface), so liveness has to be application-level: the client beats
+# (`{"type":"hb"}`), the supervisor timestamps every frame, and a socket that
+# HAS beaten and then goes quiet past this threshold is closed and dropped.
+# Only a socket that has beaten at least once is ever reaped — a notebook built
+# before heartbeats exists on people's disks and must keep today's behaviour
+# rather than be disconnected while its reader is looking at it.
+socket_silence_s <- suppressWarnings(as.numeric(Sys.getenv("CARMAR_SOCKET_SILENCE", "90")))
+if (!length(socket_silence_s) || !is.finite(socket_silence_s)) socket_silence_s <- 90
 # Runs in flight: exec id → TRUE, cleared when the worker's done frame for
 # that id comes back through pump(). This is the busy guard's whole evidence.
 sockets$running <- new.env(parent = emptyenv())
@@ -108,6 +136,15 @@ sockets$running <- new.env(parent = emptyenv())
 sockets$worker_routes <- new.env(parent = emptyenv())
 sockets$route_seq <- 0L
 sockets$worker_queue <- list()
+# Published Quarto pages never connect to the worker socket directly. A reader
+# explicitly pairs one page in a loopback consent window; that LOCAL window
+# owns the socket and relays only messages from the exact approved origin.
+sockets$pairing_requests <- new.env(parent = emptyenv())
+# Consent belongs to this local CarmaR session, not to one popup document.
+# Once an origin is approved, a replacement bridge window for that exact
+# origin may reconnect without asking again. The environment disappears when
+# the kernel stops, so approval is still session-scoped.
+sockets$published_approvals <- new.env(parent = emptyenv())
 sockets$worker_active <- NULL
 sockets$worker_terminal <- NULL
 # The analysis plane keeps its own routes and queue: its replies must never be
@@ -119,6 +156,9 @@ sockets$analyze_queue <- list()
 sockets$analyze_active <- NULL
 sockets$ever_connected <- FALSE
 sockets$idle_since <- NULL
+# When this supervisor started. A kernel nobody ever connected to is idle FROM
+# BOOT, so the linger clock has something to run from — see linger_check().
+sockets$boot_at <- Sys.time()
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
@@ -198,6 +238,122 @@ query_param <- function(qs, name) {
   utils::URLdecode(sub(paste0("^", name, "="), "", hit))
 }
 
+#' Is this an exact web origin (scheme + authority, no path or credentials)?
+#'
+#' It is deliberately a small parser: the value is used only as an opaque key
+#' compared with the browser-supplied Origin header.  Keeping paths, fragments
+#' and control characters out also makes it safe to show on the consent page.
+published_origin_valid <- function(origin) {
+  length(origin) == 1L && !is.na(origin) && nchar(origin, type = "bytes") <= 512L &&
+    grepl("^https?://[A-Za-z0-9._~-]+(:[0-9]{1,5})?$", origin)
+}
+
+# A native CarmaR launcher may start the kernel for one published page.  The
+# URL-scheme handoff is the user's consent gesture; carrying only the exact
+# origin into this process keeps the permission session-scoped and prevents a
+# second site from borrowing it.
+initial_published_origin <- Sys.getenv("CARMAR_PUBLISHED_ORIGIN", "")
+if (published_origin_valid(initial_published_origin)) {
+  sockets$published_approvals[[initial_published_origin]] <- TRUE
+  audit("published-origin-authorized", origin = initial_published_origin,
+        source = "launcher")
+}
+
+html_escape <- function(x) {
+  x <- gsub("&", "&amp;", x, fixed = TRUE)
+  x <- gsub("<", "&lt;", x, fixed = TRUE)
+  x <- gsub(">", "&gt;", x, fixed = TRUE)
+  x <- gsub('"', "&quot;", x, fixed = TRUE)
+  gsub("'", "&#39;", x, fixed = TRUE)
+}
+
+# A secret only the loopback consent document can read.  A foreign page can
+# open /pair, but X-Frame-Options keeps it out of an iframe and same-origin
+# policy keeps it from learning this value; therefore it cannot manufacture
+# the approval navigation without the reader pressing the local button.
+pairing_challenge <- function() {
+  alphabet <- c(letters, LETTERS, 0:9)
+  paste(sample(alphabet, 48L, replace = TRUE), collapse = "")
+}
+
+prune_pairing_requests <- function(now = as.numeric(Sys.time())) {
+  for (key in ls(sockets$pairing_requests, all.names = TRUE)) {
+    rec <- sockets$pairing_requests[[key]]
+    if (is.null(rec$created) || now - rec$created > 300) {
+      rm(list = key, envir = sockets$pairing_requests)
+    }
+  }
+  invisible(NULL)
+}
+
+pairing_page <- function(origin, nonce = "") {
+  prune_pairing_requests()
+  challenge <- pairing_challenge()
+  sockets$pairing_requests[[challenge]] <- list(
+    origin = origin, nonce = substr(nonce, 1L, 200L), created = as.numeric(Sys.time()))
+  paste0('<!doctype html><html><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; ',
+    "style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'\">",
+    '<title>Allow this book to use CarmaR?</title><style>',
+    'body{font:16px/1.5 system-ui,sans-serif;max-width:42rem;margin:10vh auto;padding:0 1.25rem;color:#172033}',
+    '.site{padding:.75rem 1rem;background:#f3f6fb;border-radius:.55rem;overflow-wrap:anywhere}',
+    'button{border:0;border-radius:.5rem;background:#2357d9;color:white;padding:.7rem 1rem;font:inherit;font-weight:650;cursor:pointer}',
+    'small{color:#59657a}</style></head><body>',
+    '<h1>Run this book with your R?</h1><p>The published site</p><p class="site"><strong>',
+    html_escape(origin), '</strong></p>',
+    '<p>wants to send R chunks to this CarmaR session on your computer. ',
+    'The code will run as your user and can access your files and network.</p>',
+    '<form method="get" action="/pair/approve"><input type="hidden" name="challenge" value="',
+    challenge, '"><button type="submit">Allow for this session</button></form>',
+    '<p><small>Nothing runs until you press a chunk\'s Run button. ',
+    'Approval disappears when this CarmaR session stops.</small></p></body></html>')
+}
+
+pairing_bridge_page <- function(rec) {
+  target <- toJSON(rec$origin, auto_unbox = TRUE)
+  nonce <- toJSON(rec$nonce, auto_unbox = TRUE)
+  socket_url <- toJSON(paste0("ws://127.0.0.1:", port, "/ws"), auto_unbox = TRUE)
+  paste0('<!doctype html><html><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; ',
+    "script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:",
+    port, "; base-uri 'none'\">",
+    '<title>CarmaR connected</title><style>',
+    'body{font:16px/1.5 system-ui,sans-serif;max-width:38rem;margin:10vh auto;padding:0 1.25rem;color:#172033}',
+    '.site{overflow-wrap:anywhere;color:#2357d9}</style></head><body>',
+    '<h1>CarmaR is connected</h1><p>Keep this window open while running chunks from</p>',
+    '<p class="site"><strong>', html_escape(rec$origin), '</strong></p>',
+    '<p>You can disconnect the book by closing this window.</p><script>(function(){',
+    'const target=', target, ',nonce=', nonce, ',socketUrl=', socket_url, ';let ws=null,wsGeneration=0;',
+    'const tell=(type,extra)=>{if(window.opener)window.opener.postMessage(',
+    'Object.assign({type,nonce,origin:target,port:', port, '},extra||{}),target)};',
+    'addEventListener("message",event=>{const data=event.data||{};',
+    'if(event.source!==window.opener||event.origin!==target||data.nonce!==nonce)return;',
+    'if(data.type==="carmar:bridge-attach"){const generation=++wsGeneration,old=ws;',
+    'if(old){old.onmessage=old.onerror=old.onclose=null;try{old.close()}catch(e){}}',
+    'ws=new WebSocket(socketUrl);const current=ws;',
+    'current.onmessage=message=>{if(generation===wsGeneration)tell("carmar:bridge-frame",{data:message.data})};',
+    'current.onerror=()=>{if(generation===wsGeneration)tell("carmar:bridge-error")};',
+    'current.onclose=()=>{if(generation===wsGeneration)tell("carmar:bridge-close")};return}',
+    'if(data.type==="carmar:bridge-send"&&ws&&ws.readyState===1)ws.send(data.data);',
+    'if(data.type==="carmar:bridge-close"&&ws)ws.close()});',
+    'tell("carmar:paired");})();</script></body></html>')
+}
+
+pairing_approval_page <- function(challenge) {
+  prune_pairing_requests()
+  rec <- if (nzchar(challenge) && exists(challenge, sockets$pairing_requests,
+                                         inherits = FALSE)) {
+    sockets$pairing_requests[[challenge]]
+  } else NULL
+  if (is.null(rec)) return(NULL)
+  rm(list = challenge, envir = sockets$pairing_requests)
+  sockets$published_approvals[[rec$origin]] <- TRUE
+  audit("published-origin-approved", origin = rec$origin)
+  pairing_bridge_page(rec)
+}
+
 #' Reject with a reason, and record it.
 #'
 #' Every rejection is logged when logging is on: a burst of "bad host" is a
@@ -242,7 +398,92 @@ control_rejection <- function(req, allow_file = FALSE) {
 # Commands the supervisor is willing to forward. An allow-list, not a
 # deny-list: a worker command added later is unreachable from the browser
 # until someone adds it here on purpose.
-FORWARDED <- c("env", "obj", "struct", "view", "rm", "packages",
+#
+# `colstats` was added deliberately (the data grid's per-column statistics
+# card). It reads: it resolves an object the same way `view` already does and
+# returns quantiles, level counts and a histogram for ONE named column. It is
+# strictly narrower than the `view` beside it — same resolution, less surface,
+# no mutation — which is the bar a new entry has to clear, not "it is useful".
+#' How many sessions may be open at once.
+#'
+#' Matches the R package launcher's own cap (tools/r-pkg/R/run.R MAX_SESSIONS)
+#' — a session is a whole R process plus a browser origin, so the number is
+#' about the machine. Enforced HERE too, because this supervisor can start a
+#' sibling on a browser's say-so and an uncapped version of that is a
+#' resource-exhaustion button on a web page.
+MAX_SESSIONS <- 10L
+
+#' The ports of CarmaR kernels that are actually answering right now.
+#'
+#' Read from the runtime directory rather than remembered, so sessions started
+#' by the R package launcher count too — and health-checked, because a killed
+#' kernel leaves its file behind and a dead session must not hold a slot.
+live_session_ports <- function() {
+  dir <- Sys.getenv("CARMAR_RUNTIME_DIR",
+                    file.path(path.expand("~"), ".carmar", "run"))
+  files <- list.files(dir, pattern = "^kernel-[0-9]+\\.json$", full.names = TRUE)
+  ports <- suppressWarnings(as.integer(sub("^kernel-([0-9]+)\\.json$", "\\1", basename(files))))
+  ports <- ports[!is.na(ports)]
+  Filter(function(p) {
+    if (identical(p, port)) return(TRUE)                 # ourselves, definitionally
+    ok <- tryCatch({
+      con <- url(sprintf("http://%s:%d/health", host, p), open = "rb")
+      on.exit(close(con), add = TRUE)
+      grepl('"ok":true', paste(readLines(con, warn = FALSE), collapse = ""), fixed = TRUE)
+    }, error = function(e) FALSE, warning = function(w) FALSE)
+    isTRUE(ok)
+  }, ports)
+}
+
+#' Start another supervisor on the next free adjacent port.
+#'
+#' Adjacent and stable on purpose: browsers key storage to the ORIGIN, so a
+#' session that moved ports would greet its reader with an empty notebook.
+#' Detached — closing this one must not close that one.
+#'
+#' @return list(port, url), or NULL when nothing could be started.
+start_sibling_session <- function() {
+  # Do NOT probe the port by binding it here. A serverSocket() we open and
+  # close leaves the port in TIME_WAIT, so the child's own port_taken() check
+  # says "taken" and it falls back to a RANDOM port — which defeats the whole
+  # point, since browsers key storage to the origin and a session that moves
+  # ports greets its reader with an empty notebook. Pick the first port no live
+  # session holds and let the child do the only binding.
+  used <- live_session_ports()
+  chosen <- NA_integer_
+  for (candidate in seq.int(4747L, 4747L + 200L)) {
+    if (!(candidate %in% used)) { chosen <- candidate; break }
+  }
+  if (is.na(chosen)) return(NULL)
+  # `chosen` is a PREFERENCE, not a promise. serve.R takes CARMAR_PORT only if
+  # the port is still free when IT looks — between our probe and its start the
+  # port can go, and it then falls back to a random one. Waiting for the exact
+  # port we picked therefore reported failure for a session that had started
+  # perfectly well, and left it orphaned. So: remember what was live before,
+  # and accept whichever new port appears.
+  before <- live_session_ports()
+  started <- tryCatch({
+    processx::process$new(file.path(R.home("bin"), "Rscript"),
+                          c(file.path(here, "serve.R")),
+                          env = c(Sys.getenv(), CARMAR_PORT = as.character(chosen)),
+                          stdout = "|", stderr = "|", supervise = FALSE)
+  }, error = function(e) NULL)
+  if (is.null(started)) return(NULL)
+  # Wait for it to ANSWER rather than handing back a URL that 404s.
+  deadline <- Sys.time() + 60
+  while (Sys.time() < deadline) {
+    fresh <- setdiff(live_session_ports(), before)
+    if (length(fresh)) {
+      got <- fresh[[1L]]
+      return(list(port = got, url = sprintf("http://%s:%d/", host, got)))
+    }
+    if (!started$is_alive()) return(NULL)     # it died; stop waiting on it
+    Sys.sleep(0.25)
+  }
+  NULL
+}
+
+FORWARDED <- c("env", "obj", "struct", "view", "colstats", "rm", "packages",
                "package_action", "package_help", "help", "wd",
                "parse", "complete", "files", "import", "readfile", "writefile",
                "hover", "format", "sniff", "choose")
@@ -298,8 +539,10 @@ app <- list(
     # WebSockets are exempt from the same-origin policy: without this, any site
     # the user happens to visit could open a socket here and run R.
     origin <- req$HTTP_ORIGIN
+    published_ok <- !is.null(origin) &&
+      exists(origin, sockets$published_approvals, inherits = FALSE)
     if (!is.null(origin) && !identical(origin, origin_ok) &&
-        !identical(origin, "null")) {
+        !identical(origin, "null") && !published_ok) {
       return(reject("bad origin", origin))
     }
     if (length(sockets$open) >= MAX_SOCKETS) return(reject("too many connections"))
@@ -310,7 +553,55 @@ app <- list(
     if (!host_ok(req)) return(reject("bad host", req$HTTP_HOST %||% "(none)"))
     if (identical(req$PATH_INFO, "/health")) {
       return(resp(200L, "application/json",
-                  toJSON(list(ok = TRUE, worker = k$proc$is_alive()), auto_unbox = TRUE)))
+                  toJSON(list(ok = TRUE, worker = k$proc$is_alive(),
+                              capabilities = c("published-direct-v1",
+                                               "published-pairing-v3")),
+                         auto_unbox = TRUE)))
+    }
+    # The custom carmar:// handler calls this endpoint as a native same-user
+    # client. Browser requests carry Origin/Sec-Fetch-Site and are refused by
+    # control_rejection(), so visiting a site cannot silently grant itself R
+    # execution. One launch authorizes one exact origin for this kernel only.
+    if (identical(req$PATH_INFO, "/published/authorize")) {
+      blocked <- control_rejection(req)
+      if (!is.null(blocked)) return(blocked)
+      origin <- query_param(req$QUERY_STRING, "origin")
+      if (!published_origin_valid(origin)) {
+        audit("published-origin-rejected", detail = origin)
+        return(resp(400L, "application/json",
+                    toJSON(list(ok = FALSE, error = "invalid origin"),
+                           auto_unbox = TRUE)))
+      }
+      sockets$published_approvals[[origin]] <- TRUE
+      audit("published-origin-authorized", origin = origin, source = "native")
+      return(resp(200L, "application/json",
+                  toJSON(list(ok = TRUE, origin = origin), auto_unbox = TRUE)))
+    }
+    # A published Quarto page begins here.  Merely opening this route grants
+    # nothing: it renders a local, non-frameable consent page containing an
+    # unguessable challenge.  Only the button on that page can spend it.
+    if (identical(req$PATH_INFO, "/pair")) {
+      origin <- query_param(req$QUERY_STRING, "origin")
+      nonce <- query_param(req$QUERY_STRING, "nonce")
+      if (!published_origin_valid(origin)) {
+        audit("pair-rejected", detail = origin)
+        return(resp(400L, "text/plain", "A valid http(s) publishing origin is required."))
+      }
+      if (exists(origin, sockets$published_approvals, inherits = FALSE)) {
+        audit("pair-reconnected", origin = origin)
+        return(resp(200L, "text/html",
+                    pairing_bridge_page(list(origin = origin, nonce = nonce))))
+      }
+      audit("pair-offered", origin = origin)
+      return(resp(200L, "text/html", pairing_page(origin, nonce)))
+    }
+    if (identical(req$PATH_INFO, "/pair/approve")) {
+      page <- pairing_approval_page(query_param(req$QUERY_STRING, "challenge"))
+      if (is.null(page)) {
+        audit("pair-rejected", detail = "missing or expired challenge")
+        return(resp(400L, "text/plain", "This CarmaR approval request has expired."))
+      }
+      return(resp(200L, "text/html", page))
     }
     # Same-origin shutdown: the notebook's Quit, and how an app-bundle launcher
     # ends a background kernel without hunting processes. The flag is honored
@@ -371,6 +662,11 @@ app <- list(
     rec$ws <- ws
     rec$role <- "page"
     rec$name <- ""
+    # Liveness: `last_seen` is stamped by every frame this socket sends, and
+    # `beats` records that it speaks the heartbeat at all. Both are read only
+    # by reap_dead_sockets().
+    rec$last_seen <- Sys.time()
+    rec$beats <- FALSE
     sockets$open <- c(sockets$open, rec)
     sockets$ever_connected <- TRUE
     audit("socket-open", sockets = length(sockets$open))
@@ -661,6 +957,58 @@ drop_worker_route <- function(wire_id) {
   invisible(NULL)
 }
 
+#' Serialise one kernel frame for the browser — WITHOUT re-encoding it.
+#'
+#' The supervisor is a router, and a router must not rewrite the payload. It
+#' used to: every frame was parsed by kernel_poll() and re-encoded here with
+#' `toJSON(e, auto_unbox = TRUE)`, whose defaults quietly mangled three things
+#' the worker had been careful about.
+#'
+#'   * `digits` defaults to 4, so EVERY number lost precision on the way out.
+#'     pi arrived as 3.1416, 1/3 as 0.3333, and 1.2345e-05 as plain 0 — in the
+#'     data viewer and in every CSV/Excel/JSON export, which read the same
+#'     frames. worker.R emits with `digits = NA` precisely to avoid this; the
+#'     relay threw that away one hop later.
+#'   * `null` defaults to `{}`, so an absent field became an empty object.
+#'     That is where a numeric column's phantom `"levels": {}` came from, and
+#'     `{}` is truthy in JavaScript.
+#'   * fromJSON's simplification collapses a length-1 array to a scalar, so
+#'     `bins: [500]` became `bins: 500` — reintroducing on every frame the
+#'     exact bug worker.R's I() wrapping exists to prevent.
+#'
+#' Re-encoding faithfully is not the fix: a nested-list round-trip is
+#' byte-exact but measures 225 ms/frame against 4 ms on a 150 KB view, and
+#' this loop is single-threaded. So the original text is forwarded instead and
+#' only the routing id is rewritten, which is the one field the supervisor
+#' owns. Frames the supervisor built itself (stdout/stderr, error replies)
+#' carry no raw text and fall through to an encode that matches worker.R's own
+#' options rather than jsonlite's defaults.
+#'
+#' @param e Parsed frame from kernel_poll(); carries the raw bytes as an
+#'   attribute when it came from the kernel rather than from this process.
+#' @param wire_id Internal routing id the kernel echoed, or NULL to forward
+#'   the frame untouched (session-wide frames belong to no route).
+#' @param client_id The browser's own id for the request.
+#' @return A single JSON string.
+relay_frame <- function(e, wire_id = NULL, client_id = NULL) {
+  raw <- attr(e, "raw")
+  if (!is.null(raw) && length(raw) == 1L && !is.na(raw)) {
+    if (is.null(wire_id)) return(raw)
+    # Both ids go through toJSON so a client id needing escaping cannot break
+    # the frame. Every emit site in worker.R and analyze.R writes `id` as the
+    # second field, so the first occurrence is the id — but a miss falls back
+    # to a correct encode rather than shipping the internal id.
+    if (scalar_chr(client_id)) {
+      needle <- paste0('"id":', toJSON(wire_id, auto_unbox = TRUE))
+      if (grepl(needle, raw, fixed = TRUE)) {
+        return(sub(needle, paste0('"id":', toJSON(client_id, auto_unbox = TRUE)),
+                   raw, fixed = TRUE))
+      }
+    }
+  }
+  toJSON(e, auto_unbox = TRUE, digits = NA, null = "null", na = "null")
+}
+
 # R is serial, so the supervisor owns one global command queue. Besides
 # avoiding blocked stdin writes, this gives otherwise id-less stdout/stderr a
 # single unambiguous socket owner.
@@ -819,15 +1167,15 @@ pump_analyzer <- function() {
     if (!exists(wire_id, envir = sockets$analyze_routes, inherits = FALSE)) next
     route <- sockets$analyze_routes[[wire_id]]
     e$id <- route$client_id
-    # `null = "null"` is not cosmetic here. jsonlite's DEFAULT renders a NULL
-    # field as `{}`, and this reply is full of deliberately-nullable fields:
+    # Forwarded verbatim. This reply is full of deliberately-nullable fields —
     # `failed` (absent on success), and `line`/`col` on a diagnostic R could
-    # not place. An empty object is truthy in JavaScript, so the default turns
-    # "nothing went wrong" into "something went wrong" and an unplaceable
-    # position into NaN. The analyzer already emits null; re-encoding here must
-    # not undo that.
-    try(route$rec$ws$send(toJSON(e, auto_unbox = TRUE, null = "null", na = "null")),
-        silent = TRUE)
+    # not place — and jsonlite's default renders a NULL field as `{}`, which is
+    # truthy in JavaScript: the default turned "nothing went wrong" into
+    # "something went wrong" and an unplaceable position into NaN. analyze.R
+    # already emits null; relay_frame() forwards its bytes rather than
+    # re-deciding, and its fallback encode keeps `null = "null"` for the frames
+    # this process builds itself.
+    try(route$rec$ws$send(relay_frame(e, wire_id, route$client_id)), silent = TRUE)
     drop_analyze_route(wire_id)
     if (identical(sockets$analyze_active, wire_id)) sockets$analyze_active <- NULL
   }
@@ -855,6 +1203,18 @@ handle_frame <- function(message, rec) {
   }
   cmd <- tryCatch(fromJSON(message, simplifyVector = TRUE), error = function(e) NULL)
   if (!is.list(cmd) || !scalar_chr(cmd$type)) return(invisible(NULL))
+
+  # Any frame at all proves the socket is alive; the heartbeat is simply the
+  # frame an idle notebook can still send. It is answered HERE and never
+  # reaches either allow-list: a keep-alive that could be routed to the worker
+  # would be a way to keep an evaluating session busy from a page that is
+  # doing nothing.
+  rec$last_seen <- Sys.time()
+  if (identical(cmd$type, "hb")) {
+    rec$beats <- TRUE
+    try(rec$ws$send(toJSON(list(type = "hb"), auto_unbox = TRUE)), silent = TRUE)
+    return(invisible(NULL))
+  }
 
   # ── the MCP plane ─────────────────────────────────────────────────────────
   # A local agent (Claude Code / Codex via tools/mcp/carmar-mcp.mjs) connects
@@ -998,6 +1358,36 @@ handle_frame <- function(message, rec) {
     sockets$worker_terminal <- NULL
     return(invisible(NULL))
   }
+  # A SIBLING SESSION: another supervisor, another R process, another origin.
+  #
+  # One notebook per window is the shell's shape — the cell stack is singular —
+  # so "open a second document" means a second SESSION, which is what the R
+  # package's launcher has always done (tools/r-pkg/R/run.R). A notebook opened
+  # from the Files pane could not reach that, so its only option was to replace
+  # the document you were reading.
+  #
+  # Capped, and the cap is the point: this starts a whole R process from a
+  # browser request, so an unbounded version is a resource-exhaustion button on
+  # a page. The count is of OUR OWN runtime files, health-checked, so kernels
+  # that died do not hold a slot.
+  if (identical(cmd$type, "session-new")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    audit("session-new", id = cmd$id)
+    reply <- function(...) try(rec$ws$send(toJSON(list(type = "session-new", id = cmd$id, ...),
+                                                  auto_unbox = TRUE, null = "null")), silent = TRUE)
+    live <- live_session_ports()
+    if (length(live) >= MAX_SESSIONS) {
+      reply(error = sprintf("%d sessions are already open, which is the limit.", length(live)))
+      return(invisible(NULL))
+    }
+    started <- start_sibling_session()
+    if (is.null(started)) {
+      reply(error = "Could not start another session.")
+      return(invisible(NULL))
+    }
+    reply(port = started$port, url = started$url)
+    return(invisible(NULL))
+  }
   if (cmd$type %in% ANALYZE_FORWARDED) {
     if (!scalar_chr(cmd$id)) return(invisible(NULL))
     audit(cmd$type, id = cmd$id)
@@ -1029,7 +1419,8 @@ pump <- function() {
     if (!is.null(sockets$worker_terminal)) {
       terminal <- sockets$worker_terminal
       wire_id <- terminal$wire_id
-      try(terminal$route$rec$ws$send(toJSON(terminal$frame, auto_unbox = TRUE)),
+      try(terminal$route$rec$ws$send(
+            relay_frame(terminal$frame, wire_id, terminal$route$client_id)),
           silent = TRUE)
       drop_worker_route(wire_id)
       if (identical(sockets$worker_active, wire_id)) sockets$worker_active <- NULL
@@ -1057,13 +1448,14 @@ pump <- function() {
         # browser settles the result before a trailing stderr frame arrives.
         sockets$worker_terminal <- list(wire_id = wire_id, route = route, frame = e)
       } else {
-        try(route$rec$ws$send(toJSON(e, auto_unbox = TRUE)), silent = TRUE)
+        try(route$rec$ws$send(relay_frame(e, wire_id, route$client_id)), silent = TRUE)
       }
       return(invisible(NULL))
     }
 
-    # Session-wide lifecycle frames have no owner and must reach every tab.
-    payload <- toJSON(e, auto_unbox = TRUE)
+    # Session-wide lifecycle frames have no owner and must reach every tab —
+    # and no id to rewrite, so they forward exactly as the kernel wrote them.
+    payload <- relay_frame(e)
     if (identical(e$type, "ready")) sockets$hello <- payload
     lapply(sockets$open, function(r) try(r$ws$send(payload), silent = TRUE))
     invisible(NULL)
@@ -1127,11 +1519,47 @@ if ("--open" %in% commandArgs(trailingOnly = TRUE)) {
   try(utils::browseURL(file_url), silent = TRUE)
 }
 
+#' Close and forget sockets that have stopped answering.
+#'
+#' Only sockets that have proven they speak the heartbeat are eligible, so an
+#' older notebook build is never disconnected for being quiet. The entry is
+#' dropped here as well as closed: on a half-open TCP the close may produce no
+#' onClose callback at all, and it is the ENTRY, not the socket, that keeps the
+#' linger clock from arming.
+reap_dead_sockets <- function() {
+  if (socket_silence_s <= 0 || !length(sockets$open)) return(invisible(NULL))
+  now <- Sys.time()
+  dead <- Filter(function(r) {
+    isTRUE(r$beats) && !is.null(r$last_seen) &&
+      as.numeric(difftime(now, r$last_seen, units = "secs")) >= socket_silence_s
+  }, sockets$open)
+  if (!length(dead)) return(invisible(NULL))
+  for (rec in dead) {
+    audit("socket-silent", role = rec$role %||% "page", silence = socket_silence_s)
+    sockets$open <- Filter(function(r) !identical(r, rec), sockets$open)
+    if (identical(sockets$active_page, rec)) sockets$active_page <- NULL
+    try(rec$ws$close(), silent = TRUE)
+  }
+  invisible(NULL)
+}
+
 #' Idle linger, decided once per loop turn: nobody connected, nothing running,
 #' grace elapsed → the same deliberate shutdown /shutdown performs. Any open
 #' socket or in-flight run resets the clock entirely.
+#'
+#' A kernel nobody has EVER connected to is idle from boot rather than exempt.
+#' It used to be exempt outright, so that a slow browser launch could not lose
+#' the kernel it was opening — but "still starting" was never bounded, and a
+#' session whose tab never arrived (a sibling started for a page that was
+#' closed, a `run_published()` nobody paired) lived until the machine was
+#' rebooted and held a slot in the launcher's cap the whole time. The grace
+#' itself is the protection: ten minutes is three orders of magnitude longer
+#' than a browser launch, and a page that connects at any point cancels it.
 linger_check <- function() {
-  if (linger_s <= 0 || !isTRUE(sockets$ever_connected)) return(invisible(NULL))
+  if (linger_s <= 0) return(invisible(NULL))
+  if (!isTRUE(sockets$ever_connected) && is.null(sockets$idle_since)) {
+    sockets$idle_since <- sockets$boot_at
+  }
   idle <- length(sockets$open) == 0L && length(ls(sockets$running)) == 0L
   if (!idle) { sockets$idle_since <- NULL; return(invisible(NULL)) }
   now <- Sys.time()
@@ -1152,6 +1580,7 @@ repeat {
   httpuv::service(50)
   pump()
   pump_chats()
+  reap_dead_sockets()
   linger_check()
   if (isTRUE(sockets$quit)) break
   if (!k$proc$is_alive()) {

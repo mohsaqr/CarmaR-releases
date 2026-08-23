@@ -199,6 +199,47 @@ detect_plot_type <- function() {
 
 PLOT_TYPE <- detect_plot_type()
 
+#' Find a VECTOR device that actually works, or NULL.
+#'
+#' Same discipline as detect_plot_type and for a sharper reason: on the CRAN
+#' macOS build `grDevices::svg()` opens without error, draws without error,
+#' and writes a ZERO-BYTE file, because it is Cairo and Cairo cannot dlopen
+#' without XQuartz. Measured on this machine. So the probe draws a page and
+#' insists on bytes that actually begin an SVG document.
+#'
+#' Unlike detect_plot_type this returns NULL rather than falling through to a
+#' first candidate: "no vector device" is a real answer the caller must handle
+#' by saying so, not by silently producing something else.
+#'
+#' @return "svglite", "grDevices", or NULL.
+detect_svg_device <- function() {
+  works <- function(open) {
+    f <- tempfile(fileext = ".svg")
+    ok <- tryCatch({
+      suppressWarnings(open(f))
+      graphics::plot.new()
+      graphics::text(0.5, 0.5, "x")
+      grDevices::dev.off()
+      file.exists(f) && file.info(f)$size > 0L &&
+        grepl("<svg", paste(readLines(f, n = 8L, warn = FALSE), collapse = ""), fixed = TRUE)
+    }, error = function(e) FALSE, warning = function(w) FALSE)
+    if (!is.null(grDevices::dev.list())) try(grDevices::dev.off(), silent = TRUE)
+    unlink(f)
+    isTRUE(ok)
+  }
+  # svglite first: pure C++, no Cairo, and the only one that works on a stock
+  # macOS R. grDevices::svg() is the fallback for machines that have Cairo.
+  if (requireNamespace("svglite", quietly = TRUE) &&
+      works(function(f) svglite::svglite(f, width = 2, height = 2))) return("svglite")
+  if (works(function(f) grDevices::svg(f, width = 2, height = 2))) return("grDevices")
+  NULL
+}
+
+SVG_DEVICE <- detect_svg_device()
+
+#' Is this chunk asking for vector output, and can we give it?
+plot_is_svg <- function(dims) isTRUE(dims$format == "svg") && !is.null(SVG_DEVICE)
+
 #' Write one control frame to stdout and flush immediately.
 #'
 #' @param obj Named list, serialised to JSON.
@@ -426,44 +467,265 @@ emit_struct <- function(id, name = NULL, path = NULL) {
 #' @return A named list.
 describe_column <- function(col, name) {
   n <- length(col)
-  missing <- sum(is.na(col))
+  # ONE is.na pass. It was computed twice — once for the count, once to build
+  # `ok` — and on a million-row column that second pass is a wasted 4 MB
+  # logical and ~0.6 ms, paid for every column of every page.
+  na <- is.na(col)
+  missing <- sum(na)
   base <- list(name = name, class = class(col)[1L], n = n, missing = missing)
+  # A SHORT summary for the hover panel, formatted here for the same reason the
+  # card's is (fmt_pct): R decides significant digits, and two formatters would
+  # eventually disagree about the same number. Deliberately not the card's list
+  # — hovering wants the six figures you would glance at, not fourteen.
+  pair <- function(label, value) list(label = label, value = value)
+  miss_pair <- if (missing > 0L) list(pair("Missing", fmt_share(missing, n))) else list()
 
   # Every `bins`/`levels` below is wrapped in I(): auto_unbox turns a length-1
   # vector into a bare scalar, so a constant column or single-level factor
   # shipped `"bins": 10` and broke every client that mapped over it. I() pins
   # the array shape regardless of length; scalars elsewhere stay scalars.
   if (is.numeric(col)) {
-    ok <- col[!is.na(col)]
+    ok <- col[!na]
     if (length(ok) == 0L) return(c(base, list(kind = "numeric", bins = I(integer(0)),
-                                              stat = "all missing")))
+                                              stat = "all missing",
+                                              summary = I(list(pair("Missing",
+                                                fmt_share(missing, n)))))))
     rng <- range(ok)
     # tabulate(), not table(): table drops empty bins, so a gap in the data
     # silently shortens the sparkline and every bar after it shifts left.
     bins <- if (diff(rng) == 0) rep(length(ok), 1L) else
       tabulate(cut(ok, breaks = 12L, labels = FALSE, include.lowest = TRUE), nbins = 12L)
+    med <- stats::median(ok)
+    # mean and sd measure at 0.1 and 0.2 ms on a million rows, against the
+    # 3.1 ms this function already costs — the cheapest useful thing to add.
+    mu <- mean(ok)
+    sigma <- stats::sd(ok)
     c(base, list(kind = "numeric", bins = I(as.integer(bins)),
-                 min = rng[1L], max = rng[2L], median = stats::median(ok),
+                 min = rng[1L], max = rng[2L], median = med, mean = mu, sd = sigma,
+                 summary = I(c(list(pair("Mean", fmt_num(mu)),
+                                    pair("Std. dev.", fmt_num(sigma)),
+                                    pair("Minimum", fmt_num(rng[1L])),
+                                    pair("Median", fmt_num(med)),
+                                    pair("Maximum", fmt_num(rng[2L]))), miss_pair)),
                  stat = sprintf("%s – %s", fmt_num(rng[1L]), fmt_num(rng[2L]))))
   } else if (is.logical(col)) {
+    yes <- sum(col %in% TRUE)
+    no <- sum(col %in% FALSE)
     c(base, list(kind = "logical",
-                 bins = I(as.integer(c(sum(col %in% TRUE), sum(col %in% FALSE)))),
+                 bins = I(as.integer(c(yes, no))),
                  levels = I(c("TRUE", "FALSE")),
-                 stat = sprintf("%d true / %d false", sum(col %in% TRUE), sum(col %in% FALSE))))
+                 summary = I(c(list(pair("TRUE", fmt_share(yes, yes + no)),
+                                    pair("FALSE", fmt_share(no, yes + no))), miss_pair)),
+                 stat = sprintf("%d true / %d false", yes, no)))
   } else {
-    tab <- sort(table(as.character(col[!is.na(col)])), decreasing = TRUE)
+    text <- as.character(col[!na])
+    tab <- sort(table(text), decreasing = TRUE)
     top <- utils::head(tab, 12L)
+    # The commonest levels answer "what is in here" far better than the level
+    # COUNT alone, and they are already computed for the sparkline. Four are
+    # listed when four is all there is, so a column with exactly four levels
+    # does not show three and silently swallow the last one.
+    lead <- utils::head(tab, if (length(tab) <= 4L) length(tab) else 3L)
+    tops <- lapply(seq_along(lead), function(i)
+      pair(substr(names(lead)[i], 1L, MAX_VIEW_LABEL_CHARS),
+           fmt_share(lead[[i]], length(text))))
     c(base, list(kind = "categorical", bins = I(as.integer(top)),
                  levels = I(substr(as.character(names(top)), 1L, MAX_VIEW_LABEL_CHARS)),
                  nlevels = length(tab),
+                 summary = I(c(list(pair("Distinct levels", fmt_count(length(tab)))),
+                               tops, miss_pair)),
                  stat = sprintf("%d level%s", length(tab), if (length(tab) == 1L) "" else "s")))
   }
 }
 
 fmt_num <- function(x) {
+  # as.character(NA_real_) is NA_character_, not "NA" — and a genuine NA in a
+  # display field ships as JSON null, which the card then prints as the word
+  # "null". A constant column's skewness is exactly this case (sd is 0, so the
+  # z-scores are 0/0), so it is a value the viewer really does meet.
+  if (is.nan(x)) return("NaN")
+  if (is.na(x)) return("NA")
   if (!is.finite(x)) return(as.character(x))
   if (abs(x) >= 1e5 || (abs(x) < 1e-3 && x != 0)) format(x, digits = 3, scientific = TRUE)
   else format(round(x, 3), trim = TRUE)
+}
+
+fmt_count <- function(x) format(as.numeric(x), big.mark = ",", trim = TRUE, scientific = FALSE)
+
+#' A share as a bare percentage: "85.3%".
+#'
+#' Every percentage on the statistics card comes from HERE, including the ones
+#' beside each level in the bar list. R and JavaScript do not round halves the
+#' same way — R's round() goes to even, so 50/4000 is 1.2%, while JavaScript's
+#' toFixed(1) gives 1.3% — and a card that computed some of its own percentages
+#' printed both, for the same count, two inches apart.
+#' Always one decimal: format() drops a trailing zero, so a column of shares
+#' read "1.2% / 1.1% / 1% / 1%" and the eye stopped trusting the alignment.
+fmt_pct <- function(part, whole) {
+  if (!is.finite(whole) || whole <= 0) return("")
+  paste0(formatC(100 * part / whole, format = "f", digits = 1), "%")
+}
+
+#' A share as count and percentage: "3,412 (85.3%)".
+fmt_share <- function(part, whole) {
+  if (!is.finite(whole) || whole <= 0) return(fmt_count(part))
+  sprintf("%s (%s)", fmt_count(part), fmt_pct(part, whole))
+}
+
+MAX_STATS_LEVELS <- 15L
+STATS_BINS <- 24L
+
+#' Everything a statistics card shows about ONE column.
+#'
+#' Deliberately separate from describe_column(): that one runs for every column
+#' of every page and must stay cheap, so it ships 12 bins and a label. This one
+#' runs when a reader asks about a single column and can afford quantiles, shape
+#' moments and a level table.
+#'
+#' Numbers come back BOTH ways — as strings R formatted (so the card never
+#' re-invents significant digits in JavaScript) and, where a drawing needs them,
+#' as raw numerics. The two never disagree because they come from one value.
+#'
+#' @param col A column vector.
+#' @param column_name Its name.
+#' @return A named list; see the `colstats` frame.
+colstats_payload <- function(col, column_name) {
+  n <- length(col)
+  missing <- sum(is.na(col))
+  ok <- col[!is.na(col)]
+  pair <- function(label, value) list(label = label, value = value)
+  base <- list(column = column_name, class = paste(class(col), collapse = "/"),
+               n = n, missing = missing, present = length(ok),
+               distinct = length(unique(ok)))
+
+  if (is.numeric(col) || inherits(col, "Date") || inherits(col, "POSIXct")) {
+    dated <- inherits(col, "Date") || inherits(col, "POSIXct")
+    x <- as.numeric(ok)
+    if (!length(x)) {
+      return(c(base, list(kind = if (dated) "date" else "numeric",
+                          summary = I(list(pair("Present", "0 — every value is missing"))))))
+    }
+    show <- if (dated) function(v) format(if (inherits(col, "Date"))
+      as.Date(v, origin = "1970-01-01") else as.POSIXct(v, origin = "1970-01-01", tz = "UTC"))
+      else fmt_num
+    q <- stats::quantile(x, c(0.25, 0.5, 0.75), names = FALSE, type = 7)
+    iqr <- q[3L] - q[1L]
+    m <- mean(x)
+    s <- stats::sd(x)
+    # Fences are Tukey's, so "outlier" here means what a boxplot means by it —
+    # not a normal-theory z cut, which would be a different claim about data
+    # nobody has shown is normal.
+    lo_fence <- q[1L] - 1.5 * iqr
+    hi_fence <- q[3L] + 1.5 * iqr
+    outliers <- sum(x < lo_fence | x > hi_fence)
+    # Moments by hand rather than by dependency: both are one line, and
+    # e1071/moments are not worth a require() in a kernel that must boot fast.
+    z <- if (is.finite(s) && s > 0) (x - m) / s else rep(NA_real_, length(x))
+    skew <- if (all(is.finite(z))) mean(z^3) else NA_real_
+    kurt <- if (all(is.finite(z))) mean(z^4) - 3 else NA_real_
+    rng <- range(x)
+    bins <- if (diff(rng) == 0) as.integer(length(x)) else
+      tabulate(cut(x, breaks = STATS_BINS, labels = FALSE, include.lowest = TRUE),
+               nbins = STATS_BINS)
+    summary <- list(
+      pair("Mean", show(m)), pair("Std. dev.", if (dated) fmt_num(s) else fmt_num(s)),
+      pair("Minimum", show(rng[1L])), pair("1st quartile", show(q[1L])),
+      pair("Median", show(q[2L])), pair("3rd quartile", show(q[3L])),
+      pair("Maximum", show(rng[2L])), pair("IQR", if (dated) fmt_num(iqr) else fmt_num(iqr)),
+      pair("Median abs. dev.", fmt_num(stats::mad(x))),
+      pair("Skewness", fmt_num(skew)), pair("Excess kurtosis", fmt_num(kurt)),
+      pair("Outliers (1.5 IQR)", fmt_share(outliers, length(x))))
+    if (!dated) summary <- c(summary, list(
+      pair("Zeros", fmt_share(sum(x == 0), length(x))),
+      pair("Negative", fmt_share(sum(x < 0), length(x)))))
+    if (dated) summary <- c(summary, list(pair("Span", paste(fmt_num(diff(rng) /
+      if (inherits(col, "Date")) 1 else 86400), "days"))))
+    return(c(base, list(kind = if (dated) "date" else "numeric",
+                        summary = I(summary),
+                        bins = I(as.integer(bins)),
+                        binMin = rng[1L], binMax = rng[2L],
+                        box = list(min = rng[1L], q1 = q[1L], median = q[2L],
+                                   q3 = q[3L], max = rng[2L],
+                                   lower = max(lo_fence, rng[1L]),
+                                   upper = min(hi_fence, rng[2L]),
+                                   outliers = outliers))))
+  }
+
+  if (is.logical(col)) {
+    yes <- sum(col %in% TRUE)
+    no <- sum(col %in% FALSE)
+    return(c(base, list(kind = "logical",
+      summary = I(list(pair("TRUE", fmt_share(yes, yes + no)),
+                       pair("FALSE", fmt_share(no, yes + no)),
+                       pair("Missing", fmt_share(missing, n)))),
+      levels = I(c("TRUE", "FALSE")), counts = I(as.integer(c(yes, no))),
+      shares = I(c(fmt_pct(yes, yes + no), fmt_pct(no, yes + no))), other = 0L)))
+  }
+
+  text <- as_search_text(ok)
+  tab <- sort(table(text), decreasing = TRUE)
+  top <- utils::head(tab, MAX_STATS_LEVELS)
+  widths <- nchar(text)
+  summary <- list(
+    pair("Distinct levels", fmt_count(length(tab))),
+    pair("Most common", if (length(tab)) sprintf("%s — %s", names(tab)[1L],
+                                                 fmt_share(tab[[1L]], length(text))) else "—"),
+    pair("Least common", if (length(tab)) sprintf("%s — %s", names(tab)[length(tab)],
+                                                  fmt_share(tab[[length(tab)]], length(text))) else "—"),
+    pair("Empty strings", fmt_share(sum(!nzchar(text)), length(text))),
+    pair("Shortest", if (length(widths)) fmt_count(min(widths)) else "—"),
+    pair("Longest", if (length(widths)) fmt_count(max(widths)) else "—"),
+    pair("Mean length", if (length(widths)) fmt_num(mean(widths)) else "—"))
+  other <- as.integer(length(text) - sum(top))
+  c(base, list(kind = "categorical", summary = I(summary),
+               levels = I(substr(names(top), 1L, MAX_VIEW_LABEL_CHARS)),
+               counts = I(as.integer(top)),
+               shares = I(vapply(as.integer(top), fmt_pct, character(1),
+                                 whole = length(text))),
+               other = other, otherShare = fmt_pct(other, length(text)),
+               nlevels = length(tab)))
+}
+
+#' The statistics card: one column, profiled over the rows the grid is showing.
+#'
+#' Resolves the object exactly as emit_view does, and takes the SAME query and
+#' filters, so the panel describes the visible data rather than a different
+#' population that happens to share a name.
+#'
+#' @param id Request id.
+#' @param name Object name or expression, as for `view`.
+#' @param column The column to profile.
+#' @param query,filters The viewer's active search and column filters.
+emit_colstats <- function(id, name, column, query = NULL, filters = NULL) {
+  column <- if (is.character(column) && length(column)) column[[1L]] else ""
+  obj <- tryCatch(eval(parse(text = name), globalenv()), error = function(e) NULL)
+  if (!is.data.frame(obj)) obj <- tryCatch(as.data.frame(obj, stringsAsFactors = FALSE),
+                                           error = function(e) NULL)
+  if (is.null(obj) || !nzchar(column)) {
+    emit(list(type = "colstats", id = id, name = name, column = column,
+              error = "not found"))
+    return(invisible(NULL))
+  }
+  total <- nrow(obj)
+  narrowed <- view_filter(obj, query, filters)
+  obj <- narrowed$obj
+  # The viewer truncates long column names for display; match on the truncated
+  # name too, or a card opened from a clipped header can never find its column.
+  hit <- match(column, names(obj))
+  if (is.na(hit)) hit <- match(column, substr(names(obj), 1L, MAX_VIEW_LABEL_CHARS))
+  if (is.na(hit)) {
+    emit(list(type = "colstats", id = id, name = name, column = column,
+              error = "no such column"))
+    return(invisible(NULL))
+  }
+  tryCatch(
+    emit(c(list(type = "colstats", id = id, name = name),
+           colstats_payload(obj[[hit]], column),
+           list(rows = nrow(obj), totalRows = total,
+                filtered = nzchar(narrowed$query) || narrowed$count > 0L))),
+    interrupt = function(i) emit(list(type = "colstats", id = id, name = name,
+                                      column = column, error = "interrupted"))
+  )
 }
 
 #' Autocomplete via R's own engine — the one behind TAB in the console,
@@ -564,6 +826,97 @@ as_count <- function(x, default) {
 #' frames stay the same shape — and the same CAPS — by construction rather
 #' than by discipline.
 #'
+#' A column as searchable text, whatever it holds.
+as_search_text <- function(col) {
+  tryCatch(as.character(col), error = function(e) rep("", length(col)))
+}
+
+# `grepl(..., fixed = TRUE, ignore.case = TRUE)` is NOT case-insensitive:
+# R ignores ignore.case whenever fixed is TRUE, and says so in a warning
+# that goes nowhere anyone reads. The viewer's search box and its text
+# column filters all promised case-insensitive matching in their own
+# documentation and all silently required the exact case — searching
+# "Cohesion" found nothing in a column of "cohesion".
+#
+# So the needle is escaped to a literal pattern instead and `fixed` is
+# dropped, which keeps every metacharacter inert (`a.c` matches only "a.c",
+# `f[1]` does not blow up) while letting PCRE fold case, including for
+# non-ASCII: "É" matches "é".
+escape_regex <- function(s) gsub("([][{}()*+?.^$|\\\\])", "\\\\\\1", s)
+contains_ci <- function(text, needle) {
+  grepl(escape_regex(needle), text, ignore.case = TRUE, perl = TRUE)
+}
+
+#' One column filter spec → a logical keep-mask. Never evaluates the spec:
+#' comparisons and ranges are parsed, everything else is literal text.
+#'
+#' @param col A column vector.
+#' @param spec The user's filter string.
+#' @return A logical vector as long as `col`.
+match_filter <- function(col, spec) {
+  spec <- trimws(as.character(spec)[1L])
+  if (!nzchar(spec)) return(rep(TRUE, length(col)))
+  if (identical(toupper(spec), "NA")) return(is.na(col))
+  if (is.logical(col)) {
+    wanted <- toupper(spec)
+    if (wanted %in% c("TRUE", "T")) return(!is.na(col) & col)
+    if (wanted %in% c("FALSE", "F")) return(!is.na(col) & !col)
+  }
+  if (is.numeric(col)) {
+    range <- strsplit(spec, "\\.\\.", perl = TRUE)[[1L]]
+    if (length(range) == 2L) {
+      lo <- suppressWarnings(as.numeric(trimws(range[1L])))
+      hi <- suppressWarnings(as.numeric(trimws(range[2L])))
+      if (!is.na(lo) && !is.na(hi)) return(!is.na(col) & col >= lo & col <= hi)
+    }
+    parts <- regmatches(spec, regexec("^\\s*(>=|<=|!=|==|=|>|<)\\s*(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\s*$", spec))[[1L]]
+    if (length(parts) == 3L) {
+      target <- as.numeric(parts[3L])
+      hit <- switch(parts[2L], ">=" = col >= target, "<=" = col <= target,
+                    "!=" = col != target, "==" = col == target, "=" = col == target,
+                    ">" = col > target, "<" = col < target)
+      return(!is.na(hit) & hit)
+    }
+    target <- suppressWarnings(as.numeric(spec))
+    if (!is.na(target)) return(!is.na(col) & col == target)
+  }
+  text <- as_search_text(col)
+  if (startsWith(spec, "=")) return(!is.na(col) & tolower(text) == tolower(substring(spec, 2L)))
+  if (startsWith(spec, "!")) return(is.na(col) | !contains_ci(text, substring(spec, 2L)))
+  !is.na(col) & contains_ci(text, spec)
+}
+
+#' Narrow a frame by the viewer's search box and its per-column filters.
+#'
+#' Extracted from view_payload so `colstats` can answer about exactly the rows
+#' the grid is displaying. A statistics panel that quietly profiled the whole
+#' frame while the grid showed a filtered subset would be worse than no panel:
+#' both numbers look authoritative and only one answers the question asked.
+#'
+#' @param obj A data.frame.
+#' @param query Free-text search across every column.
+#' @param filters Named list of per-column filter specs.
+#' @return list(obj, count = filters applied, query = the trimmed query).
+view_filter <- function(obj, query = NULL, filters = NULL) {
+  count <- 0L
+  if (is.list(filters) && length(filters) && length(names(filters))) {
+    for (nm in intersect(names(filters), names(obj))) {
+      spec <- filters[[nm]]
+      if (length(spec) && nzchar(trimws(as.character(spec)[1L]))) {
+        obj <- obj[match_filter(obj[[nm]], spec), , drop = FALSE]
+        count <- count + 1L
+      }
+    }
+  }
+  query <- if (is.character(query) && length(query)) trimws(query[1L]) else ""
+  if (nzchar(query) && nrow(obj)) {
+    hits <- lapply(obj, function(col) contains_ci(as_search_text(col), query))
+    keep <- Reduce(`|`, hits, init = rep(FALSE, nrow(obj)))
+    obj <- obj[keep, , drop = FALSE]
+  }
+  list(obj = obj, count = count, query = query)
+}
+
 #' Sorting happens HERE, not in the client: the client only ever holds one
 #' page, so a client-side sort would order 200 rows of a million-row frame and
 #' call it sorted. It runs on the full frame BEFORE any windowing, so a column
@@ -600,58 +953,13 @@ view_payload <- function(obj, shown_name, offset = NULL, limit = NULL,
   col_limit_req <- max(1L, as_count(col_limit, 30L))
   col_limit <- min(col_limit_req, MAX_VIEW_COLS)
 
-  as_search_text <- function(col) {
-    tryCatch(as.character(col), error = function(e) rep("", length(col)))
-  }
-  match_filter <- function(col, spec) {
-    spec <- trimws(as.character(spec)[1L])
-    if (!nzchar(spec)) return(rep(TRUE, length(col)))
-    if (identical(toupper(spec), "NA")) return(is.na(col))
-    if (is.logical(col)) {
-      wanted <- toupper(spec)
-      if (wanted %in% c("TRUE", "T")) return(!is.na(col) & col)
-      if (wanted %in% c("FALSE", "F")) return(!is.na(col) & !col)
-    }
-    if (is.numeric(col)) {
-      range <- strsplit(spec, "\\.\\.", perl = TRUE)[[1L]]
-      if (length(range) == 2L) {
-        lo <- suppressWarnings(as.numeric(trimws(range[1L])))
-        hi <- suppressWarnings(as.numeric(trimws(range[2L])))
-        if (!is.na(lo) && !is.na(hi)) return(!is.na(col) & col >= lo & col <= hi)
-      }
-      parts <- regmatches(spec, regexec("^\\s*(>=|<=|!=|==|=|>|<)\\s*(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\s*$", spec))[[1L]]
-      if (length(parts) == 3L) {
-        target <- as.numeric(parts[3L])
-        hit <- switch(parts[2L], ">=" = col >= target, "<=" = col <= target,
-                      "!=" = col != target, "==" = col == target, "=" = col == target,
-                      ">" = col > target, "<" = col < target)
-        return(!is.na(hit) & hit)
-      }
-      target <- suppressWarnings(as.numeric(spec))
-      if (!is.na(target)) return(!is.na(col) & col == target)
-    }
-    text <- as_search_text(col)
-    if (startsWith(spec, "=")) return(!is.na(col) & tolower(text) == tolower(substring(spec, 2L)))
-    if (startsWith(spec, "!")) return(is.na(col) | !grepl(substring(spec, 2L), text, fixed = TRUE, ignore.case = TRUE))
-    !is.na(col) & grepl(spec, text, fixed = TRUE, ignore.case = TRUE)
-  }
-
-  filter_count <- 0L
-  if (is.list(filters) && length(filters) && length(names(filters))) {
-    for (nm in intersect(names(filters), names(obj))) {
-      spec <- filters[[nm]]
-      if (length(spec) && nzchar(trimws(as.character(spec)[1L]))) {
-        obj <- obj[match_filter(obj[[nm]], spec), , drop = FALSE]
-        filter_count <- filter_count + 1L
-      }
-    }
-  }
-  query <- if (is.character(query) && length(query)) trimws(query[1L]) else ""
-  if (nzchar(query) && nrow(obj)) {
-    hits <- lapply(obj, function(col) grepl(query, as_search_text(col), fixed = TRUE, ignore.case = TRUE))
-    keep <- Reduce(`|`, hits, init = rep(FALSE, nrow(obj)))
-    obj <- obj[keep, , drop = FALSE]
-  }
+  # Search and per-column filters. Shared with the statistics card, so a
+  # profile of "the rows you are looking at" cannot disagree with the rows the
+  # grid is actually showing.
+  narrowed <- view_filter(obj, query, filters)
+  obj <- narrowed$obj
+  filter_count <- narrowed$count
+  query <- narrowed$query
   if (is.character(sort) && length(sort) == 1L && sort %in% names(obj)) {
     obj <- obj[order(obj[[sort]], decreasing = isTRUE(desc)), , drop = FALSE]
   }
@@ -1455,15 +1763,34 @@ emit_writefile <- function(id, path = NULL, text = "") {
 #' @param seq Index of the top-level expression, to keep filenames unique.
 #' @return Invisibly NULL.
 open_plot_device <- function(dir, seq, dims = NULL) {
+  width  <- if (!is.null(dims$width))  dims$width  else PLOT_WIDTH
+  height <- if (!is.null(dims$height)) dims$height else PLOT_HEIGHT
+  res    <- if (!is.null(dims$res))    dims$res    else PLOT_RES
+  if (plot_is_svg(dims)) {
+    # A vector device is sized in INCHES and has no resolution at all — which
+    # is the whole point: its cost does not grow with dpi. The client sends
+    # pixels because that is what a raster device wants, so convert back.
+    file <- file.path(dir, sprintf("e%03d-%%03d.svg", seq))
+    if (identical(SVG_DEVICE, "svglite")) {
+      svglite::svglite(file, width = width / res, height = height / res)
+    } else {
+      grDevices::svg(file, width = width / res, height = height / res)
+    }
+    return(invisible(NULL))
+  }
   grDevices::png(
     filename = file.path(dir, sprintf("e%03d-%%03d.png", seq)),
-    width  = if (!is.null(dims$width))  dims$width  else PLOT_WIDTH,
-    height = if (!is.null(dims$height)) dims$height else PLOT_HEIGHT,
-    res    = if (!is.null(dims$res))    dims$res    else PLOT_RES,
+    width = width, height = height, res = res,
     type = PLOT_TYPE
   )
   invisible(NULL)
 }
+
+#' The file extension the open device is writing, as a regex.
+#'
+#' Harvesting used to hard-code `\\.png$`, so an SVG device produced pages
+#' that were never collected and the chunk finished with no plots at all.
+plot_pattern <- function(dims) if (plot_is_svg(dims)) "\\.svg$" else "\\.png$"
 
 #' Emit one `plot` frame for a finished page file.
 #'
@@ -1479,7 +1806,14 @@ open_plot_device <- function(dir, seq, dims = NULL) {
 #' @param f Path to a finalized PNG page.
 #' @return Invisibly NULL.
 emit_plot_frame <- function(id, f, dims = NULL) {
-  emit(list(type = "plot", id = id, mime = "image/png",
+  # SVG travels base64 too, in the same envelope as PNG. It costs 33% and buys
+  # a zero-line client change: lib/output-pane.js already understands
+  # `image/svg+xml` (isSvg — vector Save SVG, rasterise-on-demand) and already
+  # builds `data:<mime>;base64,<data>`. Sending raw text instead would have
+  # meant an encoding field plus edits to output-pane.js AND knit.js, and an
+  # older client would have rendered nothing at all.
+  svg <- grepl("\\.svg$", f)
+  emit(list(type = "plot", id = id, mime = if (svg) "image/svg+xml" else "image/png",
             width  = if (!is.null(dims$width))  dims$width  else PLOT_WIDTH,
             height = if (!is.null(dims$height)) dims$height else PLOT_HEIGHT,
             res    = if (!is.null(dims$res))    dims$res    else PLOT_RES,
@@ -1500,7 +1834,7 @@ emit_plot_frame <- function(id, f, dims = NULL) {
 #' @param seen Character vector of filenames already emitted.
 #' @return The updated `seen` vector.
 harvest_finished <- function(id, dir, seen, dims = NULL) {
-  files <- list.files(dir, pattern = "\\.png$", full.names = TRUE)
+  files <- list.files(dir, pattern = plot_pattern(dims), full.names = TRUE)
   # Only files with bytes join `seen`: a file still empty here gets another
   # look on the next harvest instead of being remembered as already emitted.
   drawn <- Filter(function(f) file.info(f)$size > 0L, sort(setdiff(files, seen)))
@@ -1518,7 +1852,7 @@ harvest_plots <- function(id, dir, seen, dims = NULL) {
   if (!is.null(grDevices::dev.list())) {
     try(grDevices::dev.off(), silent = TRUE)
   }
-  files <- list.files(dir, pattern = "\\.png$", full.names = TRUE)
+  files <- list.files(dir, pattern = plot_pattern(dims), full.names = TRUE)
   fresh <- setdiff(files, seen)
   # A device always creates its first file, even with nothing drawn into it.
   drawn <- Filter(function(f) file.info(f)$size > 0L, sort(fresh))
@@ -1860,6 +2194,17 @@ run_cell <- function(id, source, dims = NULL) {
   plot_dir <- tempfile("carmar-plots-")
   dir.create(plot_dir)
   seen <- character(0)
+  # Asked for vector, cannot give it: SAY SO. Falling back to a raster the
+  # reader did not choose, silently, is how "my plots are blurry" becomes an
+  # unanswerable bug report — and this R may well be one where svg() opens
+  # cleanly and writes nothing (see detect_svg_device).
+  if (isTRUE(dims$format == "svg") && is.null(SVG_DEVICE)) {
+    emit(list(type = "stream", id = id, kind = "warning",
+              text = paste("Vector output is not available in this R —",
+                           "install the svglite package (or XQuartz, for Cairo)",
+                           "and restart. Drawing at", dims$res %||% PLOT_RES,
+                           "dpi instead.\n")))
+  }
 
   # Where the error happened, captured WHILE it happens. By the time
   # tryCatch's handler runs the stack has already unwound, so a traceback
@@ -2009,7 +2354,8 @@ emit(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
           commands = I(c("exec", "env", "obj", "struct", "parse", "format",
                          "complete", "packages", "package_action", "package_help",
                          "help", "hover", "wd", "files", "choose", "sniff",
-                         "import", "readfile", "writefile", "view", "rm"))))
+                         "import", "readfile", "writefile", "view", "colstats",
+                         "rm"))))
 # (No package count here on purpose: installed.packages() reads every
 # package's DESCRIPTION — 0.3–1.8 s on a big library — and no client ever
 # consumed the number. The packages PANE asks the `packages` op on demand.)
@@ -2070,6 +2416,9 @@ repeat {
                                                  col_limit = cmd$colLimit,
                                                  query = cmd$query,
                                                  filters = cmd$filters)
+  if (identical(cmd$type, "colstats")) emit_colstats(cmd$id, cmd$name, cmd$column,
+                                                     query = cmd$query,
+                                                     filters = cmd$filters)
   if (identical(cmd$type, "rm"))       emit_rm(cmd$id, cmd$names)
   invisible(NULL)
   }
