@@ -1246,6 +1246,22 @@ handle_frame <- function(message, rec) {
     return(invisible(NULL))
   }
 
+  # The page names its document. Display metadata only — it flows to the
+  # runtime record so the menu helper can label the session by what the user
+  # called it, never into the worker. Pages only: a declared agent renaming
+  # the user's session would be attribution theft. Sending it (even empty)
+  # also proves a real page is attached, which retires the "listen" mark a
+  # headless start left in the record.
+  if (identical(cmd$type, "page-title")) {
+    if (identical(rec$role, "page")) {
+      clear_runtime_listen()
+      if (scalar_chr(cmd$title) || is.null(cmd$title)) {
+        set_runtime_title(cmd$title %||% "")
+      }
+    }
+    return(invisible(NULL))
+  }
+
   # ── the MCP plane ─────────────────────────────────────────────────────────
   # A local agent (Claude Code / Codex via tools/mcp/carmar-mcp.mjs) connects
   # through the same loopback/Origin/Host gates as a page, then DECLARES itself.
@@ -1529,21 +1545,58 @@ file_url <- paste0("file://", utils::URLencode(notebook_file, reserved = FALSE),
 #' CARMAR_RUNTIME_DIR relocates it (tests use a scratch dir);
 #' CARMAR_NO_RUNTIME_FILE=1 turns it off.
 runtime_file <- ""
+runtime_record <- list(url = url, file = file_url, port = port, pid = Sys.getpid(),
+                       started = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"))
+# CARMAR_LISTEN=1 marks a kernel started headless for published pages (the
+# menu's Listen for Web Pages, the keep-ready daemon). The menu helper shows
+# such a kernel as its Listen checkbox, not as a session row — there is no
+# document behind it to name. The mark is HOW IT STARTED, so the first page
+# that actually attaches clears it (see the upgrade handler): from then on it
+# is an ordinary session.
+if (identical(Sys.getenv("CARMAR_LISTEN"), "1")) runtime_record$listen <- TRUE
+
+write_runtime <- function() {
+  if (!nzchar(runtime_file)) return(invisible(FALSE))
+  ok <- tryCatch({
+    writeLines(toJSON(runtime_record, auto_unbox = TRUE), runtime_file)
+    Sys.chmod(runtime_file, mode = "0600")
+    TRUE
+  }, error = function(e) FALSE)
+  invisible(ok)
+}
+
+#' The page's own name for its document, into the runtime record.
+#'
+#' Display metadata only — nothing reads it back into the kernel. It exists so
+#' the menu helper can label a session by what the user called it instead of
+#' the notebook file's version stamp. Quotes are flattened because
+#' helper-sessions.sh reads the record with a bounded sed, not a JSON parser,
+#' and an embedded quote would truncate every field after it.
+set_runtime_title <- function(title) {
+  title <- gsub("[[:cntrl:]]", " ", title)
+  title <- gsub("[\"\\\\]", "'", title)
+  title <- trimws(substr(title, 1L, 120L))
+  if (identical(runtime_record$title %||% "", title)) return(invisible(NULL))
+  if (nzchar(title)) runtime_record$title <<- title
+  else runtime_record$title <<- NULL
+  write_runtime()
+}
+
+#' A page attached: this kernel is now a session, not a bare listener.
+clear_runtime_listen <- function() {
+  if (is.null(runtime_record$listen)) return(invisible(NULL))
+  runtime_record$listen <<- NULL
+  write_runtime()
+}
+
 if (!identical(Sys.getenv("CARMAR_NO_RUNTIME_FILE"), "1")) {
   runtime_dir <- Sys.getenv("CARMAR_RUNTIME_DIR",
                             file.path(path.expand("~"), ".carmar", "run"))
   made <- dir.exists(runtime_dir) ||
     dir.create(runtime_dir, recursive = TRUE, showWarnings = FALSE)
   if (made) {
-    candidate <- file.path(runtime_dir, sprintf("kernel-%d.json", port))
-    wrote <- tryCatch({
-      writeLines(toJSON(list(url = url, file = file_url, port = port, pid = Sys.getpid(),
-                             started = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")),
-                        auto_unbox = TRUE), candidate)
-      Sys.chmod(candidate, mode = "0600")
-      TRUE
-    }, error = function(e) FALSE)
-    if (wrote) runtime_file <- candidate
+    runtime_file <- file.path(runtime_dir, sprintf("kernel-%d.json", port))
+    if (!write_runtime()) runtime_file <- ""
   }
 }
 

@@ -234,9 +234,12 @@ run_published <- function(port = 4747, open = FALSE) {
 #' closed tab.
 #'
 #' @return A `data.frame`, one row per recorded session, ports ascending:
-#'   `port` (integer), `alive` (logical), `page` (the notebook file URL that
-#'   reopens the session; `NA` when it is not running), `source`
-#'   (`"package"` for `run()` launches, `"runtime"` for other doors).
+#'   `port` (integer), `alive` (logical), `title` (what the notebook attached
+#'   to the session calls itself; `NA` until a page names one), `listen`
+#'   (logical — a headless kernel waiting for published pages, started by the
+#'   menu's Listen for Web Pages or the keep-ready agent), `page` (the
+#'   notebook file URL that reopens the session; `NA` when it is not running),
+#'   `source` (`"package"` for `run()` launches, `"runtime"` for other doors).
 #' @examples
 #' \dontrun{
 #' carmar::sessions()
@@ -252,17 +255,26 @@ sessions <- function() {
                               full.names = TRUE)
   read_record <- function(f, expected_port) {
     declared <- expected_port
+    title <- NA_character_
+    listen <- FALSE
     u <- if (grepl("[.]json$", f)) {
       rec <- tryCatch(jsonlite::fromJSON(f, simplifyVector = TRUE),
                       error = function(e) NULL)
-      if (is.null(rec) || !is.list(rec)) return(list(url = "", valid = FALSE))
+      if (is.null(rec) || !is.list(rec)) {
+        return(list(url = "", valid = FALSE, title = title, listen = listen))
+      }
       if (!is.null(rec$port)) declared <- suppressWarnings(as.integer(rec$port))
+      if (length(rec$title) == 1L && is.character(rec$title) && nzchar(rec$title)) {
+        title <- rec$title
+      }
+      listen <- isTRUE(rec$listen)
       rec$url %||% ""
     } else tryCatch(readLines(f, warn = FALSE, n = 1L),
                     error = function(e) "")
     u <- if (length(u) == 1L && is.character(u)) u else ""
     list(url = u, valid = valid_kernel_url(u, expected_port) &&
-           length(declared) == 1L && !is.na(declared) && declared == expected_port)
+           length(declared) == 1L && !is.na(declared) && declared == expected_port,
+         title = title, listen = listen)
   }
   files <- c(state_files, runtime_files)
   origin <- rep(c("package", "runtime"),
@@ -271,6 +283,8 @@ sessions <- function() {
   records <- Map(read_record, files, ports)
   urls <- vapply(records, `[[`, character(1), "url")
   valid <- vapply(records, `[[`, logical(1), "valid")
+  titles <- vapply(records, `[[`, character(1), "title")
+  listens <- vapply(records, `[[`, logical(1), "listen")
   alive <- valid & vapply(seq_along(urls), function(i)
     isTRUE(valid[[i]]) && kernel_alive(urls[[i]]), logical(1))
   # Validate all duplicates before choosing. A malformed package record must
@@ -280,12 +294,13 @@ sessions <- function() {
   keep <- priority[!duplicated(ports[priority])]
   keep <- keep[order(ports[keep])]
   ports <- ports[keep]; origin <- origin[keep]; urls <- urls[keep]; alive <- alive[keep]
+  titles <- titles[keep]; listens <- listens[keep]
   page <- rep(NA_character_, length(ports))
   page[alive] <- vapply(urls[alive], function(u)
     tryCatch(notebook_launch_url(u, state), error = function(e) NA_character_),
     character(1), USE.NAMES = FALSE)
-  data.frame(port = ports, alive = alive, page = page, source = origin,
-             stringsAsFactors = FALSE)
+  data.frame(port = ports, alive = alive, title = titles, listen = listens,
+             page = page, source = origin, stringsAsFactors = FALSE)
 }
 
 #' Stop the CarmaR kernel
