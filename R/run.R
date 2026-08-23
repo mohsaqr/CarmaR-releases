@@ -361,11 +361,10 @@ sync_notebook <- function(app = dirname(system.file("app", "kernel", package = "
 #' Reads the release feed once and updates BOTH halves of an installation:
 #' the newest notebook is downloaded into your user data folder, and when the
 #' release is newer than the installed carmar package, the release's own
-#' package is installed too. You never need to call this: `run()` does it on
-#' EVERY call — the launcher icon included, since the icon is `run()` with a
-#' picture on it — so every click checks for updated versions. Neither check
-#' may block or fail a launch: any trouble is a quiet no-op and CarmaR starts
-#' on what it has.
+#' package is installed too. `run()` calls this automatically. On macOS, a
+#' successful package update also refreshes CarmaR.app and CarmaR Helper.app
+#' from that package. Neither check may block or fail a launch: any trouble is
+#' a quiet no-op and CarmaR starts on what it has.
 #'
 #' @param quiet Say nothing unless something was updated? Default `FALSE`.
 #' @return Invisibly, `TRUE` if anything was updated.
@@ -457,8 +456,26 @@ upgrade_package <- function(rel, say) {
                                              type = "source", quiet = TRUE))
     isTRUE(utils::packageVersion("carmar") >= want)
   }, error = function(e) FALSE)
-  if (ok) say("The carmar package is now ", as.character(want), ".")
-  else say("The package update could not be installed - CarmaR keeps its current version.")
+  if (ok) {
+    say("The carmar package is now ", as.character(want), ".")
+    # A macOS package also carries the current CarmaR.app and menu helper.
+    # Use a fresh R process so it loads install_app() from the package that was
+    # just written, rather than this still-running namespace. This keeps the
+    # carmar:// handler and embedded kernel on the same release as the package.
+    bundles <- system.file("app", "macos", "carmar-apps.tar.gz",
+                           package = "carmar")
+    if (identical(unname(Sys.info()["sysname"]), "Darwin") && file.exists(bundles)) {
+      package_lib <- dirname(find.package("carmar"))
+      lib_literal <- encodeString(package_lib, quote = '"')
+      expr <- paste0(".libPaths(c(", lib_literal,
+        ",.libPaths())); try(carmar::install_app(quiet=TRUE,helper=TRUE),silent=TRUE)")
+      refreshed <- tryCatch(system2(file.path(R.home("bin"), "Rscript"),
+        c("--vanilla", "-e", shQuote(expr)), stdout = FALSE, stderr = FALSE) == 0L,
+        error = function(e) FALSE)
+      if (refreshed) say("CarmaR.app and its menu helper are now on the same release.")
+      else say("The package updated, but the application bundles could not be refreshed.")
+    }
+  } else say("The package update could not be installed - CarmaR keeps its current version.")
   ok
 }
 

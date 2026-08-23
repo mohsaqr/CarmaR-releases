@@ -2,10 +2,11 @@
 \alias{uninstall_app}
 \title{Remove the launcher install_app() created}
 \usage{
-uninstall_app(quiet = FALSE)
+uninstall_app(quiet = FALSE, helper = TRUE)
 }
 \arguments{
 \item{quiet}{Say nothing? Default \code{FALSE}.}
+\item{helper}{On macOS, also stop and remove CarmaR Helper and its keep-ready service? Default \code{TRUE}.}
 }
 \value{
 Invisibly, \code{TRUE} if something was removed.

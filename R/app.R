@@ -1,12 +1,9 @@
-# app.R — CarmaR as a native application, manufactured ON this machine.
+# app.R — CarmaR as a native application installed by the R package.
 #
-# The whole trick, and the reason this beats shipping an app: a downloaded
-# .app carries the quarantine bit and meets Gatekeeper, which demands a
-# Developer ID we refuse to make students depend on. An app WRITTEN by R on
-# the user's own machine carries no quarantine bit at all — same code, no
-# dialog, no signing, nothing to notarize. So the package builds the launcher
-# locally: a bundle in ~/Applications on macOS, a Start-menu entry on
-# Windows, a .desktop file on Linux.
+# On macOS the source package carries the two release-built apps in an archive.
+# R extracts and installs that archive locally, so the apps do not inherit a
+# browser-download quarantine marker. Windows and Linux build their small
+# launchers locally in the Start menu or application menu.
 #
 # Every launcher is two layers, and both are deliberately dumb:
 #   1. a platform shim that finds Rscript AT CLICK TIME (an R upgrade must
@@ -14,7 +11,9 @@
 #   2. launch.R — plain readable R that reinstalls carmar if it has gone
 #      missing, then calls carmar::run(). Self-healing, and auditable by
 #      anyone who can read ten lines of R.
-# No protocol handlers, no agents, no background jobs: the app IS run().
+# On macOS the package carries the exact release-built CarmaR.app and menu
+# helper. Installing them through R does not attach a browser-download
+# quarantine attribute, while preserving the document and carmar:// handlers.
 
 #' The bootstrap the launcher runs — kept as its own file, not an inline -e,
 #' so every platform shim escapes NOTHING and a curious user can open it.
@@ -82,13 +81,100 @@ launcher_assets <- function() {
   if (nzchar(p)) p else ""
 }
 
+#' Release-built macOS bundles carried inside the installed R package.
+#' @keywords internal
+launcher_macos_bundles <- function() {
+  p <- system.file("app", "macos", "carmar-apps.tar.gz", package = "carmar")
+  if (nzchar(p) && file.exists(p)) p else ""
+}
+
 #' Build CarmaR.app — a plain bundle with a shell-script executable. Scripts
 #' need no code signature even on Apple silicon, and a bundle this machine
 #' wrote has no quarantine bit: it opens like any app, first click included.
 #' @keywords internal
-app_macos <- function(apps = "~/Applications", assets = launcher_assets()) {
+app_macos <- function(apps = "~/Applications", assets = launcher_assets(),
+                      helper = TRUE, keep_ready = FALSE,
+                      bundles = launcher_macos_bundles(),
+                      launch_helper = TRUE, preserve_keep_ready = TRUE) {
   apps <- path.expand(apps)
   app <- file.path(apps, "CarmaR.app")
+  helper_app <- file.path(apps, "CarmaR Helper.app")
+
+  # Release packages carry the two signed bundles in one archive. Keeping
+  # Mach-O executables out of the source-package file list also keeps normal
+  # R package checks portable. A directory remains accepted for development
+  # and tests that exercise the installer without building the apps.
+  bundle_root <- bundles
+  if (nzchar(bundles) && file.exists(bundles) && !dir.exists(bundles)) {
+    unpacked <- tempfile("carmar-apps-")
+    dir.create(unpacked)
+    status <- tryCatch(utils::untar(bundles, exdir = unpacked),
+                       error = function(e) 1L)
+    if (!identical(status, 0L))
+      stop("The CarmaR application archive could not be unpacked.", call. = FALSE)
+    on.exit(unlink(unpacked, recursive = TRUE), add = TRUE)
+    bundle_root <- unpacked
+  }
+  bundled_app <- if (nzchar(bundle_root)) file.path(bundle_root, "CarmaR.app") else ""
+  bundled_helper <- if (nzchar(bundle_root)) file.path(bundle_root, "CarmaR Helper.app") else ""
+
+  # A release package contains the full app, not the old run()-only shim. It
+  # is the same bundle installed by CarmaR.pkg: document handlers, carmar://
+  # published-page authorization, updater, kernel and menu integration.
+  if (nzchar(bundled_app) && dir.exists(bundled_app)) {
+    dir.create(apps, recursive = TRUE, showWarnings = FALSE)
+    agent_was_installed <- isTRUE(preserve_keep_ready) && file.exists(path.expand(
+      "~/Library/LaunchAgents/me.saqr.carmar.helper.plist"))
+    old_agents <- file.path(helper_app, "Contents", "Resources", "helper-agent.sh")
+    old_agent <- old_agents[file.exists(old_agents)][1]
+
+    if (isTRUE(helper) && length(old_agent) && !is.na(old_agent)) {
+      suppressWarnings(system2("/bin/sh", c(shQuote(old_agent), "uninstall"),
+                               stdout = FALSE, stderr = FALSE))
+    }
+    if (isTRUE(helper)) {
+      suppressWarnings(system2("/usr/bin/osascript", c("-e", shQuote(
+        'tell application id "me.saqr.carmar.helper.app" to quit')),
+        stdout = FALSE, stderr = FALSE))
+    }
+
+    install_bundle <- function(from, to) {
+      unlink(to, recursive = TRUE)
+      status <- system2("/usr/bin/ditto", c(shQuote(from), shQuote(to)),
+                        stdout = FALSE, stderr = FALSE)
+      if (!identical(status, 0L) || !dir.exists(to))
+        stop("Could not install ", basename(to), " in ", apps, call. = FALSE)
+    }
+    install_bundle(bundled_app, app)
+    if (isTRUE(helper)) {
+      if (!dir.exists(bundled_helper))
+        stop("The CarmaR package does not contain CarmaR Helper.app.", call. = FALSE)
+      install_bundle(bundled_helper, helper_app)
+      agent <- file.path(helper_app, "Contents", "Resources", "helper-agent.sh")
+      if (isTRUE(keep_ready) || agent_was_installed) {
+        status <- system2("/bin/sh", c(shQuote(agent), "install"),
+                          stdout = FALSE, stderr = FALSE)
+        if (!identical(status, 0L))
+          warning("CarmaR was installed, but its keep-ready service could not be restored.")
+      }
+      if (isTRUE(launch_helper))
+        suppressWarnings(system2("/usr/bin/open", c("-g", shQuote(helper_app)),
+                                 stdout = FALSE, stderr = FALSE))
+    }
+
+    register <- "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    if (file.exists(register)) {
+      suppressWarnings(system2(register, c("-f", shQuote(app)),
+                               stdout = FALSE, stderr = FALSE))
+      if (isTRUE(helper)) suppressWarnings(system2(register,
+        c("-f", shQuote(helper_app)), stdout = FALSE, stderr = FALSE))
+    }
+    return(app)
+  }
+
+  # Development/source fallback. Release packages always take the full-bundle
+  # path above; keeping this generator makes source-level tests and unusual
+  # hand-built packages retain a basic launcher.
   res <- file.path(app, "Contents", "Resources")
   bin <- file.path(app, "Contents", "MacOS")
   unlink(app, recursive = TRUE)
@@ -224,23 +310,27 @@ app_linux <- function(share = "~/.local/share", assets = launcher_assets()) {
 #'
 #' Creates a native launcher — CarmaR in ~/Applications on macOS, in the
 #' Start menu on Windows, in the app menu on Linux — so starting CarmaR is
-#' a click, with R and the console nowhere in sight. The launcher is
-#' manufactured locally by this function, which is why macOS shows no
-#' "unidentified developer" dialog: nothing was downloaded, so there is
-#' nothing for Gatekeeper to quarantine. It finds R fresh on every click
-#' and reinstalls carmar if it has gone missing, so it survives R upgrades
-#' and accidental removals. Typing carmar::run() keeps working exactly as
-#' before — the launcher is the same call with an icon on it.
+#' a click, with R and the console nowhere in sight. On macOS the release-built
+#' app and CarmaR Helper are installed together from the package. Because R
+#' performs the local installation, they are not given a browser-download
+#' quarantine marker. The helper menu lists and controls local sessions, and
+#' opening CarmaR brings it back if it was closed. The keep-ready login service
+#' remains opt-in unless requested. Other platforms use a small launcher that
+#' finds R fresh and repairs a missing package automatically.
 #'
 #' @param quiet Say nothing on success? Default `FALSE`.
+#' @param helper On macOS, install and open the menu helper? Default `TRUE`.
+#' @param keep_ready On macOS, keep one kernel ready at login? Default `FALSE`.
 #' @return Invisibly, the path of what was created.
 #' @export
-install_app <- function(quiet = FALSE) {
+install_app <- function(quiet = FALSE, helper = TRUE, keep_ready = FALSE) {
   say <- function(...) if (!quiet) message(...)
   os <- unname(Sys.info()["sysname"])
   made <- if (identical(os, "Darwin")) {
-    p <- app_macos()
-    say("CarmaR is now an app: ", p, "\nFind it in Launchpad / Spotlight as CarmaR.")
+    p <- app_macos(helper = helper, keep_ready = keep_ready)
+    say("CarmaR is now an app: ", p,
+        "\nFind it in Launchpad / Spotlight as CarmaR.",
+        if (isTRUE(helper)) " The CarmaR menu is running too." else "")
     p
   } else if (identical(.Platform$OS.type, "windows")) {
     p <- app_windows()
@@ -260,13 +350,33 @@ install_app <- function(quiet = FALSE) {
 #' your R are untouched.
 #'
 #' @param quiet Say nothing? Default `FALSE`.
+#' @param helper On macOS, also stop and remove CarmaR Helper and its
+#'   keep-ready service? Default `TRUE`.
 #' @return Invisibly, `TRUE` if something was removed.
 #' @export
-uninstall_app <- function(quiet = FALSE) {
+uninstall_app <- function(quiet = FALSE, helper = TRUE) {
   say <- function(...) if (!quiet) message(...)
   os <- unname(Sys.info()["sysname"])
   targets <- if (identical(os, "Darwin")) {
-    path.expand("~/Applications/CarmaR.app")
+    main <- path.expand("~/Applications/CarmaR.app")
+    helper_app <- path.expand("~/Applications/CarmaR Helper.app")
+    if (isTRUE(helper)) {
+      agent <- file.path(helper_app, "Contents", "Resources", "helper-agent.sh")
+      if (file.exists(agent)) suppressWarnings(system2(
+        "/bin/sh", c(shQuote(agent), "uninstall"), stdout = FALSE, stderr = FALSE))
+      suppressWarnings(system2("/usr/bin/osascript", c("-e", shQuote(
+        'tell application id "me.saqr.carmar.helper.app" to quit')),
+        stdout = FALSE, stderr = FALSE))
+      update_label <- "me.saqr.carmar.update"
+      uid <- tryCatch(trimws(system2("/usr/bin/id", "-u", stdout = TRUE,
+                                    stderr = FALSE)),
+                      error = function(e) "")
+      if (nzchar(uid)) suppressWarnings(system2("/bin/launchctl", c("bootout",
+        paste0("gui/", uid, "/", update_label)),
+        stdout = FALSE, stderr = FALSE))
+      unlink(path.expand(paste0("~/Library/LaunchAgents/", update_label, ".plist")))
+      c(main, helper_app)
+    } else main
   } else if (identical(.Platform$OS.type, "windows")) {
     c(file.path(Sys.getenv("LOCALAPPDATA"), "CarmaR"),
       file.path(Sys.getenv("APPDATA"), "Microsoft", "Windows", "Start Menu",

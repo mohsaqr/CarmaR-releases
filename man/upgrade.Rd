@@ -14,9 +14,9 @@ Invisibly, \code{TRUE} if anything was updated.
 Reads the release feed once and updates BOTH halves of an installation: the
 newest notebook is downloaded into your user data folder, and when the
 release is newer than the installed carmar package, the release's own
-package is installed too. You never need to call this: \code{run()} does it
-on EVERY call --- the launcher icon included, since the icon is \code{run()}
-with a picture on it --- so every click checks for updated versions.
+package is installed too. \code{run()} calls this automatically.
+On macOS, a package update also refreshes CarmaR.app and CarmaR Helper.app so
+the custom URL handler and embedded kernel stay on the same release.
 Neither check may block or fail a launch: any trouble is a quiet no-op and
 CarmaR starts on what it has.
 }
