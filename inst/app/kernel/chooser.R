@@ -39,9 +39,12 @@ as_powershell_string <- function(x) {
 
 #' The command that opens this platform's file dialog.
 #'
-#' @param mode "file" or "dir".
+#' @param mode "file", "dir" or "save". Save is the platform's own save sheet:
+#'   it returns a path that need not exist yet, and the OS itself asks about
+#'   replacing an existing file — a question the in-app browser never asked.
 #' @param start Directory the dialog opens in; NULL for the platform default.
 #' @param prompt Dialog title.
+#' @param default_name Save mode's pre-filled file name.
 #' @param sysname `Sys.info()[["sysname"]]`; a parameter so tests can ask for
 #'   a platform they are not running on.
 #' @param have A predicate answering "is this binary available"; a parameter
@@ -51,18 +54,22 @@ as_powershell_string <- function(x) {
 #'   (AppleScript, PowerShell) and NULL otherwise — named, so no caller ever
 #'   has to reach into `args` by position to find it.
 chooser_command <- function(mode = "file", start = NULL, prompt = "Choose",
+                            default_name = NULL,
                             sysname = Sys.info()[["sysname"]],
                             have = function(bin) nzchar(Sys.which(bin))) {
-  stopifnot(mode %in% c("file", "dir"))
+  stopifnot(mode %in% c("file", "dir", "save"))
   usable_start <- is.character(start) && length(start) == 1L && nzchar(start) &&
     dir.exists(start)
+  usable_name <- is.character(default_name) && length(default_name) == 1L &&
+    nzchar(default_name)
 
   if (identical(sysname, "Darwin")) {
     # `tell application "System Events" ... activate` is what puts the dialog
     # in FRONT. Without it the picker opens behind the browser window and the
     # notebook simply looks frozen — the user is waiting for a dialog they
     # cannot see.
-    verb <- if (identical(mode, "dir")) "choose folder" else "choose file"
+    verb <- switch(mode, dir = "choose folder", save = "choose file name",
+                   "choose file")
     loc <- if (usable_start) {
       # Parentheses are syntax, not decoration: `default location POSIX file`
       # is parsed as adjacent parameter/class names by osacompile. Coercing
@@ -70,10 +77,13 @@ chooser_command <- function(mode = "file", start = NULL, prompt = "Choose",
       paste0(" default location (POSIX file ",
              as_applescript_string(normalizePath(start)), ")")
     } else ""
+    nm <- if (identical(mode, "save") && usable_name) {
+      paste0(" default name ", as_applescript_string(default_name))
+    } else ""
     script <- paste0(
       'tell application "System Events"\n',
       '  activate\n',
-      '  set theItem to ', verb, ' with prompt ', as_applescript_string(prompt), loc, '\n',
+      '  set theItem to ', verb, ' with prompt ', as_applescript_string(prompt), nm, loc, '\n',
       'end tell\n',
       'POSIX path of theItem'
     )
@@ -87,6 +97,14 @@ chooser_command <- function(mode = "file", start = NULL, prompt = "Choose",
         if (usable_start) paste0("$d.SelectedPath = ", as_powershell_string(start), "; ") else "",
         "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) ",
         "{ [Console]::Out.Write($d.SelectedPath) }")
+    } else if (identical(mode, "save")) {
+      paste0(
+        "$d = New-Object System.Windows.Forms.SaveFileDialog; ",
+        if (usable_start) paste0("$d.InitialDirectory = ", as_powershell_string(start), "; ") else "",
+        if (usable_name) paste0("$d.FileName = ", as_powershell_string(default_name), "; ") else "",
+        "$d.OverwritePrompt = $true; ",
+        "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) ",
+        "{ [Console]::Out.Write($d.FileName) }")
     } else {
       paste0(
         "$d = New-Object System.Windows.Forms.OpenFileDialog; ",
@@ -106,17 +124,27 @@ chooser_command <- function(mode = "file", start = NULL, prompt = "Choose",
 
   # Linux and the rest: whichever desktop chooser is actually installed.
   if (have("zenity")) {
+    start_arg <- if (usable_start) {
+      base <- paste0(sub("/+$", "", normalizePath(start)), "/")
+      # In save mode the --filename carries the suggested name too.
+      if (identical(mode, "save") && usable_name) paste0(base, default_name) else base
+    } else NULL
     return(list(command = "zenity", script = NULL, args = c(
       "--file-selection",
-      if (identical(mode, "dir")) "--directory" else NULL,
+      switch(mode, dir = "--directory", save = "--save"),
       paste0("--title=", prompt),
-      if (usable_start) paste0("--filename=",
-                               paste0(sub("/+$", "", normalizePath(start)), "/")) else NULL)))
+      if (!is.null(start_arg)) paste0("--filename=", start_arg))))
   }
   if (have("kdialog")) {
+    start_arg <- if (usable_start) {
+      if (identical(mode, "save") && usable_name)
+        file.path(normalizePath(start), default_name)
+      else normalizePath(start)
+    } else "."
     return(list(command = "kdialog", script = NULL, args = c(
-      if (identical(mode, "dir")) "--getexistingdirectory" else "--getopenfilename",
-      if (usable_start) normalizePath(start) else ".",
+      switch(mode, dir = "--getexistingdirectory", save = "--getsavefilename",
+             "--getopenfilename"),
+      start_arg,
       "--title", prompt)))
   }
   NULL
@@ -128,10 +156,21 @@ chooser_command <- function(mode = "file", start = NULL, prompt = "Choose",
 #' is indistinguishable from a crash unless you look. Treating it as an error
 #' puts a red message in front of someone who simply changed their mind, so
 #' cancellation is its own outcome all the way up to the wizard.
-chooser_cancelled <- function(status, output) {
+#'
+#' The reading is PER BACKEND, because "non-zero and silent" means opposite
+#' things. zenity and kdialog report Cancel exactly that way. osascript in a
+#' process that CANNOT present UI at all exits 2 instantly and silently (the
+#' 2026-08-07 empirics in lib/dialogs.js) — and calling that "cancelled"
+#' swallowed the one signal that should have sent the caller to the in-app
+#' browser instead. A real osascript cancel always names itself (-128).
+chooser_cancelled <- function(status, output, command = NULL) {
   if (identical(as.integer(status), 0L)) return(!nzchar(trimws(paste(output, collapse = ""))))
   txt <- tolower(paste(output, collapse = " "))
-  grepl("user canceled|user cancelled|-128", txt) || !nzchar(trimws(txt))
+  if (grepl("user canceled|user cancelled|-128", txt)) return(TRUE)
+  if (!is.null(command) && command %in% c("zenity", "kdialog")) {
+    return(!nzchar(trimws(txt)))
+  }
+  FALSE
 }
 
 #' Actually run a chooser command.
@@ -167,8 +206,8 @@ run_chooser <- function(spec) {
 #'   list(unsupported=TRUE) — never a thrown condition, because a missing
 #'   zenity must degrade to the in-page browser rather than end the command.
 choose_path <- function(mode = "file", start = NULL, prompt = "Choose",
-                        run = run_chooser) {
-  spec <- tryCatch(chooser_command(mode, start, prompt),
+                        default_name = NULL, run = run_chooser) {
+  spec <- tryCatch(chooser_command(mode, start, prompt, default_name),
                    error = function(e) NULL)
   if (is.null(spec)) return(list(unsupported = TRUE))
   if (!nzchar(Sys.which(spec$command))) return(list(unsupported = TRUE))
@@ -181,14 +220,20 @@ choose_path <- function(mode = "file", start = NULL, prompt = "Choose",
   status <- res$status
   if (is.null(status) || is.na(status)) status <- 1L    # timeout: no status
   out <- res$output
-  if (chooser_cancelled(status, out)) return(list(cancelled = TRUE))
+  if (chooser_cancelled(status, out, spec$command)) return(list(cancelled = TRUE))
   if (!identical(as.integer(status), 0L)) {
     return(list(error = paste("the file dialog failed:", paste(out, collapse = " "))))
   }
   # zenity can print a GTK warning to the same stream; the path is the last
-  # non-empty line, and it is the only one naming something that exists.
+  # non-empty line. Opening, it is the only line naming something that
+  # exists; saving, the chosen path DOES NOT exist yet, so the test is that
+  # its parent folder does.
   lines <- Filter(nzchar, trimws(out))
-  hit <- Find(file.exists, rev(lines))
+  hit <- if (identical(mode, "save")) {
+    Find(function(p) dir.exists(dirname(p)), rev(lines))
+  } else {
+    Find(file.exists, rev(lines))
+  }
   if (is.null(hit)) return(list(error = "the dialog returned nothing readable"))
   list(path = normalizePath(hit, mustWork = FALSE))
 }

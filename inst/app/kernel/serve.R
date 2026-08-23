@@ -1190,7 +1190,35 @@ fail_worker_routes <- function(reason) {
       list(type = "done", id = route$client_id, status = "error", message = reason)
     else list(type = route$response_type, id = route$client_id, error = reason)
     try(route$rec$ws$send(toJSON(frame, auto_unbox = TRUE)), silent = TRUE)
+    # A failed route is a finished route. The restart path clears everything
+    # itself two lines later, but any future caller that forgot would leave
+    # routes answered AND still registered — the next reply with a recycled
+    # wire id would then reach the wrong socket.
+    drop_worker_route(wire_id)
   }
+  invisible(NULL)
+}
+
+#' Best-effort refusal for a frame that cannot be forwarded. A silent drop
+#' reads as a HANG on the other end — the caller owns a promise with no
+#' timeout (a cell) or waits out a long one (a request) — so name the reason
+#' when the frame's own head still names its type and id. Reads only a
+#' bounded prefix; a frame we refused to parse is not a frame to trust.
+refuse_frame <- function(message, rec, reason) {
+  head <- substr(message, 1L, 2048L)
+  take <- function(pattern) {
+    m <- regmatches(head, regexec(pattern, head))[[1L]]
+    if (length(m) == 2L && nzchar(m[[2L]])) m[[2L]] else NULL
+  }
+  type <- take('"type"[[:space:]]*:[[:space:]]*"([A-Za-z_-]{1,32})"')
+  id <- take('"id"[[:space:]]*:[[:space:]]*"([^"]{1,128})"')
+  if (is.null(type) || is.null(id)) return(invisible(NULL))
+  frame <- if (identical(type, "exec")) {
+    list(type = "done", id = id, status = "error", message = reason)
+  } else {
+    list(type = type, id = id, error = reason)
+  }
+  try(rec$ws$send(toJSON(frame, auto_unbox = TRUE)), silent = TRUE)
   invisible(NULL)
 }
 
@@ -1199,7 +1227,9 @@ handle_frame <- function(message, rec) {
   if (is.raw(message)) return(invisible(NULL))           # binary: not our protocol
   if (nchar(message, type = "bytes") > MAX_FRAME_BYTES) {
     audit("frame-too-large", bytes = nchar(message, type = "bytes"))
-    return(invisible(NULL))
+    return(refuse_frame(message, rec, sprintf(
+      "This request is larger than the kernel accepts (%.1f MB against an 8 MB limit).",
+      nchar(message, type = "bytes") / 1e6)))
   }
   cmd <- tryCatch(fromJSON(message, simplifyVector = TRUE), error = function(e) NULL)
   if (!is.list(cmd) || !scalar_chr(cmd$type)) return(invisible(NULL))
@@ -1441,8 +1471,15 @@ pump <- function() {
 
     if (!is.null(route)) {
       e$id <- route$client_id
+      # An exec route normally ends in `done` — but an OLDER worker whose
+      # dispatch died outside run_cell answers `{"type":"exec", error}`
+      # instead, and treating that as ordinary traffic left the route (and
+      # `worker_active`) held forever: one bad frame and no run, completion
+      # or pane request ever went out again. An error frame on an exec route
+      # is terminal too.
       is_terminal <- (identical(route$kind, "request") && had_id) ||
-        identical(e$type, "done")
+        identical(e$type, "done") ||
+        (identical(route$kind, "exec") && had_id && !is.null(e$error))
       if (is_terminal) {
         # Hold the terminal frame until the pipes are quiescent. Otherwise the
         # browser settles the result before a trailing stderr frame arrives.

@@ -1062,25 +1062,42 @@ emit_view <- function(id, name, offset = NULL, limit = NULL, sort = NULL,
 #' left open all afternoon hits CHOOSER_TIMEOUT rather than wedging R.
 #'
 #' @param id Request id.
-#' @param mode "file" or "dir".
+#' @param mode "file", "dir" or "save" — save shows the platform's save sheet
+#'   and returns a path that need not exist yet.
 #' @param start Directory to open in; defaults to the working directory.
 #' @param prompt Dialog title.
+#' @param default_name Save mode's suggested file name; basename() is taken,
+#'   so a client cannot smuggle directories through it.
 #' @param probe_only Report support without opening a dialog. Older clients
 #'   discover capabilities this way; ignoring it consumes the user's first
 #'   file choice as a probe and makes the second attempt appear to work.
 #' @return Invisibly NULL. Emits one `choose` frame carrying exactly one of
 #'   `path`, `cancelled`, `unsupported` or `error`.
 emit_choose <- function(id, mode = "file", start = NULL, prompt = NULL,
-                        probe_only = FALSE) {
+                        probe_only = FALSE, default_name = NULL) {
+  # The honest opt-out. A test harness (or any deployment where a dialog
+  # would open on a screen nobody is watching) sets CARMAR_NO_NATIVE_DIALOG
+  # and this kernel simply reports "no dialog here" — probes included — so
+  # every client falls back to its own picker, which is the same contract a
+  # machine with no desktop follows.
+  if (nzchar(Sys.getenv("CARMAR_NO_NATIVE_DIALOG"))) {
+    emit(list(type = "choose", id = id, unsupported = TRUE))
+    return(invisible(NULL))
+  }
   if (!exists("choose_path", inherits = TRUE)) {
     emit(list(type = "choose", id = id, unsupported = TRUE))
     return(invisible(NULL))
   }
   if (isTRUE(probe_only)) {
-    emit(list(type = "choose", id = id, supported = TRUE))
+    # `modes` is how a client discovers save-sheet support without a second
+    # verb: kernels older than the save mode omit the field, and the client
+    # reads its absence as file/dir only.
+    emit(list(type = "choose", id = id, supported = TRUE,
+              modes = I(c("file", "dir", "save"))))
     return(invisible(NULL))
   }
-  mode <- if (identical(mode, "dir")) "dir" else "file"
+  mode <- if (is.character(mode) && length(mode) == 1L &&
+              mode %in% c("dir", "save")) mode else "file"
   begin <- if (is.character(start) && length(start) == 1L && nzchar(start)) {
     path.expand(start)
   } else getwd()
@@ -1088,8 +1105,11 @@ emit_choose <- function(id, mode = "file", start = NULL, prompt = NULL,
   # subtree — and whatever comes back is checked again below, because the
   # dialog itself cannot be constrained.
   if (!within_root(begin)) begin <- confine_root
+  nm <- if (is.character(default_name) && length(default_name) == 1L &&
+            nzchar(default_name)) basename(default_name) else NULL
   res <- choose_path(mode, begin,
-                     if (is.character(prompt) && nzchar(prompt)) prompt else "Choose a file")
+                     if (is.character(prompt) && nzchar(prompt)) prompt else "Choose a file",
+                     default_name = nm)
   if (!is.null(res$path) && !within_root(res$path)) {
     emit(list(type = "choose", id = id, error = outside_root_msg()))
     return(invisible(NULL))
@@ -1655,8 +1675,10 @@ emit_wd <- function(id, path = NULL) {
 #' @param id Request id.
 #' @param path Directory to list; NULL or "" means the working directory. `~`
 #'   is expanded.
+#' @param all TRUE also lists dotfiles (never `.` / `..`). Off by default —
+#'   the same default `list.files()` has — and a client-side toggle.
 #' @return Invisibly NULL. Emits one `files` frame.
-emit_files <- function(id, path = NULL) {
+emit_files <- function(id, path = NULL, all = FALSE) {
   p <- if (is.null(path) || !is.character(path) || !nzchar(path[1L])) getwd()
        else path.expand(path[1L])
   p <- normalizePath(p, mustWork = FALSE)
@@ -1672,7 +1694,7 @@ emit_files <- function(id, path = NULL) {
     emit(list(type = "files", id = id, path = p, error = "not readable"))
     return(invisible(NULL))
   }
-  nms <- list.files(p)
+  nms <- list.files(p, all.files = isTRUE(all), no.. = TRUE)
   info <- file.info(file.path(p, nms))
   isdir <- info$isdir %in% TRUE          # a broken symlink reports NA
   ord <- order(!isdir, tolower(nms))
@@ -2189,6 +2211,12 @@ capture_trace <- function(max_frames = 40L) {
 #' @return Invisibly NULL. Emits exactly one `done` frame.
 run_cell <- function(id, source, dims = NULL) {
   stopifnot(is.character(source), length(source) == 1L)
+  # `dims` crosses the wire unvalidated (serve.R checks only id and source),
+  # and `$` on an atomic vector THROWS — before the eval's own tryCatch, so a
+  # malformed dims from an older bundle or a hand-built frame used to escape
+  # run_cell entirely and wedge the whole exec route. A dims that is not a
+  # list is no dims.
+  if (!is.null(dims) && !is.list(dims)) dims <- NULL
   status <- "ok"
   detail <- NULL
   plot_dir <- tempfile("carmar-plots-")
@@ -2382,9 +2410,11 @@ repeat {
   # comes back as an `error` FIELD on a frame carrying the request's id, so
   # the caller sees a reason instead of waiting out a timeout.
   #
-  # `interrupt` is deliberately NOT caught here — Stop is delivered as an
-  # interrupt condition and the handlers that can be interrupted (exec, view)
-  # catch it themselves, with meaning.
+  # `interrupt` IS caught below, but only as a last resort: Stop is delivered
+  # as an interrupt condition and the handlers that can be interrupted (exec,
+  # view) catch it themselves, with meaning. The outer handler exists for the
+  # narrow window where one lands outside those — an uncaught interrupt ends
+  # the worker script, and the supervisor treats a dead worker as fatal.
   dispatch <- function(cmd) {
   if (identical(cmd$type, "exec"))     run_cell(cmd$id, cmd$source, cmd$dims)
   if (identical(cmd$type, "env"))      emit_env(cmd$id)
@@ -2399,9 +2429,9 @@ repeat {
   if (identical(cmd$type, "help"))     emit_help(cmd$id, cmd$topic)
   if (identical(cmd$type, "hover"))    emit_hover(cmd$id, cmd$name)
   if (identical(cmd$type, "wd"))       emit_wd(cmd$id, cmd$path)
-  if (identical(cmd$type, "files"))    emit_files(cmd$id, cmd$path)
+  if (identical(cmd$type, "files"))    emit_files(cmd$id, cmd$path, isTRUE(cmd$all))
   if (identical(cmd$type, "choose"))   emit_choose(cmd$id, cmd$mode, cmd$start, cmd$prompt,
-                                                    cmd$probeOnly)
+                                                    cmd$probeOnly, cmd$default)
   if (identical(cmd$type, "sniff"))    emit_sniff(cmd$id, cmd$path, cmd$opts)
   if (identical(cmd$type, "import"))   emit_import(cmd$id, cmd$path, cmd$name)
   if (identical(cmd$type, "readfile"))  emit_readfile(cmd$id, cmd$path)
@@ -2422,11 +2452,30 @@ repeat {
   if (identical(cmd$type, "rm"))       emit_rm(cmd$id, cmd$names)
   invisible(NULL)
   }
-  tryCatch(dispatch(cmd), error = function(e) {
-    emit(list(type = cmd$type,
-              id = if (is.character(cmd$id) && length(cmd$id) == 1L) cmd$id else NULL,
-              error = paste("command failed:", conditionMessage(e))))
-  })
+  # An exec that dies OUTSIDE run_cell's own handlers must still end in a
+  # `done`: the browser settles a cell only on its done frame, and the
+  # supervisor retires the route (and frees the worker queue) on the same
+  # signal — an `{"type":"exec", error}` frame satisfied neither, so one
+  # malformed command wedged every later run behind it, permanently.
+  #
+  # The interrupt handler is the same guarantee for Stop: run_cell catches
+  # interrupts around the eval, but one landing in its epilogue (unlink,
+  # flush, the emit itself) used to escape this loop, end the worker script,
+  # and take the supervisor's event loop down with it.
+  fail_frame <- function(text) {
+    id_ok <- is.character(cmd$id) && length(cmd$id) == 1L
+    if (identical(cmd$type, "exec")) {
+      if (id_ok) emit(list(type = "done", id = cmd$id, status = "error",
+                           message = text))
+    } else {
+      emit(list(type = cmd$type, id = if (id_ok) cmd$id else NULL,
+                error = text))
+    }
+  }
+  tryCatch(dispatch(cmd),
+           error = function(e) fail_frame(paste("command failed:",
+                                                conditionMessage(e))),
+           interrupt = function(i) fail_frame("Execution interrupted"))
 }
 
 close(con)

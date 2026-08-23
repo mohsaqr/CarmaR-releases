@@ -293,12 +293,22 @@ kernel_poll <- function(k, timeout_ms = 50L) {
   # SIXTEEN SECONDS to deliver something R had drawn in 0.27 s. The dpi was
   # never the cost; the number of ticks was, and it scales with payload, so
   # every large plot, every wide data frame and every long print paid it.
-  drain <- function(read) {
+  # ... and yet BOUNDED. An unbounded drain has the opposite failure: a worker
+  # producing faster than this loop consumes (`repeat cat("x\n")`) keeps the
+  # pipe permanently non-empty, `kernel_poll` never returns, httpuv::service()
+  # is never reached — and the Stop the user is pressing can never be
+  # delivered. Capping the bytes taken per poll keeps both properties: a big
+  # frame still crosses in a couple of ticks instead of hundreds, and the
+  # event loop always gets its turn, so interrupts stay deliverable.
+  drain <- function(read, max_bytes = 4e6) {
     parts <- character(0)
+    total <- 0
     repeat {
       piece <- tryCatch(read(), error = function(e) "")
       if (!length(piece) || !nzchar(piece)) break
       parts[[length(parts) + 1L]] <- piece
+      total <- total + nchar(piece, type = "bytes")
+      if (total >= max_bytes) break
     }
     if (length(parts)) paste0(parts, collapse = "") else ""
   }
@@ -319,7 +329,37 @@ kernel_poll <- function(k, timeout_ms = 50L) {
   # it is the user's output, the rest is the frame. This does not weaken the
   # forgery guarantee: that rests on the sentinel being 24 unguessable
   # characters, not on its position in the line.
-  from_stdout <- unlist(lapply(out, function(line) {
+  # Consecutive plain lines COALESCE into one event. One frame per line made
+  # text volume the supervisor's unit of work: a chunk printing 100k lines
+  # meant 100k JSON encodes and 100k socket sends in a single-threaded event
+  # loop — seconds of stall during which heartbeats and Stop sat unserved.
+  # The client accumulates stdout text and joins on "\n", so a multi-line
+  # event is byte-identical to the same lines delivered one at a time; only
+  # lines carrying a control frame still need individual treatment.
+  has_sentinel <- if (length(out)) grepl(k$sentinel, out, fixed = TRUE) else logical(0)
+  from_stdout <- if (!length(out)) list() else {
+    runs <- rle(has_sentinel)
+    ends <- cumsum(runs$lengths)
+    starts <- ends - runs$lengths + 1L
+    unlist(lapply(seq_along(runs$values), function(r) {
+      lines <- out[starts[[r]]:ends[[r]]]
+      if (!runs$values[[r]]) {
+        return(list(list(type = "stdout", text = paste(lines, collapse = "\n"))))
+      }
+      unlist(lapply(lines, function(line) parse_control_line(k, line)),
+             recursive = FALSE)
+    }), recursive = FALSE)
+  }
+  from_stderr <- if (length(err)) {
+    list(list(type = "stderr", text = paste(err, collapse = "\n")))
+  } else list()
+
+  c(from_stdout, from_stderr)
+}
+
+#' One stdout line KNOWN to carry the sentinel: split it into the user text
+#' before the frame and the frame itself.
+parse_control_line <- function(k, line) {
     at <- regexpr(k$sentinel, line, fixed = TRUE)
     if (at < 1L) return(list(list(type = "stdout", text = line)))
     # `nchar(line)` is NOT redundant: substring()'s default `last` is
@@ -349,8 +389,4 @@ kernel_poll <- function(k, timeout_ms = 50L) {
     attr(parsed, "raw") <- payload
     prefix <- substring(line, 1L, at - 1L)
     if (nzchar(prefix)) list(list(type = "stdout", text = prefix), parsed) else list(parsed)
-  }), recursive = FALSE)
-  from_stderr <- lapply(err, function(line) list(type = "stderr", text = line))
-
-  c(from_stdout, from_stderr)
 }
