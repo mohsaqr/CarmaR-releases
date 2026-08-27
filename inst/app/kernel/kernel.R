@@ -26,6 +26,56 @@ detect_rscript <- function() {
   unname(Sys.which("Rscript"))
 }
 
+#' The full R binary beside an Rscript, for the interactive worker.
+#'
+#' The debugger needs `R --interactive`: only then is the CONSOLE the stdin
+#' pipe, which is what lets a native `browser()` prompt read step commands the
+#' supervisor sends. `Rscript` cannot do this — under it the console is the
+#' script FILE, and a `browser()` reads the script's own remaining lines as
+#' debug input (measured: it consumed the lines after the call and never
+#' touched stdin).
+#'
+#' @param rscript Path to the Rscript binary actually chosen.
+#' @return Path to the sibling R binary, or "" when it does not exist.
+detect_r_binary <- function(rscript) {
+  candidate <- file.path(dirname(rscript),
+                         if (.Platform$OS.type == "windows") "R.exe" else "R")
+  if (nzchar(rscript) && file.exists(candidate)) candidate else ""
+}
+
+#' The first expression an interactive worker runs on macOS.
+#'
+#' Command-line R promotes itself to a foreground LaunchServices application
+#' when its Aqua/AppKit support initializes. On macOS 26 that gives every
+#' document worker a generic `exec` Dock tile. A packaged CarmaR kernel carries
+#' a tiny universal library beside kernel.R; calling it before worker.R is
+#' sourced registers this process as BackgroundOnly first. The process itself
+#' must make the transition — a UIElement parent does not confer its activation
+#' policy on an exec'd child.
+#'
+#' Source checkouts and non-macOS packages may not carry the compiled library;
+#' in those cases this is deliberately a no-op and kernel startup is unchanged.
+#'
+#' @param worker_path Path to the worker boot script.
+#' @param sysname Injectable platform name for source-only tests.
+#' @return A one-line R expression, or "" when no marker is available.
+macos_background_boot <- function(worker_path,
+                                  sysname = unname(Sys.info()[["sysname"]])) {
+  if (!identical(sysname, "Darwin")) return("")
+  marker <- Sys.getenv("CARMAR_BACKGROUND_LIBRARY", "")
+  if (!nzchar(marker)) {
+    marker <- file.path(dirname(worker_path), "carmar-background.dylib")
+  }
+  if (!file.exists(marker)) return("")
+  marker <- encodeString(normalizePath(marker, mustWork = TRUE), quote = '"')
+  # TransformProcessType can report paramErr when the unbundled executable is
+  # already background-only; the call still causes the early LaunchServices
+  # registration we need. Classification, not that legacy status code, is the
+  # contract, so the result is intentionally ignored.
+  sprintf('local({dyn.load(%s);.C("carmar_mark_background",result=integer(1));invisible(NULL)})',
+          marker)
+}
+
 #' Start a worker process.
 #'
 #' @param worker_path Path to worker.R.
@@ -64,11 +114,24 @@ utf8_ctype <- function() {
 }
 
 kernel_start <- function(worker_path, sentinel = NULL, rscript = detect_rscript(),
-                         env_extra = character()) {
+                         env_extra = character(), interactive = FALSE) {
   stopifnot(file.exists(worker_path), nzchar(rscript))
   if (is.null(sentinel)) {
     sentinel <- paste(sample(c(letters, 0:9), 24L, replace = TRUE), collapse = "")
   }
+  # An `--interactive` R is (Unix only) per the R manual, and it is only worth
+  # having when the sibling R binary exists. Falling back to batch keeps every
+  # session working; only the debugger is absent, and the worker's ready frame
+  # says which mode it booted in so nothing has to guess.
+  r_binary <- if (interactive && .Platform$OS.type != "windows")
+    detect_r_binary(rscript) else ""
+  mode <- if (nzchar(r_binary)) "interactive" else "batch"
+  # A SECOND token, deliberately not the sentinel. Commands sent to an
+  # interactive worker are echoed back on stdout by R's console reader, so
+  # they must be recognizable for scrubbing — but if they carried the frame
+  # sentinel, their echo would parse as a control frame FROM the worker. Two
+  # independent tokens make the two directions structurally non-confusable.
+  cmdtag <- paste(sample(c(letters, 0:9), 24L, replace = TRUE), collapse = "")
   # The supervisor is itself an R process, so its R_HOME / R_LIBS* point at the
   # R that launched it. Inheriting those into a DIFFERENT R installation aims
   # the child at the wrong tree and it never starts. Strip them and let the
@@ -119,12 +182,33 @@ kernel_start <- function(worker_path, sentinel = NULL, rscript = detect_rscript(
     clean_env <- c(clean_env[setdiff(names(clean_env), names(env_extra))], env_extra)
   }
 
-  proc <- processx::process$new(
-    rscript,
+  if (identical(mode, "interactive")) {
+    # TERM=dumb: readline's terminal probe writes an escape sequence
+    # ("\033[?1034h") to stdout before anything else, and a dumb terminal is
+    # the documented way to keep it out of the protocol stream.
+    clean_env[["TERM"]] <- "dumb"
+    # The worker cannot read argv for these — `R --interactive` takes no
+    # script argument, the worker is booted by a sys.source line fed through
+    # stdin below — so they travel in the environment instead.
+    clean_env[["CARMAR_SENTINEL"]] <- sentinel
+    clean_env[["CARMAR_CMD_TAG"]] <- cmdtag
+    clean_env[["CARMAR_WORKER_MODE"]] <- "interactive"
+    clean_env[["CARMAR_WORKER_DIR"]] <- dirname(normalizePath(worker_path, mustWork = FALSE))
+  }
+  spawn_bin <- if (identical(mode, "interactive")) r_binary else rscript
+  spawn_args <- if (identical(mode, "interactive")) {
+    # --no-echo suppresses the "> " prompt; the input ECHO it does not suppress
+    # is scrubbed in kernel_poll by the cmdtag / pending-echo machinery.
+    c("--interactive", "--no-echo", "--no-save", "--no-restore", "--no-site-file")
+  } else {
     # --vanilla, NOT --no-init-file: the user's .Rprofile/.Renviron are part of
     # their R (library paths, repos, options). Only history and saved workspaces
     # are suppressed, which is what a fresh session wants.
-    c("--no-save", "--no-restore", "--no-site-file", worker_path, sentinel),
+    c("--no-save", "--no-restore", "--no-site-file", worker_path, sentinel)
+  }
+  proc <- processx::process$new(
+    spawn_bin,
+    spawn_args,
     stdin = "|", stdout = "|", stderr = "|",
     env = clean_env,
     supervise = TRUE,
@@ -140,7 +224,42 @@ kernel_start <- function(worker_path, sentinel = NULL, rscript = detect_rscript(
   io <- new.env(parent = emptyenv())
   io$out <- ""
   io$err <- ""
-  list(proc = proc, sentinel = sentinel, rscript = rscript, io = io)
+  k <- list(proc = proc, sentinel = sentinel, rscript = rscript, io = io,
+            mode = mode, cmdtag = cmdtag)
+  if (identical(mode, "interactive")) {
+    # The boot line replaces worker-boot.R: same sys.source, same speed
+    # rationale (parse the ~2,000-line file in one pass instead of feeding it
+    # through the REPL reader). worker.R itself is sourced, not the shim —
+    # the shim's only job was resolving its own directory from --file=,
+    # which CARMAR_WORKER_DIR now carries.
+    real_worker <- file.path(dirname(worker_path), "worker.R")
+    if (!file.exists(real_worker)) real_worker <- worker_path
+    worker_boot <- sprintf('sys.source("%s", envir = globalenv(), keep.source = FALSE)',
+                           encodeString(normalizePath(real_worker)))
+    boot <- paste(Filter(nzchar, c(macos_background_boot(worker_path), worker_boot)),
+                  collapse = ";")
+    kernel_console(k, boot)
+  }
+  k
+}
+
+#' Send one RAW console line to an interactive worker.
+#'
+#' This is the debugger's channel: while the worker is paused at a Browse
+#' prompt, `n` / `s` / `f` / `c` and debug-console expressions are ordinary
+#' console lines, not NDJSON. Measured under processx pipes, R does NOT echo
+#' console input back (it does under a shell pipe with a controlling tty —
+#' which is only the test bench, never the shipped spawn), so nothing here
+#' needs scrubbing; the tagged-command scrub in kernel_poll stays as the
+#' belt for the high-volume NDJSON path.
+#'
+#' @param k Kernel handle (mode "interactive").
+#' @param line One line of text, no newline.
+#' @return Invisibly TRUE.
+kernel_console <- function(k, line) {
+  stopifnot(identical(k$mode, "interactive"),
+            is.character(line), length(line) == 1L, !grepl("\n", line, fixed = TRUE))
+  kernel_write(k, paste0(line, "\n"))
 }
 
 #' Send a cell to the worker.
@@ -157,7 +276,39 @@ kernel_exec <- function(k, id, source, dims = NULL) {
   stopifnot(is.character(id), is.character(source))
   cmd <- list(type = "exec", id = id, source = source)
   if (!is.null(dims)) cmd$dims <- dims
-  kernel_write(k, paste0(toJSON(cmd, auto_unbox = TRUE), "\n"))
+  kernel_command(k, toJSON(cmd, auto_unbox = TRUE))
+}
+
+# R's interactive console reader wedges the whole process on input lines
+# somewhere past 40,000 bytes (measured: 40,000 passed, 45,000 hung, and the
+# hang is a hang, not an error). Anything bigger travels through a file
+# instead. Batch workers have no such limit and never spill.
+MAX_CONSOLE_LINE <- 32000L
+
+#' Deliver one JSON command to the worker, however it must travel.
+#'
+#' Batch mode: the bare NDJSON line, exactly as always. Interactive mode: the
+#' line is prefixed `#<cmdtag> ` — a comment, so the one failure mode where it
+#' could reach R's raw top level (a catastrophic dispatch-loop abort) makes it
+#' inert instead of evaluated, and so its console echo is self-identifying for
+#' the scrubber in kernel_poll. A command too long for the console reader is
+#' written to a 0600 temp file and replaced on the wire by a `cmdfile` stub;
+#' the worker reads the file, deletes it, and dispatches its content.
+#'
+#' @param k Kernel handle.
+#' @param json One complete JSON command, as text, no newline.
+#' @return Invisibly TRUE.
+kernel_command <- function(k, json) {
+  if (!identical(k$mode, "interactive")) {
+    return(kernel_write(k, paste0(json, "\n")))
+  }
+  if (nchar(json, type = "bytes") > MAX_CONSOLE_LINE) {
+    spill <- tempfile("carmar-cmd-", fileext = ".json")
+    writeLines(json, spill, useBytes = TRUE)
+    Sys.chmod(spill, mode = "0600")
+    json <- toJSON(list(type = "cmdfile", path = spill), auto_unbox = TRUE)
+  }
+  kernel_write(k, paste0("#", k$cmdtag, " ", json, "\n"))
 }
 
 #' Write a whole command to the worker's stdin, however long it is.
@@ -205,7 +356,7 @@ kernel_write <- function(k, text, timeout = 15) {
 #' @return Invisibly TRUE.
 kernel_send <- function(k, cmd) {
   stopifnot(is.list(cmd), !is.null(cmd$type))
-  kernel_write(k, paste0(toJSON(cmd, auto_unbox = TRUE), "\n"))
+  kernel_command(k, toJSON(cmd, auto_unbox = TRUE))
 }
 
 #' Send a raw line to the worker, bypassing JSON encoding.
@@ -220,7 +371,11 @@ kernel_send <- function(k, cmd) {
 #' @return Invisibly TRUE.
 kernel_send_raw <- function(k, line) {
   stopifnot(is.character(line), length(line) == 1L)
-  kernel_write(k, paste0(sub("\n$", "", line), "\n"))
+  # Interactive mode still tags the line: the point of these tests is what the
+  # worker's PARSER does with malformed JSON, and the tag is what routes the
+  # line to that parser (and keeps its echo scrubbable) rather than leaving it
+  # to be misread as console input.
+  kernel_command(k, sub("\n$", "", line))
 }
 
 #' Interrupt whatever the worker is doing.
@@ -241,7 +396,7 @@ kernel_interrupt <- function(k) {
 #' @param grace Seconds to wait before killing.
 #' @return Invisibly TRUE.
 kernel_stop <- function(k, grace = 2) {
-  try(k$proc$write_input("{\"type\":\"shutdown\"}\n"), silent = TRUE)
+  try(kernel_command(k, "{\"type\":\"shutdown\"}"), silent = TRUE)
   k$proc$wait(timeout = grace * 1000)
   if (k$proc$is_alive()) k$proc$kill()
   invisible(TRUE)
@@ -314,6 +469,26 @@ kernel_poll <- function(k, timeout_ms = 50L) {
   }
   out <- take_lines("out", drain(function() k$proc$read_output()), !k$proc$is_alive())
   err <- take_lines("err", drain(function() k$proc$read_error()), !k$proc$is_alive())
+
+  # ── echo scrubbing (interactive workers only) ─────────────────────────────
+  # Under processx pipes R does not echo console input back (measured — the
+  # echo seen under a shell pipe comes with a controlling tty, which the
+  # shipped spawn never has). This scrub is the belt in case some platform's
+  # console does: a line carrying the command tag is our own NDJSON coming
+  # back, never user output. Found ANYWHERE in the line for the same reason
+  # the sentinel is: a cell ending in cat("x") with no newline leaves the
+  # cursor mid-line and an echo would land glued to that text. Anything
+  # before the tag is real user output and is kept.
+  if (identical(k$mode, "interactive") && length(out)) {
+    tag <- paste0("#", k$cmdtag)
+    scrubbed <- lapply(out, function(line) {
+      at <- regexpr(tag, line, fixed = TRUE)
+      if (at < 1L) return(line)
+      prefix <- substring(line, 1L, at - 1L)
+      if (nzchar(prefix)) prefix else NULL
+    })
+    out <- as.character(unlist(scrubbed))
+  }
 
   # The sentinel is found ANYWHERE in the line, not only at its start.
   #

@@ -440,8 +440,9 @@ workspace_symbols <- function(root, max_files = 300L, max_depth = 4L,
   for (f in files) {
     size <- tryCatch(file.info(f)$size, error = function(e) NA_real_)
     if (is.na(size) || size > max_bytes) next
-    txt <- tryCatch(paste(readLines(f, warn = FALSE), collapse = "\n"),
-                    error = function(e) NULL)
+    raw <- tryCatch(readBin(f, "raw", n = size), error = function(e) NULL)
+    txt <- if (is.null(raw) || any(raw == as.raw(0L))) NULL else
+      tryCatch(rawToChar(raw), error = function(e) NULL)
     if (is.null(txt)) next
     exprs <- tryCatch(parse(text = txt, keep.source = TRUE),
                       error = function(e) NULL, warning = function(w) invokeRestart("muffleWarning"))
@@ -454,6 +455,69 @@ workspace_symbols <- function(root, max_files = 300L, max_depth = 4L,
     }
   }
   list(files = length(files), symbols = out, truncated = truncated, error = NULL)
+}
+
+#' Every parser-confirmed occurrence of one R name below a trusted root.
+#'
+#' Only matching documents carry source back to the browser. This keeps the
+#' response bounded while giving rename a byte-for-byte precondition: a file
+#' changed after this scan is refused before any write begins.
+workspace_references <- function(root, name, max_files = 300L, max_depth = 4L,
+                                 max_bytes = 512000L, max_matches = 50L,
+                                 max_reply_bytes = 4194304L) {
+  if (is.null(root) || !nzchar(root) || !dir.exists(root)) {
+    return(list(files = 0L, documents = list(), truncated = FALSE,
+                error = "no such directory"))
+  }
+  want <- if (is.null(name)) "" else as.character(name)[[1L]]
+  if (!nzchar(want)) return(list(files = 0L, documents = list(), truncated = FALSE,
+                                 error = "name is required"))
+  base <- normalizePath(root, winslash = "/", mustWork = TRUE)
+  skip <- c(".git", ".Rproj.user", "node_modules", "renv", "packrat",
+            ".venv", "__pycache__", ".quarto", "_site", "dist")
+  files <- character(0)
+  walk <- function(dir, depth) {
+    if (depth > max_depth || length(files) >= max_files) return(invisible(NULL))
+    entries <- tryCatch(list.files(dir, all.files = FALSE, full.names = TRUE,
+                                   no.. = TRUE), error = function(e) character(0))
+    for (e in entries) {
+      if (length(files) >= max_files) return(invisible(NULL))
+      if (dir.exists(e)) {
+        if (basename(e) %in% skip) next
+        walk(e, depth + 1L)
+      } else if (grepl("\\.(R|r)$", e)) files <<- c(files, e)
+    }
+    invisible(NULL)
+  }
+  walk(base, 1L)
+  truncated <- length(files) >= max_files
+  bytes <- 0L
+  documents <- list()
+  for (f in files) {
+    size <- tryCatch(file.info(f)$size, error = function(e) NA_real_)
+    if (is.na(size) || size > max_bytes) next
+    raw <- tryCatch(readBin(f, "raw", n = size), error = function(e) NULL)
+    txt <- if (is.null(raw) || any(raw == as.raw(0L))) NULL else
+      tryCatch(rawToChar(raw), error = function(e) NULL)
+    if (is.null(txt)) next
+    exprs <- tryCatch(parse(text = txt, keep.source = TRUE),
+                      error = function(e) NULL,
+                      warning = function(w) invokeRestart("muffleWarning"))
+    if (is.null(exprs)) next
+    refs <- references(exprs)
+    hits <- Filter(function(ref) identical(as.character(ref$name), want), refs)
+    if (!length(hits)) next
+    if (length(documents) >= max_matches || bytes + nchar(txt, type = "bytes") > max_reply_bytes) {
+      truncated <- TRUE
+      break
+    }
+    rel <- sub(paste0("^", gsub("([.|()\\^{}+$*?]|\\[|\\])", "\\\\\\1", base), "/?"), "", f)
+    documents[[length(documents) + 1L]] <- list(
+      path = f, file = rel, source = txt, references = hits,
+      symbols = top_symbols(exprs))
+    bytes <- bytes + nchar(txt, type = "bytes")
+  }
+  list(files = length(files), documents = documents, truncated = truncated, error = NULL)
 }
 
 # ── command loop ───────────────────────────────────────────────────────────
@@ -505,6 +569,19 @@ repeat {
     emit(list(type = "workspace", id = id, root = cmd$root %||% NULL,
               files = res$files, symbols = res$symbols,
               truncated = res$truncated, error = res$error %||% NULL))
+    next
+  }
+  if (identical(type, "workspace_references")) {
+    res <- tryCatch(
+      workspace_references(if (is.null(cmd$root)) "" else as.character(cmd$root)[[1L]],
+                           cmd$name %||% ""),
+      error = function(e) list(files = 0L, documents = list(), truncated = FALSE,
+                               error = conditionMessage(e))
+    )
+    emit(list(type = "workspace_references", id = id, root = cmd$root %||% NULL,
+              name = cmd$name %||% NULL, files = res$files,
+              documents = res$documents, truncated = res$truncated,
+              error = res$error %||% NULL))
     next
   }
   # An unknown command is answered, not ignored: a consumer waiting on an id

@@ -45,9 +45,28 @@ stopifnot(requireNamespace("jsonlite", quietly = TRUE))
 # break the protocol from inside the session it is running in.
 local({
 
-args <- commandArgs(trailingOnly = TRUE)
-stopifnot(length(args) >= 1L, nzchar(args[1]))
-sentinel <- args[1]
+# Batch mode (Rscript worker-boot.R <sentinel>) passes the sentinel in argv.
+# Interactive mode (R --interactive, booted by a sys.source line on stdin)
+# has no argv to give, so the tokens arrive in the environment instead.
+# WORKER_MODE decides which reader serves the dispatch loop below: the
+# interactive worker MUST read through R's console (stdin()), because that is
+# the one reader a native browser() prompt shares — a second buffered reader
+# on the same fd would steal bytes from the debugger.
+WORKER_MODE <- Sys.getenv("CARMAR_WORKER_MODE", "batch")
+sentinel <- if (identical(WORKER_MODE, "interactive")) {
+  Sys.getenv("CARMAR_SENTINEL", "")
+} else {
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) >= 1L) args[1] else ""
+}
+stopifnot(nzchar(sentinel))
+# Commands from the supervisor arrive as "#<cmdtag> {json}" in interactive
+# mode — a comment, so a line that ever reached R's raw top level would be
+# inert. The prefix is stripped here before parsing.
+CMD_PREFIX <- local({
+  tag <- Sys.getenv("CARMAR_CMD_TAG", "")
+  if (nzchar(tag)) paste0("#", tag, " ") else ""
+})
 
 PLOT_WIDTH <- 900L
 PLOT_HEIGHT <- 620L
@@ -84,16 +103,50 @@ confine_root <- local({
   else normalizePath(path.expand(raw), mustWork = FALSE)
 })
 
+#' Canonicalise a path that may not exist yet.
+#'
+#' `normalizePath()` resolves symlinks by ASKING THE FILE SYSTEM, so it can
+#' only do it for a path that is already there; handed a path that does not
+#' exist it returns the string unchanged. That is fatal for a confinement
+#' check on a CREATE: on macOS `/var` is a symlink to `/private/var`, so a
+#' root under `tempdir()` canonicalises to `/private/var/...` while the
+#' not-yet-created file inside it stays `/var/...`, and the prefix comparison
+#' says "outside" about a path that is plainly inside.
+#'
+#' So: normalise the deepest ancestor that DOES exist, then re-append the
+#' components below it. The existing part gets real symlink resolution; the
+#' part that does not exist yet cannot contain a symlink, because there is
+#' nothing there to be one.
+#'
+#' @param p A path, absolute or relative.
+#' @return The canonical absolute path.
+canonical_path <- function(p) {
+  full <- path.expand(p)
+  if (file.exists(full)) return(normalizePath(full, mustWork = FALSE))
+  parts <- character(0)
+  at <- full
+  repeat {
+    up <- dirname(at)
+    parts <- c(basename(at), parts)
+    if (identical(up, at)) break            # reached the filesystem root
+    if (file.exists(up)) {
+      return(do.call(file.path, as.list(c(normalizePath(up, mustWork = FALSE), parts))))
+    }
+    at <- up
+  }
+  normalizePath(full, mustWork = FALSE)
+}
+
 #' Is `p` inside the confinement root (when there is one)?
 #'
-#' Compared after normalizePath, so `..` and symlinks are resolved before the
-#' comparison rather than after — string-prefix checks on un-normalised paths
-#' are how confinement bugs happen. The trailing separator matters too:
+#' Compared after canonicalisation, so `..` and symlinks are resolved before
+#' the comparison rather than after — string-prefix checks on un-normalised
+#' paths are how confinement bugs happen. The trailing separator matters too:
 #' without it, /srv/project would also admit /srv/project-secrets.
 within_root <- function(p) {
   if (is.null(confine_root)) return(TRUE)
   if (!is.character(p) || length(p) != 1L || is.na(p)) return(FALSE)
-  full <- normalizePath(path.expand(p), mustWork = FALSE)
+  full <- canonical_path(p)
   identical(full, confine_root) ||
     startsWith(full, paste0(confine_root, .Platform$file.sep))
 }
@@ -122,8 +175,10 @@ try(utils::rc.settings(ipck = TRUE, func = TRUE, args = TRUE, files = TRUE),
 # is started by three different launchers (kernel.R, the Chrome bridge host,
 # and the packaged inst/app/kernel) and none of them guarantee a cwd.
 import_sources <- local({
+  env_dir <- Sys.getenv("CARMAR_WORKER_DIR", "")
   file_arg <- grep("^--file=", commandArgs(FALSE), value = TRUE)
-  here <- if (length(file_arg)) {
+  here <- if (nzchar(env_dir)) env_dir
+  else if (length(file_arg)) {
     dirname(normalizePath(sub("^--file=", "", file_arg[1L]), mustWork = FALSE))
   } else getwd()
   file.path(here, c("sniff.R", "chooser.R"))
@@ -161,6 +216,16 @@ local({
       others, list(CRAN = "https://cloud.r-project.org"))))
   }
 })
+
+# An interactive R ASKS where a batch R silently defaulted, and every such
+# question is a console read that would consume protocol lines and wedge the
+# session. Close the known askers: install.packages' "install from sources
+# which need compilation?" question, and any menu() falling back to a
+# graphical chooser it cannot open.
+if (identical(WORKER_MODE, "interactive")) {
+  options(install.packages.compile.from.source = "never",
+          menu.graphics = FALSE)
+}
 
 # The reserved words R's engine offers with "(" appended (for/if/while) or
 # bare; they are neither functions nor variables and the UI badges them apart.
@@ -698,6 +763,13 @@ colstats_payload <- function(col, column_name) {
 #' @param query,filters The viewer's active search and column filters.
 emit_colstats <- function(id, name, column, query = NULL, filters = NULL) {
   column <- if (is.character(column) && length(column)) column[[1L]] else ""
+  # Same console-read wedge as emit_view: parse(text = NULL) blocks the
+  # interactive worker on its own protocol stream.
+  if (!is.character(name) || length(name) != 1L || is.na(name) || !nzchar(name)) {
+    emit(list(type = "colstats", id = id, name = name, column = column,
+              error = "bad name"))
+    return(invisible(NULL))
+  }
   obj <- tryCatch(eval(parse(text = name), globalenv()), error = function(e) NULL)
   if (!is.data.frame(obj)) obj <- tryCatch(as.data.frame(obj, stringsAsFactors = FALSE),
                                            error = function(e) NULL)
@@ -748,12 +820,20 @@ emit_colstats <- function(id, name, column, query = NULL, filters = NULL) {
 #' @param line The source line being typed.
 #' @param cursor Character offset of the caret in `line` (0-based).
 #' @param max_items Cap on items shipped; `truncated` reports the cut.
-#' @return Invisibly NULL. Emits one `complete` frame.
+#' @return Invisibly NULL. Emits one `complete` frame. A frame with no items
+#'   carries `reason` when the engine actually FAILED, so a completion that has
+#'   gone dark can be told apart from a token R simply had nothing to say
+#'   about — the difference used to be invisible from the browser.
 emit_complete <- function(id, line = NULL, cursor = NULL, max_items = MAX_COMPLETIONS) {
   if (!is.character(line) || length(line) != 1L || is.na(line)) line <- ""
   cursor <- max(0L, min(as_count(cursor, nchar(line)), nchar(line)))
   empty <- list(type = "complete", id = id, start = cursor, end = cursor,
                 token = "", items = list(), truncated = FALSE)
+  # Degrading to an empty list keeps a keystroke from killing the worker, but
+  # a silent empty list is indistinguishable from "no matches" — and that is
+  # exactly the shape a broken completion engine takes in a long-lived
+  # session. The condition is kept and shipped with the empty frame.
+  reason <- NULL
   st <- tryCatch({
     ce <- utils:::.CompletionEnv
     utils:::.assignLinebuffer(line)
@@ -763,8 +843,13 @@ emit_complete <- function(id, line = NULL, cursor = NULL, max_items = MAX_COMPLE
     list(token = as.character(ce[["token"]]), start = as.integer(ce[["start"]]),
          comps = as.character(utils:::.retrieveCompletions()),
          quoted = isTRUE(ce[["fileName"]]))
-  }, error = function(e) NULL, interrupt = function(i) NULL)
+  }, error = function(e) { reason <<- conditionMessage(e); NULL },
+     interrupt = function(i) { reason <<- "interrupted"; NULL })
   if (is.null(st) || length(st$start) != 1L || is.na(st$start)) {
+    if (is.null(reason) && !is.null(st)) {
+      reason <- "the completion engine returned no position for this token"
+    }
+    if (!is.null(reason)) empty$reason <- as.character(reason)[[1L]]
     emit(empty)
     return(invisible(NULL))
   }
@@ -1034,6 +1119,15 @@ view_payload <- function(obj, shown_name, offset = NULL, limit = NULL,
 emit_view <- function(id, name, offset = NULL, limit = NULL, sort = NULL,
                       desc = FALSE, col_offset = NULL, col_limit = NULL,
                       label = NULL, query = NULL, filters = NULL) {
+  # `parse(text = NULL)` falls back to `parse(file = "")` — the CONSOLE. In
+  # the interactive worker that read BLOCKS on the protocol stream and wedges
+  # the whole session (a batch Rscript merely got instant EOF, which is why
+  # this guard did not exist from day one). Wire-supplied, so an error frame,
+  # never a stop.
+  if (!is.character(name) || length(name) != 1L || is.na(name) || !nzchar(name)) {
+    emit(list(type = "view", id = id, name = label %||% name, error = "bad name"))
+    return(invisible(NULL))
+  }
   shown <- if (is.null(label)) name else label
   obj <- tryCatch(eval(parse(text = name), globalenv()), error = function(e) NULL)
   if (is.null(obj)) {
@@ -1236,6 +1330,8 @@ emit_rm <- function(id, names = NULL) {
 #' @param source Source text.
 #' @return Invisibly NULL. Emits one `parse` frame.
 emit_parse <- function(id, source) {
+  # NULL would send parse() to the console — see the guard in emit_view.
+  if (!is.character(source) || length(source) != 1L || is.na(source)) source <- ""
   complete <- TRUE
   message_ <- NULL
   tryCatch(
@@ -1705,6 +1801,192 @@ emit_files <- function(id, path = NULL, all = FALSE) {
             entries = entries))
 }
 
+#' Create a folder — the file tree's New Folder.
+#'
+#' `recursive = FALSE` on purpose: the tree only ever creates a child of a
+#' folder it is already showing, so a missing intermediate means the tree is
+#' stale, and silently manufacturing the whole chain would hide that. Refuses
+#' an existing name rather than succeeding quietly, because "New Folder" that
+#' returns ok on a name already taken reads as "created" and is not.
+#'
+#' @param id Request id.
+#' @param path Absolute path of the folder to create.
+#' @return Invisibly NULL. Emits one `mkdir` frame with `path` or `error`.
+emit_mkdir <- function(id, path = NULL) {
+  fail <- function(msg) {
+    emit(list(type = "mkdir", id = id, path = path, error = msg))
+    invisible(NULL)
+  }
+  if (!is.character(path) || length(path) != 1L || !nzchar(path)) return(fail("no path"))
+  p <- path.expand(path)
+  if (!within_root(p)) return(fail(outside_root_msg()))
+  if (file.exists(p)) return(fail("something with that name is already here"))
+  if (!dir.exists(dirname(p))) return(fail(paste0("no such folder: ", dirname(p))))
+  ok <- tryCatch(dir.create(p, recursive = FALSE), warning = function(w) FALSE,
+                 error = function(e) FALSE)
+  if (!isTRUE(ok)) return(fail("the folder could not be created"))
+  emit(list(type = "mkdir", id = id, path = normalizePath(p, mustWork = FALSE)))
+  invisible(NULL)
+}
+
+#' Rename or move one entry — the tree's inline rename.
+#'
+#' BOTH ends are checked against the root. Checking only the source would let
+#' a rename carry a file OUT of the permitted folder, which is the same
+#' capability the root exists to deny; a guard that reads one end of a
+#' two-ended operation is not a guard.
+#'
+#' Refuses to clobber. An overwrite here is indistinguishable from a typo, and
+#' the tree has no undo.
+#'
+#' @param id Request id.
+#' @param path Existing absolute path.
+#' @param to Absolute destination path.
+#' @return Invisibly NULL. Emits one `renamepath` frame with `from`/`to`, or `error`.
+emit_renamepath <- function(id, path = NULL, to = NULL) {
+  fail <- function(msg) {
+    emit(list(type = "renamepath", id = id, path = path, error = msg))
+    invisible(NULL)
+  }
+  if (!is.character(path) || length(path) != 1L || !nzchar(path)) return(fail("no path"))
+  if (!is.character(to) || length(to) != 1L || !nzchar(to)) return(fail("no new name"))
+  from <- path.expand(path)
+  dest <- path.expand(to)
+  if (!within_root(from) || !within_root(dest)) return(fail(outside_root_msg()))
+  if (!file.exists(from)) return(fail("that file is no longer here"))
+  if (file.exists(dest)) return(fail("something with that name is already here"))
+  if (!dir.exists(dirname(dest))) return(fail(paste0("no such folder: ", dirname(dest))))
+  ok <- tryCatch(file.rename(from, dest), warning = function(w) FALSE,
+                 error = function(e) FALSE)
+  if (!isTRUE(ok)) return(fail("the rename failed"))
+  emit(list(type = "renamepath", id = id,
+            from = normalizePath(from, mustWork = FALSE),
+            to = normalizePath(dest, mustWork = FALSE)))
+  invisible(NULL)
+}
+
+#' Delete files and folders — the tree's Delete.
+#'
+#' Takes a VECTOR, because the tree deletes a selection and N separate round
+#' trips would leave a half-deleted selection on any failure. Each path is
+#' root-checked individually; one refusal does not cancel the others, and the
+#' frame reports exactly what went and what did not, so the tree never has to
+#' guess which rows to drop.
+#'
+#' A non-empty folder needs `recursive = TRUE` — asked for explicitly by the
+#' caller, which is the client that showed the confirmation naming the folder.
+#'
+#' @param id Request id.
+#' @param paths Character vector of absolute paths.
+#' @param recursive TRUE to remove non-empty folders.
+#' @return Invisibly NULL. Emits one `deletepath` frame: `deleted`, `failed`.
+emit_deletepath <- function(id, paths = NULL, recursive = FALSE) {
+  if (!is.character(paths) || !length(paths)) {
+    emit(list(type = "deletepath", id = id, error = "no paths"))
+    return(invisible(NULL))
+  }
+  deleted <- character(0)
+  failed <- list()
+  note <- function(p, why) failed[[length(failed) + 1L]] <<- list(path = p, error = why)
+  for (raw in paths) {
+    if (!is.character(raw) || is.na(raw) || !nzchar(raw)) { note(raw, "no path"); next }
+    p <- path.expand(raw)
+    if (!within_root(p)) { note(p, outside_root_msg()); next }
+    if (!file.exists(p)) { note(p, "already gone"); next }
+    is_dir <- dir.exists(p)
+    if (is_dir && !isTRUE(recursive) && length(list.files(p, all.files = TRUE, no.. = TRUE))) {
+      note(p, "the folder is not empty")
+      next
+    }
+    ok <- tryCatch(unlink(p, recursive = is_dir, force = FALSE) == 0L,
+                   warning = function(w) FALSE, error = function(e) FALSE)
+    # unlink() reports 0 for "nothing to do" as well as success, so the file
+    # system is asked again rather than trusting the status code.
+    if (isTRUE(ok) && !file.exists(p)) deleted <- c(deleted, p) else note(p, "could not be deleted")
+  }
+  emit(list(type = "deletepath", id = id, deleted = I(as.list(deleted)),
+            failed = I(failed)))
+  invisible(NULL)
+}
+
+#' Copy a file or folder — the tree's Duplicate.
+#'
+#' Both ends root-checked, for the same reason rename checks both: a copy is a
+#' two-ended operation, and a guard that reads one end lets data OUT.
+#'
+#' Refuses to clobber. `file.copy(overwrite = FALSE)` returns FALSE rather than
+#' erroring on a collision, so the check is explicit and the message says which
+#' of the two things went wrong.
+#'
+#' @param id Request id.
+#' @param path Existing absolute path.
+#' @param to Absolute destination path.
+#' @return Invisibly NULL. Emits one `copypath` frame with `from`/`to`, or `error`.
+emit_copypath <- function(id, path = NULL, to = NULL) {
+  fail <- function(msg) {
+    emit(list(type = "copypath", id = id, path = path, error = msg))
+    invisible(NULL)
+  }
+  if (!is.character(path) || length(path) != 1L || !nzchar(path)) return(fail("no path"))
+  if (!is.character(to) || length(to) != 1L || !nzchar(to)) return(fail("no destination"))
+  from <- path.expand(path)
+  dest <- path.expand(to)
+  if (!within_root(from) || !within_root(dest)) return(fail(outside_root_msg()))
+  if (!file.exists(from)) return(fail("that file is no longer here"))
+  if (file.exists(dest)) return(fail("something with that name is already here"))
+  if (!dir.exists(dirname(dest))) return(fail(paste0("no such folder: ", dirname(dest))))
+  ok <- tryCatch({
+    if (dir.exists(from)) {
+      # file.copy(recursive=) copies the DIRECTORY INTO the target, so the
+      # destination must exist first and is named by its parent, not itself.
+      dir.create(dest, recursive = FALSE)
+      kids <- list.files(from, all.files = TRUE, no.. = TRUE, full.names = TRUE)
+      all(file.copy(kids, dest, recursive = TRUE, copy.date = TRUE))
+    } else {
+      file.copy(from, dest, overwrite = FALSE, copy.date = TRUE)
+    }
+  }, warning = function(w) FALSE, error = function(e) FALSE)
+  if (!isTRUE(ok) || !file.exists(dest)) return(fail("the copy failed"))
+  emit(list(type = "copypath", id = id,
+            from = normalizePath(from, mustWork = FALSE),
+            to = normalizePath(dest, mustWork = FALSE)))
+  invisible(NULL)
+}
+
+#' Show one entry in the desktop file manager.
+#'
+#' The path is root-checked and handed to the platform opener as an ARGUMENT
+#' VECTOR, never interpolated into a shell string: a file called
+#' `; rm -rf ~` is a legal filename, and `system()` on a composed string would
+#' run it. `system2()` with a character vector does not go through a shell.
+#'
+#' @param id Request id.
+#' @param path Absolute path to reveal.
+#' @return Invisibly NULL. Emits one `revealpath` frame.
+emit_revealpath <- function(id, path = NULL) {
+  fail <- function(msg) {
+    emit(list(type = "revealpath", id = id, path = path, error = msg))
+    invisible(NULL)
+  }
+  if (!is.character(path) || length(path) != 1L || !nzchar(path)) return(fail("no path"))
+  p <- path.expand(path)
+  if (!within_root(p)) return(fail(outside_root_msg()))
+  if (!file.exists(p)) return(fail("that file is no longer here"))
+  p <- normalizePath(p, mustWork = TRUE)
+  sysname <- unname(Sys.info()[["sysname"]])
+  status <- tryCatch(switch(sysname,
+    Darwin  = system2("/usr/bin/open", c("-R", p), stdout = FALSE, stderr = FALSE),
+    Windows = system2("explorer", sprintf("/select,%s", p), stdout = FALSE, stderr = FALSE),
+    system2("xdg-open", dirname(p), stdout = FALSE, stderr = FALSE)),
+    warning = function(w) 0L, error = function(e) 1L)
+  # Windows explorer returns 1 on success; only a hard failure is reported.
+  if (!identical(sysname, "Windows") && !identical(as.integer(status), 0L)) {
+    return(fail("the file manager could not be opened"))
+  }
+  emit(list(type = "revealpath", id = id, path = p))
+  invisible(NULL)
+}
+
 #' Read a text file — the script editor's Open.
 #'
 #' Text only, and capped: the editor is for .R scripts, and handing a 400 MB
@@ -1740,16 +2022,17 @@ emit_readfile <- function(id, path = NULL) {
 
 #' Write a text file — the script editor's Save.
 #'
-#' Writes exactly the bytes given, with no trailing-newline politics beyond the
-#' one every POSIX text file ends with. The directory must already exist: a Save
+#' Writes exactly the bytes given. The directory must already exist: a Save
 #' that silently creates a tree is a Save that puts the file somewhere else than
-#' the user believes.
+#' the user believes. The replacement is a same-directory rename, and an
+#' optional exact previous value makes an editor Save fail closed if another
+#' program changed the file since it was opened.
 #'
 #' @param id Request id.
 #' @param path Destination; `~` is expanded.
 #' @param text Contents.
 #' @return Invisibly NULL. Emits one `writefile` frame with `path`, or `error`.
-emit_writefile <- function(id, path = NULL, text = "") {
+emit_writefile <- function(id, path = NULL, text = "", expected = NULL) {
   fail <- function(msg) {
     emit(list(type = "writefile", id = id, path = path, error = msg))
     invisible(NULL)
@@ -1764,16 +2047,121 @@ emit_writefile <- function(id, path = NULL, text = "") {
     return(fail("too large to save from the editor"))
   }
   body <- if (is.character(text) && length(text)) paste(text, collapse = "\n") else ""
-  if (!grepl("\n$", body)) body <- paste0(body, "\n")
+  if (!is.null(expected)) {
+    if (!is.character(expected)) return(fail("expected text must be a string"))
+    before <- paste(expected, collapse = "\n")
+    if (!file.exists(p)) return(fail("the file was removed after it was opened; nothing was written"))
+    size <- file.info(p)$size
+    raw <- tryCatch(readBin(p, "raw", n = size), error = function(e) NULL)
+    current <- if (is.null(raw)) NULL else tryCatch(rawToChar(raw), error = function(e) NULL)
+    if (is.null(current) || !identical(enc2utf8(current), enc2utf8(before))) {
+      return(fail("the file changed on disk after it was opened; nothing was written"))
+    }
+  }
+  temp <- tempfile(pattern = ".carmar-save-", tmpdir = dirname(p))
+  backup <- tempfile(pattern = ".carmar-backup-", tmpdir = dirname(p))
+  existed <- file.exists(p)
+  old_mode <- if (existed) file.info(p)$mode else NULL
+  on.exit({
+    if (file.exists(temp)) unlink(temp)
+    if (file.exists(backup) && file.exists(p)) unlink(backup)
+  }, add = TRUE)
   ok <- tryCatch({
-    con <- file(p, open = "wb")
-    on.exit(close(con), add = TRUE)
+    con <- file(temp, open = "wb")
     writeBin(charToRaw(enc2utf8(body)), con)
+    close(con)
+    con <- NULL
+    if (!is.null(old_mode)) Sys.chmod(temp, mode = old_mode)
     TRUE
-  }, error = function(e) conditionMessage(e))
+  }, error = function(e) conditionMessage(e),
+  finally = if (exists("con", inherits = FALSE) && !is.null(con)) try(close(con), silent = TRUE))
   if (is.character(ok)) return(fail(ok))
+  if (existed && !file.rename(p, backup)) return(fail("could not prepare the existing file for replacement"))
+  if (!file.rename(temp, p)) {
+    if (existed && file.exists(backup)) file.rename(backup, p)
+    return(fail("could not atomically replace the file; the original was restored"))
+  }
+  if (file.exists(backup)) unlink(backup)
   emit(list(type = "writefile", id = id, path = normalizePath(p),
             bytes = nchar(body, type = "bytes")))
+}
+
+#' Atomically replace several existing text files after exact-content checks.
+#'
+#' Every temporary and backup lives beside its target, so rename stays on one
+#' filesystem. All preconditions are checked before the first rename; a later
+#' failure restores every target already swapped.
+emit_writefiles_atomic <- function(id, files = NULL) {
+  fail <- function(msg) {
+    emit(list(type = "writefiles_atomic", id = id, error = msg))
+    invisible(NULL)
+  }
+  records <- if (is.data.frame(files)) {
+    lapply(seq_len(nrow(files)), function(i) as.list(files[i, , drop = FALSE]))
+  } else if (is.list(files)) files else list()
+  if (!length(records)) return(fail("no files"))
+  if (length(records) > 50L) return(fail("too many files in one change"))
+
+  plans <- list()
+  for (item in records) {
+    p <- if (is.list(item) && is.character(item$path) && length(item$path)) path.expand(item$path[[1L]]) else ""
+    before <- if (is.list(item) && is.character(item$before)) paste(item$before, collapse = "\n") else NULL
+    after <- if (is.list(item) && is.character(item$after)) paste(item$after, collapse = "\n") else NULL
+    if (!nzchar(p) || is.null(before) || is.null(after)) return(fail("each file needs path, before and after"))
+    if (!within_root(p)) return(fail(outside_root_msg()))
+    if (!file.exists(p) || dir.exists(p)) return(fail(paste0("not an existing text file: ", p)))
+    size <- file.info(p)$size
+    raw <- tryCatch(readBin(p, "raw", n = size), error = function(e) NULL)
+    current <- if (is.null(raw)) NULL else tryCatch(rawToChar(raw), error = function(e) NULL)
+    if (is.null(current) || !identical(enc2utf8(current), enc2utf8(before))) {
+      return(fail(paste0(basename(p), " changed after the preview; nothing was written")))
+    }
+    if (nchar(after, type = "bytes") > MAX_TEXT_BYTES) return(fail(paste0(basename(p), " is too large")))
+    plans[[length(plans) + 1L]] <- list(path = p, before = before, after = after,
+      mode = file.info(p)$mode,
+      temp = tempfile(pattern = ".carmar-new-", tmpdir = dirname(p)),
+      backup = tempfile(pattern = ".carmar-old-", tmpdir = dirname(p)))
+  }
+
+  cleanup <- function() {
+    for (plan in plans) {
+      if (file.exists(plan$temp)) unlink(plan$temp)
+      if (file.exists(plan$backup) && file.exists(plan$path)) unlink(plan$backup)
+    }
+  }
+  on.exit(cleanup(), add = TRUE)
+  for (plan in plans) {
+    con <- NULL
+    ok <- tryCatch({
+      con <- file(plan$temp, open = "wb")
+      writeBin(charToRaw(enc2utf8(plan$after)), con)
+      close(con)
+      con <- NULL
+      Sys.chmod(plan$temp, mode = plan$mode)
+      TRUE
+    }, error = function(e) conditionMessage(e),
+    finally = if (!is.null(con)) try(close(con), silent = TRUE))
+    if (!identical(ok, TRUE)) return(fail(as.character(ok)))
+  }
+
+  swapped <- integer(0)
+  for (i in seq_along(plans)) {
+    plan <- plans[[i]]
+    ok <- file.rename(plan$path, plan$backup) && file.rename(plan$temp, plan$path)
+    if (!ok) {
+      if (!file.exists(plan$path) && file.exists(plan$backup)) file.rename(plan$backup, plan$path)
+      for (j in rev(swapped)) {
+        prior <- plans[[j]]
+        if (file.exists(prior$path)) unlink(prior$path)
+        if (file.exists(prior$backup)) file.rename(prior$backup, prior$path)
+      }
+      return(fail("could not replace every file; all completed replacements were restored"))
+    }
+    swapped <- c(swapped, i)
+  }
+  for (plan in plans) if (file.exists(plan$backup)) unlink(plan$backup)
+  emit(list(type = "writefiles_atomic", id = id,
+            paths = I(vapply(plans, function(plan) normalizePath(plan$path), character(1)))))
 }
 
 #' Open a fresh PNG device whose pages land in `dir`.
@@ -2152,6 +2540,128 @@ frame_vars <- function(env, max_vars = 40L) {
   })
 }
 
+# ── the debugger (stage 5 slice 2) ──────────────────────────────────────────
+# Native browser(), not a reimplementation: the worker runs under
+# `R --interactive`, so the console IS the stdin pipe and a Browse prompt
+# reads the step commands the supervisor sends as raw lines. Everything here
+# only decides WHERE to call browser() and reports state in frames; the
+# stepping engine is R's own.
+
+# srcname -> integer vector of 1-based breakpoint lines.
+break_registry <- new.env(parent = emptyenv())
+# Traces currently armed: list(name, env) per traced function, so they can be
+# removed before re-arming (a cleared breakpoint must actually stop firing).
+armed_traces <- list()
+
+#' Arm function-body breakpoints for everything the registry names.
+#'
+#' Re-run after every cell: a redefined function sheds its trace with the old
+#' object, so arming is idempotent re-derivation from the registry, never an
+#' increment. findLineNum matches functions whose srcref FILENAME equals the
+#' registered srcname — which is why run_cell parses chunk source under
+#' srcfilecopy(srcname, ...).
+#'
+#' @return Number of function locations armed.
+apply_fn_breaks <- function() {
+  for (tr in armed_traces) {
+    tryCatch(suppressMessages(untrace(tr$name, where = tr$env)),
+             error = function(e) NULL)
+  }
+  armed_traces <<- list()
+  if (!identical(WORKER_MODE, "interactive")) return(0L)
+  files <- ls(break_registry, all.names = TRUE)
+  for (file in files) {
+    for (line in break_registry[[file]]) {
+      hits <- tryCatch(
+        utils::findLineNum(sprintf("%s#%d", file, line),
+                           envir = globalenv(), lastenv = globalenv()),
+        error = function(e) list())
+      for (h in hits) {
+        ok <- tryCatch({
+          suppressMessages(trace(
+            h$name,
+            tracer = bquote({
+              .carmar_debug_entered(.(file), .(line), "breakpoint")
+              browser()
+            }),
+            at = h$at, where = h$env, print = FALSE))
+          TRUE
+        }, error = function(e) FALSE)
+        if (ok) armed_traces[[length(armed_traces) + 1L]] <<- list(name = h$name, env = h$env)
+      }
+    }
+  }
+  length(armed_traces)
+}
+
+#' Set or clear the breakpoints of one source file, then re-arm.
+#'
+#' @param id Request id.
+#' @param file The srcname the client runs its chunks under ("chunk:<id>",
+#'   or a script path).
+#' @param lines 1-based lines; empty or absent clears the file.
+#' @return Invisibly NULL. Emits one `debug_breaks` frame.
+emit_debug_breaks <- function(id, file, lines = NULL) {
+  if (!is.character(file) || length(file) != 1L || !nzchar(file)) {
+    emit(list(type = "debug_breaks", id = id, error = "bad file"))
+    return(invisible(NULL))
+  }
+  if (!identical(WORKER_MODE, "interactive")) {
+    emit(list(type = "debug_breaks", id = id, file = file,
+              error = "the debugger needs an interactive worker (this one is batch)"))
+    return(invisible(NULL))
+  }
+  lines <- suppressWarnings(as.integer(unlist(lines)))
+  lines <- sort(unique(lines[is.finite(lines) & lines >= 1L]))
+  if (length(lines)) assign(file, lines, envir = break_registry)
+  else if (exists(file, envir = break_registry)) rm(list = file, envir = break_registry)
+  armed <- apply_fn_breaks()
+  emit(list(type = "debug_breaks", id = id, file = file,
+            lines = I(as.integer(lines)), functions = armed))
+}
+
+#' The live call stack at a debug pause, trimmed like capture_trace.
+#'
+#' Bottom harness frames are dropped up to the last eval boundary; top frames
+#' are dropped through the trace/browser machinery and this file's own debug
+#' functions, so the first and last things a reader sees are their own calls.
+#'
+#' @param calls The sys.calls() of the caller.
+#' @param frames The sys.frames() of the caller.
+#' @return A list of list(call, vars, file, line) — innermost LAST.
+debug_stack <- function(calls, frames, max_frames = 40L) {
+  if (!length(calls)) return(list())
+  texts <- vapply(calls, function(cl) {
+    d <- tryCatch(paste(deparse(cl), collapse = " "), error = function(e) "<call>")
+    if (nchar(d) > 300L) paste0(substr(d, 1L, 297L), "...") else d
+  }, character(1))
+  boundary <- which(startsWith(texts, "withVisible(eval(") |
+                    startsWith(texts, "eval(e, globalenv())") |
+                    startsWith(texts, "eval(wrapped, globalenv())"))
+  from <- if (length(boundary)) max(boundary) + 1L else 1L
+  to <- length(texts)
+  # Trace/browser plumbing above the user's own frames. Trimming it is not
+  # cosmetic: frame_vars below reads every frame it keeps, and a machinery
+  # frame's environment holds the TRACER EXPRESSION as an unforced promise —
+  # mget() forces what it reads, so describing that frame re-entered the
+  # tracer recursively (a second paused frame, a browser "Called from: mget").
+  ours <- "^(\\.carmar_debug_entered|\\.carmar_debug_where|\\.doTrace|browser\\(|eval\\(expr|eval\\.parent|Reduce\\(|\\{)"
+  while (to >= from && grepl(ours, texts[[to]])) to <- to - 1L
+  if (to < from) return(list())
+  idx <- seq.int(from, to)
+  if (length(idx) > max_frames) idx <- utils::tail(idx, max_frames)
+  lapply(idx, function(k) {
+    ref <- utils::getSrcref(calls[[k]])
+    list(call = texts[[k]],
+         vars = if (k <= length(frames)) frame_vars(frames[[k]]) else list(),
+         file = if (is.null(ref)) NULL else {
+           f <- attr(ref, "srcfile")
+           if (is.null(f) || is.null(f$filename) || !nzchar(f$filename)) NULL else f$filename
+         },
+         line = if (is.null(ref)) NULL else as.integer(ref[[1L]]))
+  })
+}
+
 #' The call stack at the moment of an error, as frames a UI can click.
 #'
 #' Stage 5 slice 1. Two details make this useful rather than decorative:
@@ -2209,8 +2719,14 @@ capture_trace <- function(max_frames = 40L) {
 }
 
 #' @return Invisibly NULL. Emits exactly one `done` frame.
-run_cell <- function(id, source, dims = NULL) {
+run_cell <- function(id, source, dims = NULL, srcname = NULL) {
   stopifnot(is.character(source), length(source) == 1L)
+  # The srcname is the chunk's identity in the debugger: functions defined
+  # here carry it in their srcrefs, which is what lets findLineNum resolve
+  # "chunk:<id>#line" to a function and a step. Wire-supplied; anything not a
+  # plain single string means "no debugging identity", never an error.
+  if (!is.character(srcname) || length(srcname) != 1L || is.na(srcname) ||
+      !nzchar(srcname)) srcname <- NULL
   # `dims` crosses the wire unvalidated (serve.R checks only id and source),
   # and `$` on an atomic vector THROWS — before the eval's own tryCatch, so a
   # malformed dims from an older bundle or a hand-built frame used to escape
@@ -2242,12 +2758,24 @@ run_cell <- function(id, source, dims = NULL) {
   at_line <- NA_integer_
   trace_frames <- list()
 
+  # Breakpoint lines registered for this chunk, if any. Top-level hits pause
+  # via a braced browser() below; hits inside function bodies were armed as
+  # traces by apply_fn_breaks and fire on the call.
+  bp_lines <- if (!is.null(srcname) && identical(WORKER_MODE, "interactive") &&
+                  exists(srcname, envir = break_registry)) {
+    break_registry[[srcname]]
+  } else integer(0)
+
   tryCatch(
+    withRestarts(
     withCallingHandlers(
       {
         # keep.source so every top-level expression knows its own line, which
-        # is what "jump from the error to the source" actually needs.
-        exprs <- parse(text = source, keep.source = TRUE)
+        # is what "jump from the error to the source" actually needs. The
+        # srcfile names the chunk so the debugger can address its lines.
+        exprs <- if (is.null(srcname)) parse(text = source, keep.source = TRUE)
+                 else parse(text = source, keep.source = TRUE,
+                            srcfile = srcfilecopy(srcname, source))
         srcrefs <- attr(exprs, "srcref")
         # ONE device for the whole cell, not one per statement. Base graphics
         # are stateful across statements — `layout()` then two plots, `par()`
@@ -2265,13 +2793,34 @@ run_cell <- function(id, source, dims = NULL) {
           } else {
             NA_integer_
           }
-          res <- withVisible(eval(e, globalenv()))
+          # A top-level breakpoint pauses BEFORE its expression, inside a
+          # constructed block, so R's own stepper takes over from there: `n`
+          # runs the expression whole, `s` steps into its calls, `c` finishes
+          # the block. The block's value and visibility are the expression's
+          # own, so autoprint below is unchanged.
+          res <- if (!is.na(at_line) && at_line %in% bp_lines) {
+            wrapped <- as.call(list(
+              as.name("{"),
+              bquote(.carmar_debug_entered(.(srcname), .(at_line), "breakpoint")),
+              quote(browser()),
+              e))
+            withVisible(eval(wrapped, globalenv()))
+          } else {
+            withVisible(eval(e, globalenv()))
+          }
           if (isTRUE(res$visible)) {
             v <- res$value
             if (inherits(v, "htmlwidget")) emit_widget(id, v)
             else if (is.data.frame(v)) emit_dataframe(id, v)
             else if (is.matrix(v) && nrow(v) > 0L && ncol(v) > 0L) emit_dataframe(id, matrix_to_df(v))
             else print(v)
+          }
+          # Re-arm function breakpoints after EVERY top-level expression, not
+          # after the cell: the RStudio-typical chunk defines a function and
+          # calls it three lines later, and a trace armed at cell end would
+          # miss that first call entirely. No-op while no breakpoint is set.
+          if (length(ls(break_registry, all.names = TRUE))) {
+            tryCatch(apply_fn_breaks(), error = function(err) NULL)
           }
           seen <<- harvest_finished(id, plot_dir, seen, dims)
           # User code may close our device (an explicit dev.off() in the
@@ -2301,6 +2850,15 @@ run_cell <- function(id, source, dims = NULL) {
       error = function(e) {
         trace_frames <<- capture_trace()
       }
+    ),
+    # The debugger's Stop. `Q` at a Browse prompt would abort past the
+    # dispatch loop and zombie the worker; invoking this restart instead
+    # unwinds the browser and the rest of the cell, lands here, and the cell
+    # reports itself stopped like any interrupt.
+    carmar_abort_cell = function() {
+      status <<- "interrupted"
+      detail <<- "Stopped from the debugger"
+    }
     ),
     error = function(e) {
       status <<- "error"
@@ -2335,13 +2893,50 @@ run_cell <- function(id, source, dims = NULL) {
 #' Read one command line from stdin, tolerating an interrupt that lands while
 #' the worker is idle (a Stop pressed with nothing running must not kill R).
 #'
-#' @param con Open text connection on stdin.
+#' In interactive mode this reads through R's CONSOLE (stdin()), not a file
+#' connection on fd 0 — deliberately. The console is the reader a native
+#' browser() prompt uses, so dispatch reads and debugger reads share one
+#' buffer and cannot steal bytes from each other. A SIGINT landing in a
+#' console read raises an interrupt condition exactly as it does on the file
+#' connection (measured), so the same handler serves both.
+#'
+#' @param con Open text connection on stdin, or stdin() in interactive mode.
 #' @return A single line, character(0) at EOF, or NA_character_ if interrupted.
 read_command <- function(con) {
-  tryCatch(
+  line <- tryCatch(
     readLines(con, n = 1L, warn = FALSE),
     interrupt = function(i) NA_character_
   )
+  # Strip the supervisor's comment tag; a line without it (older supervisor,
+  # test harness writing bare NDJSON) passes through untouched.
+  if (length(line) == 1L && !is.na(line) && nzchar(CMD_PREFIX) &&
+      startsWith(line, CMD_PREFIX)) {
+    line <- substring(line, nchar(CMD_PREFIX) + 1L)
+  }
+  line
+}
+
+#' Resolve a `cmdfile` stub to the command it spilled.
+#'
+#' The interactive console reader wedges on lines past ~40 KB, so the
+#' supervisor writes oversized commands to a 0600 temp file and sends a stub
+#' naming it. The file is consumed exactly once and deleted before the
+#' command runs, success or failure.
+#'
+#' @param cmd A parsed command list.
+#' @return The command to dispatch — `cmd` itself, or the spilled one.
+resolve_cmdfile <- function(cmd) {
+  if (!identical(cmd$type, "cmdfile")) return(cmd)
+  path <- cmd$path
+  if (!is.character(path) || length(path) != 1L || !file.exists(path)) return(NULL)
+  text <- tryCatch(paste(readLines(path, warn = FALSE, encoding = "UTF-8"),
+                         collapse = "\n"),
+                   error = function(e) NULL)
+  unlink(path)
+  if (is.null(text)) return(NULL)
+  inner <- tryCatch(jsonlite::fromJSON(text), error = function(e) NULL)
+  if (!is.list(inner) || !is.character(inner$type) || length(inner$type) != 1L) return(NULL)
+  inner
 }
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
@@ -2350,6 +2945,34 @@ read_command <- function(con) {
 # rather than in globalenv keeps the user's environment clean (the Environment
 # pane shows their objects, not ours) while still shadowing utils::View.
 carmar_tools <- new.env()
+# Debug hooks live on the SEARCH PATH, not in this file's private scope, for a
+# reason of visibility: a trace() tracer evaluates in the traced function's
+# frame, whose lexical chain ends at globalenv() and then the search path —
+# the worker's private local() is not on it. Same for expressions typed at a
+# Browse prompt, which is how .carmar_debug_where is called.
+carmar_tools$.carmar_debug_entered <- function(file, line, reason = "breakpoint") {
+  # Snapshot FIRST, then drop this function's own frame. Taking sys.calls()
+  # lazily inside the emit arguments would extend the stack through
+  # debug_stack/frame_vars themselves, defeat the machinery trimming, and put
+  # tracer-holding frames back in reach of frame_vars — the recursion bug.
+  calls <- sys.calls()
+  frames <- sys.frames()
+  n <- length(calls)
+  emit(list(type = "debug", event = "paused",
+            file = file, line = as.integer(line), reason = reason,
+            stack = debug_stack(calls[-n], frames[-n]),
+            locals = frame_vars(parent.frame())))
+  invisible(NULL)
+}
+carmar_tools$.carmar_debug_where <- function() {
+  calls <- sys.calls()
+  frames <- sys.frames()
+  n <- length(calls)
+  emit(list(type = "debug", event = "where",
+            stack = debug_stack(calls[-n], frames[-n]),
+            locals = frame_vars(parent.frame())))
+  invisible(NULL)
+}
 carmar_tools$View <- function(x, title = NULL) {
   # The LABEL is what the user typed; the FETCH NAME is where the viewer reads
   # it from. Conflating them titled `View(mtcars)` as `.carmar_view`, because
@@ -2361,7 +2984,37 @@ carmar_tools$View <- function(x, title = NULL) {
 }
 attach(carmar_tools, name = "carmar:tools", warn.conflicts = FALSE)
 
-con <- file("stdin", open = "rt", blocking = TRUE)
+# Interactive mode reads the console; batch mode opens fd 0 as a connection.
+# The console read is what lets browser() prompts and the dispatch loop share
+# one input stream — see read_command.
+con <- if (identical(WORKER_MODE, "interactive")) stdin()
+       else file("stdin", open = "rt", blocking = TRUE)
+
+# Die-fast guard for the interactive worker. A batch worker that suffers an
+# uncaught escape simply ends its script and exits, and the supervisor treats
+# the dead process as fatal. An interactive worker would instead abort to R's
+# raw top-level prompt — alive, but with the dispatch loop gone: a zombie the
+# supervisor cannot tell from a healthy idle worker. This restores parity.
+# Errors raised AT a Browse prompt also fire this handler, but quit() is a
+# no-op inside a browser context (measured), so a debug-console typo cannot
+# kill the session.
+if (identical(WORKER_MODE, "interactive")) {
+  options(error = function() quit(save = "no", status = 70L))
+}
+
+# macOS 26 registers command-line R as a foreground application after Aqua or
+# AppKit initializes, even when the process was launched by CarmaR's UIElement
+# helper. The supervisor loads the packaged marker before sourcing this file
+# (preventing an initial Dock flash); repeat the transition here, after all
+# worker initialization and immediately before `ready`, so any framework that
+# promoted R during startup cannot leave this document kernel in the Dock.
+# Existing workers cannot be changed by a newly installed build; every fresh
+# or restarted worker reaches this point automatically.
+if (identical(unname(Sys.info()[["sysname"]]), "Darwin") &&
+    is.loaded("carmar_mark_background")) {
+  invisible(try(.C("carmar_mark_background", result = integer(1)), silent = TRUE))
+}
+
 # The ready frame says WHICH R this is. A session that silently uses the wrong
 # installation looks identical to one using the right one until `library(tna)`
 # fails — so the home and the library count are reported up front.
@@ -2379,11 +3032,17 @@ con <- file("stdin", open = "rt", blocking = TRUE)
 emit(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
           # I(): a single library path must still ship as an array.
           home = R.home(), libs = I(.libPaths()),
+          # "interactive" means a native browser() can pause this worker — the
+          # debugger exists. "batch" (Windows, or no R binary beside Rscript)
+          # means it cannot, and clients must not offer breakpoints.
+          mode = WORKER_MODE,
           commands = I(c("exec", "env", "obj", "struct", "parse", "format",
                          "complete", "packages", "package_action", "package_help",
                          "help", "hover", "wd", "files", "choose", "sniff",
-                         "import", "readfile", "writefile", "view", "colstats",
-                         "rm"))))
+                         "import", "readfile", "writefile", "writefiles_atomic", "view", "colstats",
+                         "mkdir", "renamepath", "deletepath", "copypath", "revealpath",
+                         "rm",
+                         if (identical(WORKER_MODE, "interactive")) "debug_breaks"))))
 # (No package count here on purpose: installed.packages() reads every
 # package's DESCRIPTION — 0.3–1.8 s on a big library — and no client ever
 # consumed the number. The packages PANE asks the `packages` op on demand.)
@@ -2397,6 +3056,8 @@ repeat {
   # number, an array, `{"type":[1,2]}` — used to reach `cmd$type` on an atomic
   # vector and take the whole worker down with it, ending the session.
   if (!is.list(cmd) || !is.character(cmd$type) || length(cmd$type) != 1L) next
+  cmd <- resolve_cmdfile(cmd)
+  if (is.null(cmd)) next
   if (identical(cmd$type, "shutdown")) break
   # Every command is handled in the worker because every one of them needs the
   # SESSION — the environment, the search path, the working directory. Even
@@ -2416,7 +3077,8 @@ repeat {
   # narrow window where one lands outside those — an uncaught interrupt ends
   # the worker script, and the supervisor treats a dead worker as fatal.
   dispatch <- function(cmd) {
-  if (identical(cmd$type, "exec"))     run_cell(cmd$id, cmd$source, cmd$dims)
+  if (identical(cmd$type, "exec"))     run_cell(cmd$id, cmd$source, cmd$dims, cmd$srcname)
+  if (identical(cmd$type, "debug_breaks")) emit_debug_breaks(cmd$id, cmd$file, cmd$lines)
   if (identical(cmd$type, "env"))      emit_env(cmd$id)
   if (identical(cmd$type, "obj"))      emit_obj(cmd$id, cmd$name)
   if (identical(cmd$type, "struct"))   emit_struct(cmd$id, cmd$name, cmd$path)
@@ -2435,7 +3097,13 @@ repeat {
   if (identical(cmd$type, "sniff"))    emit_sniff(cmd$id, cmd$path, cmd$opts)
   if (identical(cmd$type, "import"))   emit_import(cmd$id, cmd$path, cmd$name)
   if (identical(cmd$type, "readfile"))  emit_readfile(cmd$id, cmd$path)
-  if (identical(cmd$type, "writefile")) emit_writefile(cmd$id, cmd$path, cmd$text)
+  if (identical(cmd$type, "writefile")) emit_writefile(cmd$id, cmd$path, cmd$text, cmd$expected)
+  if (identical(cmd$type, "writefiles_atomic")) emit_writefiles_atomic(cmd$id, cmd$files)
+  if (identical(cmd$type, "mkdir"))      emit_mkdir(cmd$id, cmd$path)
+  if (identical(cmd$type, "renamepath")) emit_renamepath(cmd$id, cmd$path, cmd$to)
+  if (identical(cmd$type, "deletepath")) emit_deletepath(cmd$id, cmd$paths, isTRUE(cmd$recursive))
+  if (identical(cmd$type, "copypath"))   emit_copypath(cmd$id, cmd$path, cmd$to)
+  if (identical(cmd$type, "revealpath")) emit_revealpath(cmd$id, cmd$path)
   # `rows` is the pre-paging spelling of `limit`; old clients keep working.
   if (identical(cmd$type, "view"))     emit_view(cmd$id, cmd$name,
                                                  offset = cmd$offset,
@@ -2478,6 +3146,10 @@ repeat {
            interrupt = function(i) fail_frame("Execution interrupted"))
 }
 
-close(con)
+# stdin() is R's console, not ours to close. And an interactive R does not
+# exit when the script does — it would sit at the top-level prompt waiting for
+# input until the supervisor's grace timeout killed it — so the shutdown that
+# broke the loop ends the process here, explicitly.
+if (identical(WORKER_MODE, "interactive")) quit(save = "no") else close(con)
 
 })

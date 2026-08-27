@@ -22,9 +22,6 @@
 #' @param open Open the browser once the kernel answers? Default `TRUE`.
 #' @param new Start an independent session? Default `TRUE`. Set `FALSE` to
 #'   reopen a live session on `port` when there is one.
-#' @param allow_more What to do when `MAX_SESSIONS` are already live. `NULL`
-#'   (default) and `TRUE` both start the session; `FALSE` reopens the newest
-#'   existing one instead. Never a prompt.
 #' @return Invisibly, the versioned notebook file URL with its kernel selected.
 #' @examples
 #' \dontrun{
@@ -33,26 +30,10 @@
 #' }
 #' @importFrom httpuv startServer
 #' @export
-#' The point at which `run()` starts SAYING how many sessions are live.
-#'
-#' Each session is a whole R process plus a browser origin of its own, so the
-#' number is about the machine. It is no longer a gate here: a dialog on a
-#' typed command is a question whose answer the user already gave, and the one
-#' it kept asking was wrong anyway — until 0.60.1 a kernel could not tell a
-#' closed laptop from an attached notebook, so sessions nobody had open kept
-#' answering, kept counting, and pushed every launch into a prompt about
-#' sessions that did not exist. The real cap lives in the supervisor, where
-#' the caller is a WEB PAGE rather than a person: an uncapped sibling-start on
-#' a browser's say-so is a resource-exhaustion button (see MAX_SESSIONS in
-#' spike/serve.R, enforced there and unchanged).
-MAX_SESSIONS <- 10L
-
-run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
+run <- function(port = 4747, open = TRUE, new = TRUE) {
   stopifnot(is.numeric(port), length(port) == 1L, is.finite(port),
             port == as.integer(port), port > 0, port < 65536)
   stopifnot(is.logical(new), length(new) == 1L, !is.na(new))
-  if (!is.null(allow_more)) stopifnot(is.logical(allow_more), length(allow_more) == 1L,
-                                      !is.na(allow_more))
   state <- tools::R_user_dir("carmar", "data")
   dir.create(state, recursive = TRUE, showWarnings = FALSE)
 
@@ -77,21 +58,9 @@ run <- function(port = 4747, open = TRUE, new = TRUE, allow_more = NULL) {
     return(invisible(page))
   }
 
-  if (new && length(live) >= MAX_SESSIONS) {
-    message(length(live), " CarmaR sessions are already running. ",
-            "carmar::stop_kernel(\"all\") stops them all; ",
-            "carmar::sessions() lists them.")
-  }
-  if (new && length(live) >= MAX_SESSIONS && !confirm_more_sessions(length(live), allow_more)) {
-    u <- unname(live[[1]])
-    page <- notebook_launch_url(u, state)
-    if (open) utils::browseURL(page)
-    message("Kept the existing ", length(live), " CarmaR sessions; reopened: ", page)
-    return(invisible(page))
-  }
-
   # Independent sessions get stable adjacent origins. That preserves browser
-  # storage per session while making the ordinary ten predictable.
+  # storage per session. There is deliberately no session-count gate: `run()`
+  # is an explicit user launch, and it starts the session it was asked for.
   used <- vapply(live, kernel_port, integer(1))
   chosen <- NA_integer_
   for (candidate in seq.int(as.integer(port), 65535L)) {
@@ -598,24 +567,6 @@ port_is_free <- function(port) {
   if (is.null(con)) return(TRUE)
   close(con)
   FALSE
-}
-
-#' Explicitly authorize a sixth-or-later independent session. @noRd
-#' Whether a launch past the cap proceeds. It does, unless someone said not to.
-#'
-#' This used to raise a dialog — `askYesNo`, an osascript panel, `winDialog`,
-#' or an outright `stop()` — every single launch once the count was reached.
-#' Three things were wrong with it. The count included kernels that were dead
-#' to everyone except the health check; the question interrupted a command the
-#' user had just typed, which is not consent-seeking but nagging; and refusing
-#' silently reopened some OTHER session, so the answer to "start another?" was
-#' a notebook the reader did not ask for. Explicit refusal still works, for
-#' scripts that want it: `allow_more = FALSE`, or CARMAR_ALLOW_MORE=0.
-confirm_more_sessions <- function(count, allow_more = NULL) {
-  if (!is.null(allow_more)) return(isTRUE(allow_more))
-  env <- tolower(Sys.getenv("CARMAR_ALLOW_MORE", ""))
-  if (env %in% c("0", "false", "no")) return(FALSE)
-  TRUE
 }
 
 #' readLines over http with a short timeout, connection always closed. @noRd

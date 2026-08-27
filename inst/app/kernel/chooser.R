@@ -109,7 +109,15 @@ chooser_command <- function(mode = "file", start = NULL, prompt = "Choose",
       paste0(
         "$d = New-Object System.Windows.Forms.OpenFileDialog; ",
         if (usable_start) paste0("$d.InitialDirectory = ", as_powershell_string(start), "; ") else "",
-        "$d.Filter = 'Data files|*.csv;*.tsv;*.txt;*.xlsx;*.xls;*.rds;*.sav;*.dta;*.json;*.parquet|All files|*.*'; ",
+        # File > Open is ONE door for everything R people open, so the
+        # default group has to be everything — a "Data files" default hid
+        # every .qmd and .md behind a dropdown the user had to know about.
+        "$d.Filter = 'All files R people open|",
+        "*.qmd;*.Rmd;*.rmd;*.md;*.markdown;*.carmd;*.R;*.r;*.bib;",
+        "*.csv;*.tsv;*.txt;*.xlsx;*.xls;*.rds;*.sav;*.dta;*.json;*.parquet|",
+        "Documents|*.qmd;*.Rmd;*.rmd;*.md;*.markdown;*.carmd|",
+        "Data files|*.csv;*.tsv;*.txt;*.xlsx;*.xls;*.rds;*.sav;*.dta;*.json;*.parquet|",
+        "R scripts|*.R;*.r|All files|*.*'; ",
         "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) ",
         "{ [Console]::Out.Write($d.FileName) }")
     }

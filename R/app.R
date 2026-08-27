@@ -92,10 +92,44 @@ launcher_macos_bundles <- function() {
 #' need no code signature even on Apple silicon, and a bundle this machine
 #' wrote has no quarantine bit: it opens like any app, first click included.
 #' @keywords internal
+#' Is LaunchServices allowed to learn about the bundle we just built?
+#'
+#' `NA` (the default) means "decide from where it landed", and the decision is
+#' always the same: never register a bundle inside `tempdir()`. `lsregister -f`
+#' writes a PERMANENT database entry, and R deletes its temp directory at the
+#' end of the session — so a test that installs into `tempfile("apps")` leaves
+#' a record pointing at a path that will not exist, under the SAME bundle
+#' identifier as the real app. Twenty-one runs of `test/app-launcher.test.R`
+#' put 42 such ghosts in this machine's database, all claiming to be
+#' `me.saqr.carmar.app`, and handler resolution for .R/.qmd/.Rmd and for
+#' `carmar://` is then a lottery among them.
+#'
+#' This is a default, not a policy: `register = TRUE` still registers a
+#' temp-dir bundle for a test that is specifically about registration, and
+#' `register = FALSE` suppresses it for a managed deployment.
+register_bundles <- function(register, apps) {
+  if (isTRUE(register)) return(TRUE)
+  if (isFALSE(register)) return(FALSE)
+  scratch <- normalizePath(tempdir(), mustWork = FALSE)
+  landed <- normalizePath(apps, mustWork = FALSE)
+  !startsWith(paste0(landed, .Platform$file.sep), paste0(scratch, .Platform$file.sep))
+}
+
+#' Register one bundle with LaunchServices, if the tool is present.
+lsregister_bundle <- function(bundle) {
+  tool <- file.path("/System/Library/Frameworks/CoreServices.framework",
+                    "Frameworks/LaunchServices.framework/Support/lsregister")
+  if (!file.exists(tool)) return(invisible(FALSE))
+  suppressWarnings(system2(tool, c("-f", shQuote(bundle)),
+                           stdout = FALSE, stderr = FALSE))
+  invisible(TRUE)
+}
+
 app_macos <- function(apps = "~/Applications", assets = launcher_assets(),
                       helper = TRUE, keep_ready = FALSE,
                       bundles = launcher_macos_bundles(),
-                      launch_helper = TRUE, preserve_keep_ready = TRUE) {
+                      launch_helper = FALSE, preserve_keep_ready = FALSE,
+                      register = NA) {
   apps <- path.expand(apps)
   app <- file.path(apps, "CarmaR.app")
   helper_app <- file.path(apps, "CarmaR Helper.app")
@@ -162,12 +196,9 @@ app_macos <- function(apps = "~/Applications", assets = launcher_assets(),
                                  stdout = FALSE, stderr = FALSE))
     }
 
-    register <- "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-    if (file.exists(register)) {
-      suppressWarnings(system2(register, c("-f", shQuote(app)),
-                               stdout = FALSE, stderr = FALSE))
-      if (isTRUE(helper)) suppressWarnings(system2(register,
-        c("-f", shQuote(helper_app)), stdout = FALSE, stderr = FALSE))
+    if (register_bundles(register, apps)) {
+      lsregister_bundle(app)
+      if (isTRUE(helper)) lsregister_bundle(helper_app)
     }
     return(app)
   }
@@ -313,13 +344,13 @@ app_linux <- function(share = "~/.local/share", assets = launcher_assets()) {
 #' a click, with R and the console nowhere in sight. On macOS the release-built
 #' app and CarmaR Helper are installed together from the package. Because R
 #' performs the local installation, they are not given a browser-download
-#' quarantine marker. The helper menu lists and controls local sessions, and
-#' opening CarmaR brings it back if it was closed. The keep-ready login service
-#' remains opt-in unless requested. Other platforms use a small launcher that
+#' quarantine marker. Launching CarmaR starts the helper menu, which lists and
+#' controls local sessions while keeping R's background processes out of the Dock.
+#' The keep-ready login service remains opt-in unless requested. Other platforms use a small launcher that
 #' finds R fresh and repairs a missing package automatically.
 #'
 #' @param quiet Say nothing on success? Default `FALSE`.
-#' @param helper On macOS, install and open the menu helper? Default `TRUE`.
+#' @param helper On macOS, also install the optional menu helper? Default `TRUE`.
 #' @param keep_ready On macOS, keep one kernel ready at login? Default `FALSE`.
 #' @return Invisibly, the path of what was created.
 #' @export
@@ -329,8 +360,7 @@ install_app <- function(quiet = FALSE, helper = TRUE, keep_ready = FALSE) {
   made <- if (identical(os, "Darwin")) {
     p <- app_macos(helper = helper, keep_ready = keep_ready)
     say("CarmaR is now an app: ", p,
-        "\nFind it in Launchpad / Spotlight as CarmaR.",
-        if (isTRUE(helper)) " The CarmaR menu is running too." else "")
+        "\nFind it in Launchpad / Spotlight as CarmaR.")
     p
   } else if (identical(.Platform$OS.type, "windows")) {
     p <- app_windows()

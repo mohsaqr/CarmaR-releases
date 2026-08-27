@@ -78,7 +78,12 @@ audit <- function(event, ...) {
           append = TRUE), silent = TRUE)
 }
 
-k <- kernel_start(file.path(here, "worker-boot.R"))
+# interactive = TRUE: the evaluating worker runs under `R --interactive` where
+# available, which is what makes a native browser() debugger possible (the
+# console becomes the stdin pipe). The analyzer below stays batch — it parses
+# and never pauses. Falls back to batch by itself on Windows or a missing R
+# binary; the ready frame's `mode` says which one booted.
+k <- kernel_start(file.path(here, "worker-boot.R"), interactive = TRUE)
 sockets <- new.env(parent = emptyenv())
 # Each connection is a RECORD (an environment), not a bare ws: the MCP plane
 # below needs to know which socket is a notebook page and which is an agent,
@@ -147,6 +152,11 @@ sockets$pairing_requests <- new.env(parent = emptyenv())
 sockets$published_approvals <- new.env(parent = emptyenv())
 sockets$worker_active <- NULL
 sockets$worker_terminal <- NULL
+# TRUE while the worker sits at a Browse prompt (a `debug` frame arrived and
+# the paused run has not yet finished). Gates debug_cmd: raw console lines may
+# only be sent when a browser() is actually reading them — at any other moment
+# they would reach the dispatch loop as junk.
+sockets$debug_paused <- FALSE
 # The analysis plane keeps its own routes and queue: its replies must never be
 # mistaken for the evaluating session's, and a stuck analysis must never block
 # a run (or the reverse).
@@ -258,6 +268,17 @@ if (published_origin_valid(initial_published_origin)) {
   audit("published-origin-authorized", origin = initial_published_origin,
         source = "launcher")
 }
+
+# A Finder double-click hands the document to the KERNEL, not the page URL:
+# macOS `open` strips the fragment from file:// URLs before the browser sees
+# it, so anything riding the address can silently vanish. The launcher parks
+# the path here; the first PAGE to ask (open-request) receives it exactly
+# once. Only the native launcher's environment can set this — no browser
+# input reaches it, so the trust model is unchanged: the page still reads the
+# file through the worker's ordinary readfile rules.
+open_file_env <- Sys.getenv("CARMAR_OPEN_FILE", "")
+sockets$pending_open <- if (nzchar(open_file_env)) open_file_env else NULL
+if (!is.null(sockets$pending_open)) audit("open-file-parked")
 
 html_escape <- function(x) {
   x <- gsub("&", "&amp;", x, fixed = TRUE)
@@ -404,15 +425,6 @@ control_rejection <- function(req, allow_file = FALSE) {
 # returns quantiles, level counts and a histogram for ONE named column. It is
 # strictly narrower than the `view` beside it — same resolution, less surface,
 # no mutation — which is the bar a new entry has to clear, not "it is useful".
-#' How many sessions may be open at once.
-#'
-#' Matches the R package launcher's own cap (tools/r-pkg/R/run.R MAX_SESSIONS)
-#' — a session is a whole R process plus a browser origin, so the number is
-#' about the machine. Enforced HERE too, because this supervisor can start a
-#' sibling on a browser's say-so and an uncapped version of that is a
-#' resource-exhaustion button on a web page.
-MAX_SESSIONS <- 10L
-
 #' The ports of CarmaR kernels that are actually answering right now.
 #'
 #' Read from the runtime directory rather than remembered, so sessions started
@@ -485,8 +497,27 @@ start_sibling_session <- function() {
 
 FORWARDED <- c("env", "obj", "struct", "view", "colstats", "rm", "packages",
                "package_action", "package_help", "help", "wd",
-               "parse", "complete", "files", "import", "readfile", "writefile",
-               "hover", "format", "sniff", "choose")
+               "parse", "complete", "files", "import", "readfile", "writefile", "writefiles_atomic",
+               "hover", "format", "sniff", "choose",
+               # The file tree's New Folder, Rename and Delete. These MUTATE
+               # the filesystem, which is a wider door than the read-only ops
+               # around them, so the bar they clear is stated rather than
+               # assumed: `writefile` — already here — can create, overwrite
+               # and truncate any file the worker may touch, so creating an
+               # empty directory and renaming an entry add no reach it did not
+               # already have. `deletepath` genuinely does add reach, and it is
+               # here because a file explorer without Delete is not one; it is
+               # bounded by the same `within_root()` every file op uses, checks
+               # BOTH ends of a rename, refuses to clobber, and reports each
+               # path's outcome instead of a single success flag. The
+               # confirmation naming the files lives in the page, which is the
+               # only place that knows what the user selected.
+               "mkdir", "renamepath", "deletepath", "copypath", "revealpath",
+               # Registers breakpoint lines; the worker arms/clears traces and
+               # answers with what it armed. NOTE `cmdfile` is deliberately NOT
+               # here: it makes the worker read a file path as a command, and
+               # only kernel.R's own spill path may mint one.
+               "debug_breaks")
 
 # The ANALYSIS plane is a SECOND allow-list, deliberately kept apart from the
 # one above and deliberately tiny. Commands here are routed to spike/analyze.R
@@ -500,7 +531,15 @@ FORWARDED <- c("env", "obj", "struct", "view", "colstats", "rm", "packages",
 # added to the wrong one either reaches the user's session when it should not,
 # or reaches a process that cannot do it. Adding to EITHER list is a security
 # decision (CLAUDE.md, "FORWARDED in serve.R is an allow-list").
-ANALYZE_FORWARDED <- c("analyze", "analyze_ping", "analyze_workspace")
+ANALYZE_FORWARDED <- c("analyze", "analyze_ping", "analyze_workspace",
+                       "analyze_workspace_references")
+
+# Output held for a run whose page went away, replayed to whoever adopts it.
+# A quarter of a megabyte is far more than any chunk prints on purpose and far
+# less than a runaway `print()` loop prints by accident — and the cap matters
+# because the page that would have consumed this output is, by definition, not
+# there to apply back-pressure.
+ORPHAN_BUFFER_BYTES <- 262144L
 
 # A single WebSocket frame this large is not a notebook cell; it is either a
 # bug or an attempt to exhaust memory in fromJSON(). 8 MB is far above any
@@ -552,11 +591,17 @@ app <- list(
   call = function(req) {
     if (!host_ok(req)) return(reject("bad host", req$HTTP_HOST %||% "(none)"))
     if (identical(req$PATH_INFO, "/health")) {
+      # CORS is granted HERE AND ONLY HERE, so a notebook page (a file:
+      # origin) probing for its kernel can read which port holds a pending
+      # double-clicked document and prefer it. Booleans only — the path
+      # itself never appears in an unauthenticated response.
       return(resp(200L, "application/json",
                   toJSON(list(ok = TRUE, worker = k$proc$is_alive(),
+                              pending_open = !is.null(sockets$pending_open),
                               capabilities = c("published-direct-v1",
                                                "published-pairing-v3")),
-                         auto_unbox = TRUE)))
+                         auto_unbox = TRUE),
+                  extra = list("Access-Control-Allow-Origin" = "*")))
     }
     # The custom carmar:// handler calls this endpoint as a native same-user
     # client. Browser requests carry Origin/Sec-Fetch-Site and are refused by
@@ -627,26 +672,57 @@ app <- list(
                               codex = nzchar(codex_bin())), auto_unbox = TRUE),
                   extra = list("Access-Control-Allow-Origin" = "null")))
     }
-    # The double-click door: /open?file=/abs/path.qmd. This is how
-    # CarmaR.app hands a Finder-opened document to the notebook — the server
-    # only VALIDATES and redirects; the page itself asks the worker for the
-    # text (the readfile op, which enforces its own path rules) and imports.
+    # The double-click door: /open?file=/abs/path. This is how a Finder-opened
+    # document reaches a kernel that is ALREADY RUNNING, and it is the reason
+    # opening a file no longer costs an R session.
+    #
+    # The other channel — CARMAR_OPEN_FILE in the supervisor's environment —
+    # is read once at startup, so the only way to deliver a document through
+    # it is to start a new process. That is precisely what the launcher used
+    # to do: every double-click was a fresh supervisor, worker and analyzer,
+    # and four files opened in a minute were twelve R processes. This door
+    # takes the same path and hands it to the session the user already has.
+    #
+    # There is NO extension whitelist here, deliberately. The old one
+    # (`qmd|rmd|md|markdown`) predated the page's own router and contradicted
+    # the app's Info.plist, which claims .R and .RData — so a double-clicked
+    # R script was rejected by the very door meant to open it. The authority
+    # on what may be read is `readfile` in the WORKER, which enforces the path
+    # rules, refuses binaries and bounds the size, with a reason; a second,
+    # weaker copy of that judgment here only ever produced false rejections.
+    #
     # Origin/Sec-Fetch gated like /shutdown: a drive-by page must not be able
     # to make the notebook open files by guessing paths.
     if (identical(req$PATH_INFO, "/open")) {
       blocked <- control_rejection(req)
       if (!is.null(blocked)) return(blocked)
       f <- query_param(req$QUERY_STRING, "file")
-      openable <- nzchar(f) && file.exists(f) && !dir.exists(f) &&
-        grepl("\\.(qmd|rmd|md|markdown)$", f, ignore.case = TRUE)
-      if (!openable) {
+      if (!nzchar(f) || !file.exists(f) || dir.exists(f)) {
         audit("open-rejected", detail = f)
-        return(resp(400L, "text/plain", "not an openable document (.qmd, .Rmd, .md)"))
+        return(resp(400L, "text/plain", "no such file"))
+      }
+      f <- normalizePath(f)
+      page <- target_page()
+      if (is.null(page)) {
+        # No page is connected yet — this kernel was started for this very
+        # document and its notebook is still loading. Park it exactly as the
+        # environment channel does, and the first page to ask collects it.
+        sockets$pending_open <- f
+        audit("open-parked", detail = f)
+        return(resp(200L, "application/json", '{"ok":true,"delivered":"parked"}'))
       }
       audit("open", detail = f)
-      loc <- paste0("/?open=",
-                    utils::URLencode(normalizePath(f), reserved = TRUE))
-      return(resp(302L, "text/plain", "", extra = list(Location = loc)))
+      sent <- tryCatch({
+        page$ws$send(toJSON(list(type = "open-file", path = f), auto_unbox = TRUE))
+        TRUE
+      }, error = function(e) FALSE)
+      if (!sent) {
+        # The page we picked died between the roster read and the send. Park
+        # rather than report a success nobody acted on.
+        sockets$pending_open <- f
+        return(resp(200L, "application/json", '{"ok":true,"delivered":"parked"}'))
+      }
+      return(resp(200L, "application/json", '{"ok":true,"delivered":"page"}'))
     }
     if (identical(req$PATH_INFO, "/") || identical(req$PATH_INFO, "/spike")) {
       page <- if (identical(req$PATH_INFO, "/spike")) file.path(here, "index.html")
@@ -947,6 +1023,46 @@ route_command <- function(cmd, rec, kind) {
   list(cmd = cmd, wire_id = wire_id)
 }
 
+#' Has this route's page gone away?
+#'
+#' A socket record is removed from `sockets$open` the moment its close handler
+#' fires, so "still open" is identity in that list — not a flag on the record,
+#' which would need clearing in every path that can lose a page.
+route_is_orphan <- function(route) {
+  if (is.null(route) || is.null(route$rec)) return(TRUE)
+  !any(vapply(sockets$open, function(r) identical(r, route$rec), logical(1)))
+}
+
+#' Keep one output frame for a run, bounded.
+#'
+#' Called for EVERY exec frame, attached page or not — see the note at the call
+#' site. The cap protects against a runaway `print()` loop, and the overflow is
+#' dropped from the END: the first lines of a long run are the ones that say
+#' what it was doing, so losing the tail is the survivable half.
+record_output <- function(route, frame) {
+  held <- route$buffered_bytes %||% 0L
+  # Measure the FRAME, not its text: a plot arrives as base64 and a view as a
+  # table, and neither has a `text` field to charge for.
+  size <- nchar(attr(frame, "raw") %||% (frame$text %||% ""), type = "bytes")
+  if (held + size > ORPHAN_BUFFER_BYTES) {
+    route$buffer_truncated <- TRUE
+    return(invisible(NULL))
+  }
+  # `buf[[n]] <- frame`, NOT `c(buf, list(frame))`. The second re-allocates and
+  # copies the whole list on every frame, which is O(n²) over a run: measured
+  # at 0.35 s of supervisor CPU for 12,000 lines against 0.00 s here, 117x.
+  # That cost was invisible while this only ran for ORPHANED runs; recording
+  # every run put it on the hot path of the loop that services the socket, so
+  # a chatty `for` loop would have stalled the whole session. R over-allocates
+  # on `[[<-`, so the indexed form is amortised constant.
+  n <- (route$buffer_n %||% 0L) + 1L
+  if (n == 1L) route$buffer <- list()
+  route$buffer[[n]] <- frame
+  route$buffer_n <- n
+  route$buffered_bytes <- held + size
+  invisible(NULL)
+}
+
 drop_worker_route <- function(wire_id) {
   if (exists(wire_id, envir = sockets$worker_routes, inherits = FALSE)) {
     rm(list = wire_id, envir = sockets$worker_routes)
@@ -1141,12 +1257,14 @@ route_analyze <- function(cmd, rec) {
   # on the type it asked for, so the reply type is recorded here, not guessed.
   route$response_type <- if (identical(cmd$type, "analyze_ping")) "pong"
     else if (identical(cmd$type, "analyze_workspace")) "workspace"
+    else if (identical(cmd$type, "analyze_workspace_references")) "workspace_references"
     else "analyze"
   sockets$analyze_routes[[wire_id]] <- route
   cmd$id <- wire_id
   # The wire name is the analyzer's vocabulary, not the browser's.
   if (identical(cmd$type, "analyze_ping")) cmd$type <- "ping"
   if (identical(cmd$type, "analyze_workspace")) cmd$type <- "workspace"
+  if (identical(cmd$type, "analyze_workspace_references")) cmd$type <- "workspace_references"
   list(cmd = cmd, wire_id = wire_id)
 }
 
@@ -1285,6 +1403,22 @@ handle_frame <- function(message, rec) {
     if (identical(rec$role, "page")) sockets$active_page <- rec
     return(invisible(NULL))
   }
+  if (identical(cmd$type, "open-request")) {
+    # The double-clicked document parked by the launcher (CARMAR_OPEN_FILE).
+    # Pages only — an agent must never consume it — and consume-once: the
+    # first page to ask gets the path, everyone after gets "". An empty
+    # string, not a JSON null, because jsonlite renders NULL as a truthy {}.
+    if (!identical(rec$role, "page")) return(invisible(NULL))
+    path <- sockets$pending_open
+    sockets$pending_open <- NULL
+    if (!is.null(path)) audit("open-file-delivered")
+    reply <- toJSON(list(type = "open-request",
+                         id = if (scalar_chr(cmd$id)) cmd$id else "open",
+                         path = path %||% ""),
+                    auto_unbox = TRUE)
+    try(rec$ws$send(reply), silent = TRUE)
+    return(invisible(NULL))
+  }
   if (identical(cmd$type, "mcp-request")) {
     if (!identical(rec$role, "mcp")) {
       audit("mcp-refused", reason = "mcp-request from a non-agent socket")
@@ -1341,7 +1475,136 @@ handle_frame <- function(message, rec) {
     return(invisible(NULL))
   }
 
-  if (cmd$type %in% c("exec", "interrupt", "restart") && identical(rec$role, "mcp")) {
+  # ── "is the run I am still waiting for actually alive?" ───────────────────
+  #
+  # A page waits for a `done` with no timeout, on purpose: a model fit may run
+  # for hours. The cost is that a done LOST on the way out — a send that threw
+  # on a socket in a bad state, a frame the page missed — leaves the chunk
+  # showing "Running…" for the rest of the session while R sits idle. Nothing
+  # on screen is wrong except everything, and only a reload clears it.
+  #
+  # The supervisor already knows the answer: a live exec has a route, and the
+  # route is dropped the moment its terminal frame is relayed. So this is a
+  # question it can answer ITSELF — no frame is written to the worker, which
+  # matters, because a worker parked at a `browser()` prompt or inside
+  # `readline()` would read that frame as console input.
+  #
+  # Scoped to the ASKING socket: exec ids are per-page counters (`c1`, `c2`),
+  # so two tabs collide on every one of them, and a neighbour's live run must
+  # never be the reason this page keeps waiting.
+  if (identical(cmd$type, "runstate")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    run_id <- if (scalar_chr(cmd$run)) cmd$run else ""
+    alive <- nzchar(run_id) && any(vapply(ls(sockets$worker_routes), function(w) {
+      route <- sockets$worker_routes[[w]]
+      !is.null(route) && identical(route$kind, "exec") &&
+        identical(route$client_id, run_id) && identical(route$rec, rec)
+    }, logical(1)))
+    # A terminal frame waiting out the drain cycle is still in flight: its
+    # route is gone, but the result is one turn away. Answering "not running"
+    # here would race the real answer and settle the chunk as lost.
+    if (!alive && !is.null(sockets$worker_terminal)) {
+      held <- sockets$worker_terminal$route
+      alive <- !is.null(held) && identical(held$client_id, run_id) &&
+        identical(held$rec, rec)
+    }
+    try(rec$ws$send(toJSON(list(type = "runstate", id = cmd$id, run = run_id,
+                                running = alive), auto_unbox = TRUE)), silent = TRUE)
+    return(invisible(NULL))
+  }
+
+  # ── what is still running, and adopting it ────────────────────────────────
+  #
+  # R outlives the page. Closing a tab, reloading it, or following a link does
+  # not stop a fit — it strands it: the run keeps burning CPU and its result is
+  # relayed to a socket that is gone. Both halves of that are fixed here.
+  # `runs` lets a page that has just connected SEE what its session is doing,
+  # and `adopt` re-points an orphaned run at the page asking for it, so the
+  # result lands in the chunk that asked for it however long ago.
+  #
+  # Only an ORPHANED run may be adopted. A live page's run is not up for
+  # grabs by a second tab — that would silently move someone's output.
+  if (identical(cmd$type, "runs")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    rows <- Filter(Negate(is.null), lapply(ls(sockets$worker_routes), function(w) {
+      route <- sockets$worker_routes[[w]]
+      if (is.null(route) || !identical(route$kind, "exec")) return(NULL)
+      list(run = route$client_id %||% "", srcname = route$srcname %||% "",
+           mine = identical(route$rec, rec), orphan = route_is_orphan(route),
+           finished = !is.null(route$parked),
+           seconds = round(as.numeric(difftime(Sys.time(),
+             route$started %||% Sys.time(), units = "secs")), 1))
+    }))
+    try(rec$ws$send(toJSON(list(type = "runs", id = cmd$id,
+                                runs = if (length(rows)) rows else I(list())),
+                           auto_unbox = TRUE)), silent = TRUE)
+    return(invisible(NULL))
+  }
+
+  if (identical(cmd$type, "adopt")) {
+    if (!scalar_chr(cmd$id) || !scalar_chr(cmd$srcname) || !nzchar(cmd$srcname)) {
+      return(invisible(NULL))
+    }
+    refuse <- function(msg) {
+      try(rec$ws$send(toJSON(list(type = "done", id = cmd$id, status = "lost",
+                                  message = msg), auto_unbox = TRUE)), silent = TRUE)
+      invisible(NULL)
+    }
+    hit <- NULL
+    for (w in ls(sockets$worker_routes)) {
+      route <- sockets$worker_routes[[w]]
+      if (!is.null(route) && identical(route$kind, "exec") &&
+          identical(route$srcname %||% "", cmd$srcname) && route_is_orphan(route)) {
+        hit <- w
+        break
+      }
+    }
+    if (is.null(hit)) return(refuse("that run is no longer in this session."))
+    route <- sockets$worker_routes[[hit]]
+    route$rec <- rec
+    route$client_id <- cmd$id
+    audit("adopt", srcname = cmd$srcname)
+    # It may already be FINISHED: the result was parked when its page went
+    # away, and adopting is how it finally gets delivered.
+    # Everything it printed while nobody was attached, in order, BEFORE the
+    # result — the adopting page then sees exactly the sequence a run nobody
+    # interrupted produces, and its accumulator fills the same way.
+    buffered <- route$buffer %||% list()
+    route$buffer <- NULL
+    route$buffer_n <- 0L
+    route$buffered_bytes <- 0L
+    lapply(buffered, function(frame) {
+      # Plain stdout/stderr carries no protocol id, so relay_frame's needle
+      # ("id":<wire id> in the worker's own bytes) cannot match and the frame
+      # falls through to an encode of the parsed list — whose `id` the pump
+      # had already rewritten to the client id of the page that is GONE. The
+      # adopting client drops a frame addressed to someone else, which is how
+      # a rejoined run arrived with a status and an empty output panel. Re-
+      # address it here; frames that do carry an id take the needle path and
+      # are rewritten there.
+      frame$id <- cmd$id
+      try(rec$ws$send(relay_frame(frame, hit, cmd$id)), silent = TRUE)
+    })
+    # A gap in a transcript that does not admit to being a gap is worse than
+    # no transcript, so the truncation says so in the output itself.
+    if (isTRUE(route$buffer_truncated)) {
+      route$buffer_truncated <- NULL
+      try(rec$ws$send(toJSON(list(type = "message", id = cmd$id, kind = "warning",
+        text = paste("Output printed while this notebook was closed exceeded",
+                     ORPHAN_BUFFER_BYTES %/% 1024L, "KB; the rest was dropped.")),
+        auto_unbox = TRUE)), silent = TRUE)
+    }
+    parked <- route$parked
+    if (!is.null(parked)) {
+      route$parked <- NULL
+      try(rec$ws$send(relay_frame(parked, hit, cmd$id)), silent = TRUE)
+      drop_worker_route(hit)
+    }
+    return(invisible(NULL))
+  }
+
+  if (cmd$type %in% c("exec", "interrupt", "restart", "debug_cmd") &&
+      identical(rec$role, "mcp")) {
     audit("mcp-refused", reason = paste("agent asked for", cmd$type))
     if (scalar_chr(cmd$id)) {
       reply <- toJSON(list(type = cmd$type, id = cmd$id,
@@ -1356,6 +1619,13 @@ handle_frame <- function(message, rec) {
     if (!scalar_chr(cmd$id) || !scalar_chr(cmd$source)) return(invisible(NULL))
     audit("exec", id = cmd$id, bytes = nchar(cmd$source, type = "bytes"))
     routed <- route_command(cmd, rec, "exec")
+    # The chunk's stable identity travels with the route. Exec ids are per-page
+    # counters and die with the page; `chunk:<stableId>` is the same string the
+    # NEXT page will use for the same chunk, which is what makes a run
+    # adoptable after a reload.
+    sockets$worker_routes[[routed$wire_id]]$srcname <-
+      if (scalar_chr(cmd$srcname)) cmd$srcname else ""
+    sockets$worker_routes[[routed$wire_id]]$started <- Sys.time()
     assign(routed$wire_id, TRUE, envir = sockets$running)
     enqueue_worker_command(routed$cmd, routed$wire_id)
     return(invisible(NULL))
@@ -1386,6 +1656,54 @@ handle_frame <- function(message, rec) {
     # Compatibility for an older notebook bundle with id-less Stop.
     return(invisible(kernel_interrupt(k)))
   }
+  # ── the debugger's raw console ────────────────────────────────────────────
+  # While the worker is paused at a Browse prompt, step commands and console
+  # expressions are RAW lines on the worker's stdin, not NDJSON — R's own
+  # debugger REPL is reading them. This is arbitrary code execution by
+  # design, exactly like exec: pages only (agents are refused above with
+  # exec), and only the page that owns the paused run.
+  if (identical(cmd$type, "debug_cmd")) {
+    reply_err <- function(msg) {
+      if (scalar_chr(cmd$id)) {
+        try(rec$ws$send(toJSON(list(type = "debug_cmd", id = cmd$id, error = msg),
+                               auto_unbox = TRUE)), silent = TRUE)
+      }
+    }
+    if (!identical(k$mode, "interactive")) {
+      reply_err("the debugger needs an interactive worker")
+      return(invisible(NULL))
+    }
+    if (!isTRUE(sockets$debug_paused)) {
+      reply_err("R is not paused in the debugger")
+      return(invisible(NULL))
+    }
+    route <- if (!is.null(sockets$worker_active))
+      sockets$worker_routes[[sockets$worker_active]] else NULL
+    if (is.null(route) || !identical(route$rec, rec)) {
+      reply_err("another page owns the paused run")
+      return(invisible(NULL))
+    }
+    action <- if (scalar_chr(cmd$action)) cmd$action else ""
+    line <- switch(action,
+      continue = "c", over = "n", into = "s", out = "f",
+      where = ".carmar_debug_where()",
+      abort = 'invokeRestart("carmar_abort_cell")',
+      eval = if (scalar_chr(cmd$expr)) cmd$expr else NULL)
+    if (is.null(line) || grepl("[\n\r]", line) || nchar(line) > 4000L) {
+      reply_err("bad debug command")
+      return(invisible(NULL))
+    }
+    audit("debug_cmd", action = action)
+    try(kernel_console(k, line), silent = TRUE)
+    # A step moves the position; follow it with a where so the client gets a
+    # structured stack instead of parsing narration. If the step ran off the
+    # end of the debuggable code the where line reaches the dispatch loop,
+    # which ignores what it cannot parse — harmless by construction.
+    if (action %in% c("over", "into", "out")) {
+      try(kernel_console(k, ".carmar_debug_where()"), silent = TRUE)
+    }
+    return(invisible(NULL))
+  }
   # Restart: a NEW worker process — fresh globalenv, fresh packages. The stored
   # hello is stale the moment the old worker dies; the new worker's ready frame
   # replaces it via pump() and reaches every open socket.
@@ -1393,7 +1711,7 @@ handle_frame <- function(message, rec) {
     audit("restart")
     fail_worker_routes("R was restarted — this request was abandoned.")
     try(kernel_stop(k, grace = 1), silent = TRUE)
-    k <<- kernel_start(file.path(here, "worker-boot.R"))
+    k <<- kernel_start(file.path(here, "worker-boot.R"), interactive = TRUE)
     sockets$hello <- NULL
     # In-flight runs died with the old worker; the new one will never emit
     # their done frames, and a stuck entry would block idle linger forever.
@@ -1402,6 +1720,7 @@ handle_frame <- function(message, rec) {
     sockets$worker_queue <- list()
     sockets$worker_active <- NULL
     sockets$worker_terminal <- NULL
+    sockets$debug_paused <- FALSE
     return(invisible(NULL))
   }
   # A SIBLING SESSION: another supervisor, another R process, another origin.
@@ -1412,20 +1731,14 @@ handle_frame <- function(message, rec) {
   # from the Files pane could not reach that, so its only option was to replace
   # the document you were reading.
   #
-  # Capped, and the cap is the point: this starts a whole R process from a
-  # browser request, so an unbounded version is a resource-exhaustion button on
-  # a page. The count is of OUR OWN runtime files, health-checked, so kernels
-  # that died do not hold a slot.
+  # This is an explicit New Session command from the local notebook. It starts
+  # the sibling it was asked for; there is no count at which it silently turns
+  # into some other action.
   if (identical(cmd$type, "session-new")) {
     if (!scalar_chr(cmd$id)) return(invisible(NULL))
     audit("session-new", id = cmd$id)
     reply <- function(...) try(rec$ws$send(toJSON(list(type = "session-new", id = cmd$id, ...),
                                                   auto_unbox = TRUE, null = "null")), silent = TRUE)
-    live <- live_session_ports()
-    if (length(live) >= MAX_SESSIONS) {
-      reply(error = sprintf("%d sessions are already open, which is the limit.", length(live)))
-      return(invisible(NULL))
-    }
     started <- start_sibling_session()
     if (is.null(started)) {
       reply(error = "Could not start another session.")
@@ -1465,10 +1778,22 @@ pump <- function() {
     if (!is.null(sockets$worker_terminal)) {
       terminal <- sockets$worker_terminal
       wire_id <- terminal$wire_id
-      try(terminal$route$rec$ws$send(
-            relay_frame(terminal$frame, wire_id, terminal$route$client_id)),
-          silent = TRUE)
-      drop_worker_route(wire_id)
+      # The page that asked may be gone — a reload, a closed tab, a followed
+      # link. The RUN is not: R finished it, and the result is the only copy
+      # of work that may have taken an hour. Sending it into a dead socket
+      # (which `try(silent)` used to do, uncomplainingly) threw it away. Park
+      # it on the route instead and keep the route alive, so the page that
+      # comes back can adopt it and see its own output.
+      if (route_is_orphan(terminal$route) && identical(terminal$route$kind, "exec")) {
+        terminal$route$parked <- terminal$frame
+        terminal$route$parked_at <- Sys.time()
+        audit("result-parked", srcname = terminal$route$srcname %||% "")
+      } else {
+        try(terminal$route$rec$ws$send(
+              relay_frame(terminal$frame, wire_id, terminal$route$client_id)),
+            silent = TRUE)
+        drop_worker_route(wire_id)
+      }
       if (identical(sockets$worker_active, wire_id)) sockets$worker_active <- NULL
       sockets$worker_terminal <- NULL
       dispatch_worker_queue()
@@ -1476,11 +1801,18 @@ pump <- function() {
     return(invisible(NULL))
   }
   lapply(events, function(e) {
+    # Debug frames mark the pause window; the run's own done closes it. The
+    # flag is what gates debug_cmd, so it must flip on the frame, not on
+    # anything the client does.
+    if (identical(e$type, "debug")) sockets$debug_paused <- TRUE
+    if (identical(e$type, "done")) sockets$debug_paused <- FALSE
     # Plain stdout/stderr has no protocol id. The worker is serial, so it
-    # belongs to the oldest execution still in flight.
+    # belongs to the oldest execution still in flight — and so does a debug
+    # frame, which carries no id by design (it is emitted mid-pause, from
+    # inside the paused evaluation).
     had_id <- scalar_chr(e$id)
     wire_id <- if (had_id) e$id else
-      if (e$type %in% c("stdout", "stderr")) sockets$worker_active else NULL
+      if (e$type %in% c("stdout", "stderr", "debug")) sockets$worker_active else NULL
     route <- if (!is.null(wire_id) &&
                  exists(wire_id, envir = sockets$worker_routes, inherits = FALSE))
       sockets$worker_routes[[wire_id]] else NULL
@@ -1501,7 +1833,22 @@ pump <- function() {
         # browser settles the result before a trailing stderr frame arrives.
         sockets$worker_terminal <- list(wire_id = wire_id, route = route, frame = e)
       } else {
-        try(route$rec$ws$send(relay_frame(e, wire_id, route$client_id)), silent = TRUE)
+        # An exec's output is recorded for the WHOLE run, not only the part
+        # after its page left. The buffer used to start at the moment of
+        # orphaning, which loses everything printed before it — and a page that
+        # reloads mid-run has an EMPTY output panel, so the part it is missing
+        # is precisely the part that already went to the socket it no longer
+        # has. Adoption then delivered a status and half a transcript.
+        #
+        # Recording always is affordable because it is bounded twice over: the
+        # worker is one R session, so at most one exec route is producing
+        # output at a time, and that route's buffer is capped. A run whose page
+        # is still there drops its route (and the buffer with it) the moment it
+        # finishes, so nothing accumulates across runs.
+        if (identical(route$kind, "exec")) record_output(route, e)
+        if (!route_is_orphan(route)) {
+          try(route$rec$ws$send(relay_frame(e, wire_id, route$client_id)), silent = TRUE)
+        }
       }
       return(invisible(NULL))
     }
@@ -1645,8 +1992,29 @@ reap_dead_sockets <- function() {
 #' rebooted and held a slot in the launcher's cap the whole time. The grace
 #' itself is the protection: ten minutes is three orders of magnitude longer
 #' than a browser launch, and a page that connects at any point cancels it.
+#' Forget results nobody came back for.
+#'
+#' A parked result keeps its route — and therefore `sockets$running` — alive,
+#' which is exactly right for the reload it exists for and exactly wrong
+#' forever: an unclaimed result would hold the kernel open for good. One
+#' linger window is the same grace the kernel gives a page that never returns.
+sweep_parked_results <- function() {
+  if (linger_s <= 0) return(invisible(NULL))
+  now <- Sys.time()
+  for (w in ls(sockets$worker_routes)) {
+    route <- sockets$worker_routes[[w]]
+    if (is.null(route) || is.null(route$parked)) next
+    if (as.numeric(difftime(now, route$parked_at %||% now, units = "secs")) >= linger_s) {
+      audit("result-forgotten", srcname = route$srcname %||% "")
+      drop_worker_route(w)
+    }
+  }
+  invisible(NULL)
+}
+
 linger_check <- function() {
   if (linger_s <= 0) return(invisible(NULL))
+  sweep_parked_results()
   if (!isTRUE(sockets$ever_connected) && is.null(sockets$idle_since)) {
     sockets$idle_since <- sockets$boot_at
   }
