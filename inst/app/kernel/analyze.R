@@ -38,6 +38,17 @@
 
 suppressPackageStartupMessages(stopifnot(requireNamespace("jsonlite", quietly = TRUE)))
 
+# How long a workspace scan may run, in seconds. Read from the environment
+# because the right number depends on the tree: 3 s keeps the single-flight
+# analyzer responsive on a project, and someone with a genuinely large one can
+# raise it knowingly. Clamped to [0, 60] so a typo cannot remove the bound —
+# and 0 is a real setting, meaning "scan nothing and report it truncated".
+ANALYZE_BUDGET <- local({
+  v <- suppressWarnings(as.numeric(Sys.getenv("CARMAR_ANALYZE_BUDGET", "3")))
+  if (!is.finite(v)) v <- 3
+  max(0, min(v, 60))
+})
+
 # A private scope, for the same reason worker.R uses one: the protocol must not
 # be clobberable, and nothing here should leak into any environment a future
 # introspection command might report.
@@ -262,21 +273,37 @@ references <- function(exprs) {
 #' @return integer vector, parallel to `ids`: the id of the binding function
 #'   node, or 0 for the document's top level.
 resolve_scopes <- function(pd, ids) {
-  parent_of <- setNames(pd$parent, as.character(pd$id))
+  # Parent and function-node lookups are BY INTEGER ID, not by name. They used
+  # to be `parent_of[[as.character(cur)]]` on a named vector, and R resolves a
+  # character index into a vector by LINEAR SCAN — so every step of every
+  # ancestor walk cost O(tokens), and the walk runs once per binding and once
+  # per symbol. On a 3,000-line file that is quadratic: a workspace Find
+  # References over this repo took 49 s, blowing past the client's 25 s
+  # timeout and stalling the single-flight analyzer's diagnostics behind it.
+  # getParseData ids are positive integers, so an integer-indexed vector makes
+  # each hop O(1) and changes no result. `parent` is NEGATIVE for a comment,
+  # so both the id map and the function-node mask keep to positives — a
+  # negative index in R means "drop", which would silently unset entries.
+  ids_pos <- pd$id[pd$id > 0L]
+  max_id <- max(c(ids_pos, pd$parent[pd$parent > 0L], 0L))
+  parent_vec <- integer(max_id)
+  if (length(ids_pos)) parent_vec[ids_pos] <- pd$parent[pd$id > 0L]
   # A function's node is the parent of its FUNCTION token — `function(a) a`
   # and `\(a) a` both produce one.
   fn_nodes <- unique(pd$parent[pd$token %in% c("FUNCTION", "OP-LAMBDA")])
-  fn_nodes <- fn_nodes[fn_nodes != 0L]
+  fn_nodes <- fn_nodes[fn_nodes > 0L]
+  is_fn <- logical(max_id)
+  if (length(fn_nodes)) is_fn[fn_nodes] <- TRUE
 
   #' Ancestors of a node, innermost first, restricted to function nodes.
   fn_ancestors <- function(id) {
     out <- integer(0)
     cur <- id
     guard <- 0L
-    while (!is.na(cur) && cur != 0L && guard < 1000L) {
-      if (cur %in% fn_nodes) out <- c(out, cur)
-      nxt <- parent_of[[as.character(cur)]]
-      cur <- if (is.null(nxt) || is.na(nxt)) 0L else nxt
+    while (!is.na(cur) && cur > 0L && cur <= max_id && guard < 1000L) {
+      if (is_fn[[cur]]) out <- c(out, cur)
+      nxt <- parent_vec[[cur]]
+      cur <- if (is.na(nxt)) 0L else nxt
       guard <- guard + 1L
     }
     out
@@ -323,9 +350,10 @@ resolve_scopes <- function(pd, ids) {
     add_bind(anc[[1L]], term$text[[i]])
   }
 
-  row_of <- setNames(seq_len(nrow(pd)), as.character(pd$id))
+  row_vec <- integer(max_id)
+  if (length(ids_pos)) row_vec[ids_pos] <- seq_len(nrow(pd))[pd$id > 0L]
   vapply(ids, function(id) {
-    i <- row_of[[as.character(id)]]
+    i <- row_vec[[id]]
     name <- pd$text[[i]]
     for (node in fn_ancestors(id)) {
       key <- as.character(node)
@@ -402,15 +430,35 @@ analyze_source <- function(source) {
 #'   from lib/workdir.js, enforced where the reading happens rather than where
 #'   the asking happens.
 #'
+#'   BOUNDED IN TIME, not only in size. The analyzer is single-flight: while a
+#'   scan runs it answers nothing else, so diagnostics, completion and hover for
+#'   the chunk being typed queue behind it. File, byte and match caps bound how
+#'   MUCH is read but not how LONG that takes — a deep tree of small files can
+#'   sit inside every count cap and still run past the client's timeout, which
+#'   is a hang with extra steps. `max_seconds` bounds the wall clock instead,
+#'   and stopping early sets the same `truncated` flag the count caps set. That
+#'   flag already means "this answer is incomplete" everywhere it is read:
+#'   navigation says the scan stopped at its limit, and folder rename REFUSES
+#'   (lib/refactor.js), so a partial scan can never produce a partial rename.
+#'
 #' @param root Directory to scan.
-#' @param max_files,max_depth,max_bytes Caps.
+#' @param max_files,max_depth,max_bytes,max_seconds Caps.
 #' @return list(files, symbols, truncated).
 workspace_symbols <- function(root, max_files = 300L, max_depth = 4L,
-                              max_bytes = 512000L) {
+                              max_bytes = 512000L,
+                              max_seconds = ANALYZE_BUDGET) {
   if (is.null(root) || !nzchar(root) || !dir.exists(root)) {
     return(list(files = 0L, symbols = list(), truncated = FALSE,
                 error = "no such directory"))
   }
+  # Wall clock, not the system clock: `proc.time()[["elapsed"]]` counts seconds
+  # since this R session started, so an NTP step or a DST change mid-scan cannot
+  # move the deadline. Read once here and compared, never re-based.
+  deadline <- proc.time()[["elapsed"]] + max_seconds
+  # `>=`, not `>`: elapsed never decreases, so a budget of 0 is already spent
+  # the instant it is set. That makes "scan nothing and say so" an exactly
+  # reachable state instead of one that depends on the clock's resolution.
+  over_budget <- function() proc.time()[["elapsed"]] >= deadline
   base <- normalizePath(root, winslash = "/", mustWork = TRUE)
   # Directories nobody wants indexed. Named rather than pattern-matched, so
   # adding one is a decision someone can read.
@@ -419,11 +467,11 @@ workspace_symbols <- function(root, max_files = 300L, max_depth = 4L,
 
   files <- character(0)
   walk <- function(dir, depth) {
-    if (depth > max_depth || length(files) >= max_files) return(invisible(NULL))
+    if (depth > max_depth || length(files) >= max_files || over_budget()) return(invisible(NULL))
     entries <- tryCatch(list.files(dir, all.files = FALSE, full.names = TRUE,
                                    no.. = TRUE), error = function(e) character(0))
     for (e in entries) {
-      if (length(files) >= max_files) return(invisible(NULL))
+      if (length(files) >= max_files || over_budget()) return(invisible(NULL))
       if (dir.exists(e)) {
         if (basename(e) %in% skip) next
         walk(e, depth + 1L)
@@ -434,10 +482,13 @@ workspace_symbols <- function(root, max_files = 300L, max_depth = 4L,
     invisible(NULL)
   }
   walk(base, 1L)
-  truncated <- length(files) >= max_files
+  truncated <- length(files) >= max_files || over_budget()
 
   out <- list()
   for (f in files) {
+    # Parsing dominates: one over-budget check per FILE, not per token, keeps
+    # the check itself off the hot path while still bounding the loop.
+    if (over_budget()) { truncated <- TRUE; break }
     size <- tryCatch(file.info(f)$size, error = function(e) NA_real_)
     if (is.na(size) || size > max_bytes) next
     raw <- tryCatch(readBin(f, "raw", n = size), error = function(e) NULL)
@@ -464,7 +515,8 @@ workspace_symbols <- function(root, max_files = 300L, max_depth = 4L,
 #' changed after this scan is refused before any write begins.
 workspace_references <- function(root, name, max_files = 300L, max_depth = 4L,
                                  max_bytes = 512000L, max_matches = 50L,
-                                 max_reply_bytes = 4194304L) {
+                                 max_reply_bytes = 4194304L,
+                                 max_seconds = ANALYZE_BUDGET) {
   if (is.null(root) || !nzchar(root) || !dir.exists(root)) {
     return(list(files = 0L, documents = list(), truncated = FALSE,
                 error = "no such directory"))
@@ -472,16 +524,24 @@ workspace_references <- function(root, name, max_files = 300L, max_depth = 4L,
   want <- if (is.null(name)) "" else as.character(name)[[1L]]
   if (!nzchar(want)) return(list(files = 0L, documents = list(), truncated = FALSE,
                                  error = "name is required"))
+  # Wall clock, not the system clock: `proc.time()[["elapsed"]]` counts seconds
+  # since this R session started, so an NTP step or a DST change mid-scan cannot
+  # move the deadline. Read once here and compared, never re-based.
+  deadline <- proc.time()[["elapsed"]] + max_seconds
+  # `>=`, not `>`: elapsed never decreases, so a budget of 0 is already spent
+  # the instant it is set. That makes "scan nothing and say so" an exactly
+  # reachable state instead of one that depends on the clock's resolution.
+  over_budget <- function() proc.time()[["elapsed"]] >= deadline
   base <- normalizePath(root, winslash = "/", mustWork = TRUE)
   skip <- c(".git", ".Rproj.user", "node_modules", "renv", "packrat",
             ".venv", "__pycache__", ".quarto", "_site", "dist")
   files <- character(0)
   walk <- function(dir, depth) {
-    if (depth > max_depth || length(files) >= max_files) return(invisible(NULL))
+    if (depth > max_depth || length(files) >= max_files || over_budget()) return(invisible(NULL))
     entries <- tryCatch(list.files(dir, all.files = FALSE, full.names = TRUE,
                                    no.. = TRUE), error = function(e) character(0))
     for (e in entries) {
-      if (length(files) >= max_files) return(invisible(NULL))
+      if (length(files) >= max_files || over_budget()) return(invisible(NULL))
       if (dir.exists(e)) {
         if (basename(e) %in% skip) next
         walk(e, depth + 1L)
@@ -490,16 +550,23 @@ workspace_references <- function(root, name, max_files = 300L, max_depth = 4L,
     invisible(NULL)
   }
   walk(base, 1L)
-  truncated <- length(files) >= max_files
+  truncated <- length(files) >= max_files || over_budget()
   bytes <- 0L
   documents <- list()
   for (f in files) {
+    if (over_budget()) { truncated <- TRUE; break }
     size <- tryCatch(file.info(f)$size, error = function(e) NA_real_)
     if (is.na(size) || size > max_bytes) next
     raw <- tryCatch(readBin(f, "raw", n = size), error = function(e) NULL)
     txt <- if (is.null(raw) || any(raw == as.raw(0L))) NULL else
       tryCatch(rawToChar(raw), error = function(e) NULL)
     if (is.null(txt)) next
+    # Reject before parsing. `references()` walks getParseData() for the whole
+    # file, so without this every `.R` under the root was parsed and walked on
+    # every lookup. A parsed reference to `want` requires the name to appear
+    # literally in the source, so a file not containing the substring cannot
+    # contain the symbol and skipping it changes no result.
+    if (!grepl(want, txt, fixed = TRUE)) next
     exprs <- tryCatch(parse(text = txt, keep.source = TRUE),
                       error = function(e) NULL,
                       warning = function(w) invokeRestart("muffleWarning"))

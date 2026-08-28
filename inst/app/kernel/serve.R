@@ -17,6 +17,7 @@ suppressPackageStartupMessages({
 here <- dirname(normalizePath(sub("^--file=", "",
   grep("^--file=", commandArgs(FALSE), value = TRUE)[1])))
 source(file.path(here, "kernel.R"))
+source(file.path(here, "notebook-page.R"))
 
 # Before anything reads or writes a frame. The supervisor parses every browser
 # message and re-encodes every worker reply, so its own character locale
@@ -179,23 +180,11 @@ sockets$boot_at <- Sys.time()
 #'
 #' @return Path to an HTML file.
 notebook_page <- function() {
-  # ALL locations pooled, best VERSION wins — updaters drop new files in a
-  # dist/ (the app bundle's, or CARMAR_DIST: the per-user dir carmar::run()
-  # announces) while the bundle carries its own, and character sort is wrong
-  # for versions twice over (V0.9 > V0.12, V0.13 > V1.0). numeric_version
-  # knows. Request-time on purpose: a file downloaded while the kernel runs
-  # is served on the very next reload.
-  user_dist <- Sys.getenv("CARMAR_DIST", "")
-  dirs <- c(if (nzchar(user_dist)) user_dist,
-            file.path(here, "..", "dist"), file.path(here, ".."))
-  built <- unlist(lapply(dirs, function(d)
-    list.files(d, pattern = "^carmar_V.*[^n]\\.html$", full.names = TRUE)))
-  if (length(built) > 0L) {
-    v <- tryCatch(numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", basename(built))),
-                  error = function(e) NULL)
-    if (!is.null(v)) return(built[order(v, decreasing = TRUE)][1L])
-    return(sort(built, decreasing = TRUE)[1L])       # unparseable name: old rule
-  }
+  # One implementation, in notebook-page.R, because tools/app/launch.sh has to
+  # ask the same question at open time — the announcement below is computed
+  # once at startup and goes stale the moment a new build lands.
+  page <- carmar_notebook_page(here)
+  if (nzchar(page)) return(page)
   file.path(here, "index.html")
 }
 
@@ -276,6 +265,68 @@ if (published_origin_valid(initial_published_origin)) {
 # once. Only the native launcher's environment can set this — no browser
 # input reaches it, so the trust model is unchanged: the page still reads the
 # file through the worker's ordinary readfile rules.
+# A page opened from disk sends `Origin: null` — the literal four-character
+# string, not an absent header. It is not a web origin and never becomes one,
+# so it is spelled once here and approved through the SAME consent path as a
+# published site rather than getting a second, parallel one.
+#
+# Until 0.60.88 it was allowed unconditionally, and that was the whole of
+# issue #14: /health grants `Access-Control-Allow-Origin: *` on purpose so a
+# saved notebook can find its kernel, and lib/kernel-ref.js walks 4747..65535
+# looking for one. Any HTML file the user opened could therefore sweep for a
+# kernel and send `exec` — the same shape as the Chrome extension deleted in
+# 0.38.0 ("no token and no page identity"), which is documented there as
+# unacceptable. A file page cannot hold a secret CarmaR never gave it, and
+# CarmaR never sees it open (CarmaR.app claims .qmd/.Rmd/.R/... but not
+# .html, so a double-clicked notebook goes straight to the browser). What is
+# left is to ASK — once per session, on a local page that names what is
+# asking. Absent Origin (native same-user clients) is deliberately unchanged:
+# that process could run Rscript itself.
+#' Bytes no caller can predict.
+#'
+#' `sample()` draws from the Mersenne Twister, which is seeded from the clock
+#' and the pid and is trivially reconstructible — fine for shuffling a vector,
+#' not for a value that decides whether a page may run R. /dev/urandom is the
+#' OS CSPRNG on every platform CarmaR ships a kernel for except Windows, where
+#' the RNG fallback is documented rather than hidden.
+secure_token <- function(n = 32L) {
+  alphabet <- c(letters, LETTERS, 0:9)
+  con <- tryCatch(file("/dev/urandom", "rb"), error = function(e) NULL,
+                  warning = function(w) NULL)
+  if (!is.null(con)) {
+    on.exit(close(con), add = TRUE)
+    bytes <- tryCatch(readBin(con, "integer", n = n, size = 1L, signed = FALSE),
+                      error = function(e) integer(0))
+    if (length(bytes) == n) {
+      return(paste(alphabet[(bytes %% length(alphabet)) + 1L], collapse = ""))
+    }
+  }
+  # Windows, or an unreadable /dev/urandom. Weaker, and said so out loud.
+  paste(sample(alphabet, n, replace = TRUE), collapse = "")
+}
+
+FILE_ORIGIN <- "null"
+
+# The capability that lets the notebook this kernel POINTED AT skip the
+# consent click, while a file page that merely found the port cannot.
+#
+# serve.R prints the exact file:// URL it expects to be opened, and that URL
+# is the one channel CarmaR controls: it already carries `#kernel=<port>`, so
+# it can carry a secret too. The page reads it out of its own fragment and
+# presents it on the WebSocket URL. A drive-by html file probing 4747..65535
+# can reach /health and learn a kernel is there, but it was never handed this,
+# and it is not in anything /health discloses.
+#
+# It is NOT a general kernel token: an absent Origin (native same-user
+# clients) is unaffected, and the served http page still proves itself by
+# being same-origin. It exists for exactly one case — "is this the file I told
+# you to open, or a file that went looking?"
+#
+# Fragments do not survive a Finder double-click (macOS `open` strips them),
+# which is precisely why the /pair consent click remains: this is the quiet
+# path, not the only one.
+FILE_LAUNCH_CAP <- secure_token(32L)
+
 open_file_env <- Sys.getenv("CARMAR_OPEN_FILE", "")
 sockets$pending_open <- if (nzchar(open_file_env)) open_file_env else NULL
 if (!is.null(sockets$pending_open)) audit("open-file-parked")
@@ -292,10 +343,7 @@ html_escape <- function(x) {
 # open /pair, but X-Frame-Options keeps it out of an iframe and same-origin
 # policy keeps it from learning this value; therefore it cannot manufacture
 # the approval navigation without the reader pressing the local button.
-pairing_challenge <- function() {
-  alphabet <- c(letters, LETTERS, 0:9)
-  paste(sample(alphabet, 48L, replace = TRUE), collapse = "")
-}
+pairing_challenge <- function() secure_token(48L)
 
 prune_pairing_requests <- function(now = as.numeric(Sys.time())) {
   for (key in ls(sockets$pairing_requests, all.names = TRUE)) {
@@ -309,6 +357,7 @@ prune_pairing_requests <- function(now = as.numeric(Sys.time())) {
 
 pairing_page <- function(origin, nonce = "") {
   prune_pairing_requests()
+  is_file <- identical(origin, FILE_ORIGIN)
   challenge <- pairing_challenge()
   sockets$pairing_requests[[challenge]] <- list(
     origin = origin, nonce = substr(nonce, 1L, 200L), created = as.numeric(Sys.time()))
@@ -316,15 +365,25 @@ pairing_page <- function(origin, nonce = "") {
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; ',
     "style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'\">",
-    '<title>Allow this book to use CarmaR?</title><style>',
+    '<title>', if (is_file) 'Allow this notebook file to use CarmaR?'
+               else 'Allow this book to use CarmaR?', '</title><style>',
     'body{font:16px/1.5 system-ui,sans-serif;max-width:42rem;margin:10vh auto;padding:0 1.25rem;color:#172033}',
     '.site{padding:.75rem 1rem;background:#f3f6fb;border-radius:.55rem;overflow-wrap:anywhere}',
     'button{border:0;border-radius:.5rem;background:#2357d9;color:white;padding:.7rem 1rem;font:inherit;font-weight:650;cursor:pointer}',
     'small{color:#59657a}</style></head><body>',
-    '<h1>Run this book with your R?</h1><p>The published site</p><p class="site"><strong>',
-    html_escape(origin), '</strong></p>',
-    '<p>wants to send R chunks to this CarmaR session on your computer. ',
-    'The code will run as your user and can access your files and network.</p>',
+    if (is_file)
+      paste0('<h1>Run this notebook file with your R?</h1>',
+        '<p>A notebook opened from a file on this computer</p>',
+        '<p class="site"><strong>a page opened from disk (file://)</strong></p>',
+        '<p>wants to use this CarmaR session. The code will run as your user ',
+        'and can access your files and network. A page opened from a file ',
+        'cannot be identified any more exactly than this, so approve it only ',
+        'if you just opened a notebook of your own.</p>')
+    else
+      paste0('<h1>Run this book with your R?</h1><p>The published site</p>',
+        '<p class="site"><strong>', html_escape(origin), '</strong></p>',
+        '<p>wants to send R chunks to this CarmaR session on your computer. ',
+        'The code will run as your user and can access your files and network.</p>'),
     '<form method="get" action="/pair/approve"><input type="hidden" name="challenge" value="',
     challenge, '"><button type="submit">Allow for this session</button></form>',
     '<p><small>Nothing runs until you press a chunk\'s Run button. ',
@@ -495,6 +554,61 @@ start_sibling_session <- function() {
   NULL
 }
 
+# ── the AI key lives HERE, not in the browser ────────────────────────────────
+#
+# It used to sit in localStorage under `carmar-ai-key-kept`: in the browser's
+# storage for this origin, readable by anything that can run script in the page,
+# and one careless export away from being inside a notebook file. A provider key
+# is not notebook content — it is a machine credential — so it belongs where the
+# machine's other state lives: the user's own R config directory, 0600.
+#
+# THE SUPERVISOR ANSWERS THIS ITSELF. It never reaches worker.R (which evaluates
+# user code) or analyze.R, and a declared MCP agent is refused it outright,
+# alongside exec — an agent may run chunks, it may not read your credentials.
+# Ops a declared MCP agent is refused outright. Raw evaluation (it must go
+# through a visible chunk_run) and the user's credentials.
+AGENT_REFUSED <- c("exec", "interrupt", "restart", "debug_cmd", "ai-key")
+
+ai_key_path <- function() {
+  dir <- tools::R_user_dir("carmar", "config")
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+  file.path(dir, "ai-key")
+}
+
+ai_key_read <- function() {
+  path <- ai_key_path()
+  if (!file.exists(path)) return("")
+  lines <- tryCatch(readLines(path, warn = FALSE), error = function(e) character())
+  if (!length(lines)) "" else trimws(lines[[1]])
+}
+
+ai_key_write <- function(value) {
+  path <- ai_key_path()
+  if (!nzchar(value)) {
+    # unlink() REPORTS failure in its return value rather than raising, so an
+    # unwritable config directory used to answer {ok:true} while the key sat
+    # there. "Forget the key" reporting success over a key that is still on
+    # disk is the one lie this function must not tell.
+    if (!file.exists(path)) return(TRUE)
+    return(identical(unlink(path), 0L) && !file.exists(path))
+  }
+  # Lock the file down BEFORE the secret goes into it. Creating it with the key
+  # already inside leaves a window where it is world-readable, and a key that
+  # was briefly readable has already leaked.
+  if (!file.exists(path) && !file.create(path)) return(FALSE)
+  # The chmod runs BEFORE the secret exists in the file, and its result is
+  # checked: Sys.chmod returns FALSE rather than raising, so on a filesystem
+  # that allows writing but not mode changes the key would otherwise have been
+  # written world-readable under a promise of 0600. Refuse instead.
+  if (!isTRUE(Sys.chmod(path, "0600"))) {
+    unlink(path)
+    return(FALSE)
+  }
+  ok <- tryCatch({ writeLines(value, path); TRUE }, error = function(e) FALSE)
+  if (!ok) unlink(path)
+  ok
+}
+
 FORWARDED <- c("env", "obj", "struct", "view", "colstats", "rm", "packages",
                "package_action", "package_help", "help", "wd",
                "parse", "complete", "files", "import", "readfile", "writefile", "writefiles_atomic",
@@ -578,10 +692,20 @@ app <- list(
     # WebSockets are exempt from the same-origin policy: without this, any site
     # the user happens to visit could open a socket here and run R.
     origin <- req$HTTP_ORIGIN
-    published_ok <- !is.null(origin) &&
+    # `approved` covers both consent cases, because they ARE one case: an
+    # exact string the user approved this session. FILE_ORIGIN is in the same
+    # store rather than a flag of its own, so "who may open a socket?" has one
+    # answer to read and one place to revoke.
+    approved <- !is.null(origin) &&
       exists(origin, sockets$published_approvals, inherits = FALSE)
+    # A file page may also present the capability from the URL this kernel
+    # printed. Compared with a constant-time-ish identical() on two strings of
+    # equal length; the value never appears in a response, only in the URL the
+    # launcher opened.
+    launched <- identical(origin, FILE_ORIGIN) &&
+      identical(query_param(req$QUERY_STRING, "pair"), FILE_LAUNCH_CAP)
     if (!is.null(origin) && !identical(origin, origin_ok) &&
-        !identical(origin, "null") && !published_ok) {
+        !approved && !launched) {
       return(reject("bad origin", origin))
     }
     if (length(sockets$open) >= MAX_SOCKETS) return(reject("too many connections"))
@@ -628,7 +752,12 @@ app <- list(
     if (identical(req$PATH_INFO, "/pair")) {
       origin <- query_param(req$QUERY_STRING, "origin")
       nonce <- query_param(req$QUERY_STRING, "nonce")
-      if (!published_origin_valid(origin)) {
+      # FILE_ORIGIN is accepted HERE and only here. `published_origin_valid()`
+      # stays strict (`^https?://…`) because it also guards
+      # /published/authorize and the CARMAR_PUBLISHED_ORIGIN seed — widening it
+      # would let an environment variable or a native launch silently
+      # pre-approve every file on disk, which is the opposite of the point.
+      if (!identical(origin, FILE_ORIGIN) && !published_origin_valid(origin)) {
         audit("pair-rejected", detail = origin)
         return(resp(400L, "text/plain", "A valid http(s) publishing origin is required."))
       }
@@ -1603,13 +1732,19 @@ handle_frame <- function(message, rec) {
     return(invisible(NULL))
   }
 
-  if (cmd$type %in% c("exec", "interrupt", "restart", "debug_cmd") &&
-      identical(rec$role, "mcp")) {
+  # WHAT A DECLARED AGENT MAY NEVER DO — one list, so an auditor reading it
+  # gets the whole answer. `ai-key` belongs here and not in its own handler
+  # below: a second, differently-shaped refusal would make this set look
+  # complete when it was not.
+  if (cmd$type %in% AGENT_REFUSED && identical(rec$role, "mcp")) {
     audit("mcp-refused", reason = paste("agent asked for", cmd$type))
     if (scalar_chr(cmd$id)) {
-      reply <- toJSON(list(type = cmd$type, id = cmd$id,
-        error = "Agents run code through notebook chunks (chunk_run), not raw exec."),
-        auto_unbox = TRUE)
+      why <- if (identical(cmd$type, "ai-key")) {
+        "Agents cannot read or write the stored key."
+      } else {
+        "Agents run code through notebook chunks (chunk_run), not raw exec."
+      }
+      reply <- toJSON(list(type = cmd$type, id = cmd$id, error = why), auto_unbox = TRUE)
       try(rec$ws$send(reply), silent = TRUE)
     }
     return(invisible(NULL))
@@ -1747,6 +1882,29 @@ handle_frame <- function(message, rec) {
     reply(port = started$port, url = started$url)
     return(invisible(NULL))
   }
+  # The key: get / set / clear, answered by the supervisor and by nobody else.
+  if (identical(cmd$type, "ai-key")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    reply <- function(...) try(rec$ws$send(toJSON(list(type = "ai-key", id = cmd$id, ...),
+                                                  auto_unbox = TRUE, null = "null")), silent = TRUE)
+    action <- if (scalar_chr(cmd$action)) cmd$action else "get"
+    if (identical(action, "get")) {
+      audit("ai-key", detail = "get")
+      reply(key = ai_key_read())
+    } else if (action %in% c("set", "clear")) {
+      # One branch: ai_key_write("") already deletes the file, so "clear" is
+      # "set to nothing" and does not need a second tryCatch/audit pair to keep
+      # in step with this one.
+      value <- if (identical(action, "set") && scalar_chr(cmd$key)) cmd$key else ""
+      ok <- tryCatch(ai_key_write(value), error = function(e) FALSE)
+      audit("ai-key", detail = if (nzchar(value)) "set" else "clear")
+      reply(ok = isTRUE(ok))
+    } else {
+      reply(error = "ai-key: action must be get, set or clear.")
+    }
+    return(invisible(NULL))
+  }
+
   if (cmd$type %in% ANALYZE_FORWARDED) {
     if (!scalar_chr(cmd$id)) return(invisible(NULL))
     audit(cmd$type, id = cmd$id)
@@ -1878,7 +2036,7 @@ url <- paste0(origin_ok, "/")
 # anything to a web server.
 notebook_file <- normalizePath(notebook_page())
 file_url <- paste0("file://", utils::URLencode(notebook_file, reserved = FALSE),
-                   "#kernel=", port)
+                   "#kernel=", port, "&pair=", FILE_LAUNCH_CAP)
 
 #' Discovery for local agents — the Jupyter runtime-dir pattern.
 #'
