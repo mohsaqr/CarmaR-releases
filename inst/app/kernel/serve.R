@@ -18,6 +18,9 @@ here <- dirname(normalizePath(sub("^--file=", "",
   grep("^--file=", commandArgs(FALSE), value = TRUE)[1])))
 source(file.path(here, "kernel.R"))
 source(file.path(here, "notebook-page.R"))
+source(file.path(here, "deployment.R"))
+source(file.path(here, "ai-policy.R"))
+source(file.path(here, "jobs.R"))
 
 # Before anything reads or writes a frame. The supervisor parses every browser
 # message and re-encodes every worker reply, so its own character locale
@@ -29,7 +32,13 @@ source(file.path(here, "notebook-page.R"))
 # unparseable first line at worst.
 invisible(utf8_ctype())
 
-host <- "127.0.0.1"
+# Where to listen. 127.0.0.1 unless an operator says otherwise, and saying
+# otherwise inverts the trust model — see spike/deployment.R, which owns that
+# decision and refuses the unsafe spellings of it outright.
+host <- local({
+  h <- trimws(Sys.getenv("CARMAR_BIND", "127.0.0.1"))
+  if (nzchar(h)) h else "127.0.0.1"
+})
 
 #' A STABLE port, because the browser partitions storage by ORIGIN.
 #'
@@ -48,23 +57,67 @@ host <- "127.0.0.1"
 #' the correct trade against not running at all.
 port_taken <- function(p) {
   con <- suppressWarnings(tryCatch(
-    socketConnection(host, p, open = "r+", blocking = TRUE, timeout = 1),
+    socketConnection("127.0.0.1", p, open = "r+", blocking = TRUE, timeout = 1),
     error = function(e) NULL))
   if (is.null(con)) FALSE else { close(con); TRUE }
 }
+# CARMAR_PORT is a PREFERENCE by default and a PROMISE when asked.
+#
+# Moving to a random port when the wanted one is taken is right for a person
+# double-clicking the app: they get a session instead of an error, and the
+# launcher tells them where it went. It is wrong the moment something else
+# chose the port on the kernel's behalf — under the session broker, the port
+# is already written into a registry record and about to be handed to Caddy
+# as an upstream, so a kernel that quietly moves leaves BOTH pointing at
+# nothing and the reader gets a connection refused with no explanation
+# anywhere in the system. CARMAR_PORT_STRICT=1 turns the silent move into a
+# refusal, which is the only honest answer when the caller cannot be told.
 port <- local({
   wanted <- suppressWarnings(as.integer(Sys.getenv("CARMAR_PORT", "4747")))
   if (is.na(wanted) || wanted < 1024L || wanted > 65535L) wanted <- 4747L
-  if (port_taken(wanted)) httpuv::randomPort() else wanted
+  if (!port_taken(wanted)) return(wanted)
+  if (identical(Sys.getenv("CARMAR_PORT_STRICT", ""), "1")) {
+    message("CarmaR refuses to start: CARMAR_PORT=", wanted, " is already in use ",
+            "and CARMAR_PORT_STRICT=1 forbids moving to another port. Whoever ",
+            "chose this port is expecting to find the kernel on it.")
+    quit(status = 2L, save = "no")
+  }
+  httpuv::randomPort()
 })
 
-origin_ok <- sprintf("http://%s:%d", host, port)
+# The posture: bind, Origin allow-list, Host allow-list, and whether an
+# Origin-less client is a same-user native process or an unauthenticated
+# stranger. Computed once; every gate below reads a decided answer.
+deployment <- carmar_deployment(port)
+
+# The administrator's AI policy, read once. Its errors join the deployment's
+# in the same startup gate and for the same reason: a governance control that
+# silently failed to apply is worse than one that refuses to start, because
+# nobody finds out until the data has already gone to the wrong vendor.
+ai_policy <- carmar_ai_policy()
+
+startup_errors <- c(deployment$errors, ai_policy$errors)
+if (length(startup_errors)) {
+  # Refusing to start is the correct outcome. A server that binds to the
+  # network with the loopback trust model is not a degraded CarmaR, it is a
+  # remote-execution service, and there is no safe way to serve it "for now".
+  for (msg in startup_errors) message("CarmaR refuses to start: ", msg)
+  quit(status = 2L, save = "no")
+}
+
+# The origin this kernel serves its own page from — used to BUILD urls (the
+# launcher's, the MCP bridge's). Whether some other origin may connect is a
+# different question, answered by `deployment$origins`.
+origin_ok <- sprintf("http://%s:%d", if (deployment$loopback) host else "127.0.0.1", port)
+origins_ok <- deployment$origins
 # What a browser may claim to be talking to. Anything else is a DNS-rebinding
 # attempt: the attacker's page keeps its own origin while its hostname is
 # re-pointed at 127.0.0.1, and the Host header is the one thing that still
 # names the attacker. Same class as CVE-2025-66414 in the MCP TypeScript SDK.
-hosts_ok <- c(sprintf("127.0.0.1:%d", port), sprintf("localhost:%d", port),
-              sprintf("[::1]:%d", port))
+# Off loopback this list is REQUIRED (deployment.R refuses an empty one),
+# because the proxy's hostname is the only thing distinguishing a real reader
+# from a rebound attacker page.
+hosts_ok <- deployment$hosts
 
 # Optional audit log — one JSON object per line, for deployments that must be
 # able to answer "what did this session do?". Off unless CARMAR_LOG is set,
@@ -103,6 +156,14 @@ sockets$mcp_pending <- new.env(parent = emptyenv())
 # Subscription chats: id → record of one running `claude -p` process, owned by
 # the page socket that asked. See the agent-chat frames in handle_frame.
 sockets$chats <- new.env(parent = emptyenv())
+# Development jobs: id -> record of one `spike/job-run.R` process. Like chats
+# they are supervisor children, and UNLIKE chats they are DETACHED — a job
+# belongs to the kernel, not to the socket that started it, so its output is
+# broadcast to every page and its log is buffered for a page that reconnects.
+# That is Stage 6 item 7 and Stage 5 slice 3 in one field: the same model both
+# asked for, which is why neither was built without the other.
+sockets$jobs <- new.env(parent = emptyenv())
+sockets$job_seq <- 0L
 # Idle linger: a kernel nobody is connected to stops itself, so closing the
 # notebook tab does not strand an R process (and five stranded days do not
 # greet day six with the capacity prompt). The clock starts when the LAST
@@ -158,6 +219,11 @@ sockets$worker_terminal <- NULL
 # only be sent when a browser() is actually reading them — at any other moment
 # they would reach the dispatch loop as junk.
 sockets$debug_paused <- FALSE
+# The same shape one level along: a raw console line answering a readline() may
+# only be sent while a readline() is actually reading it. Set by the worker's
+# input_request frame, cleared by input_done and by the run ending, so an
+# interrupted prompt cannot leave the gate open.
+sockets$input_waiting <- FALSE
 # The analysis plane keeps its own routes and queue: its replies must never be
 # mistaken for the evaluating session's, and a stuck analysis must never block
 # a run (or the reverse).
@@ -466,13 +532,48 @@ host_ok <- function(req) {
 #' stable localhost URL users expect.
 control_rejection <- function(req, allow_file = FALSE) {
   origin <- req$HTTP_ORIGIN %||% ""
-  if (nzchar(origin) && !identical(origin, origin_ok) &&
+  if (nzchar(origin) && !(origin %in% origins_ok) &&
       !(allow_file && identical(origin, "null"))) {
     return(reject("bad origin", origin))
+  }
+  # Off loopback, "no Origin" is not a same-user native client any more — it is
+  # anyone with a socket. Control endpoints (shutdown, authorize, open-file)
+  # are the ones where that difference is expensive, so they close first.
+  if (!nzchar(origin) && !isTRUE(deployment$allow_native)) {
+    return(reject("origin required", "(none)"))
   }
   site <- tolower(req$HTTP_SEC_FETCH_SITE %||% "")
   if (identical(site, "cross-site")) return(reject("cross-site request", site))
   NULL
+}
+
+#' Which of the four accepted classes opened this socket?
+#'
+#' The upgrade gate decides WHETHER a socket may open and then throws its
+#' reasoning away: four different trust cases all end in the same `NULL`. Some
+#' decisions need the reasoning rather than the verdict, because "may this
+#' connection read the user's provider key?" is not the question "may it
+#' connect?".
+#'
+#' httpuv hands onWSOpen the very Rook environment the gate inspected
+#' (WebSocket$initialize stores it as `$request`), so the class is recomputed
+#' from the same header instead of threaded through shared state — one reader,
+#' no second copy to fall out of step.
+#'
+#' It fails CLOSED: no request environment means "unknown", and unknown is
+#' trusted with nothing.
+socket_class <- function(req) {
+  if (is.null(req)) return("unknown")
+  origin <- req$HTTP_ORIGIN
+  # No Origin at all: not a browser. On loopback that is the launcher, R, curl
+  # or the MCP bridge — the same OS user, who could have run Rscript anyway. Off
+  # loopback the same header means an unauthenticated stranger, and the upgrade
+  # gate has already refused it; "unknown" is trusted with nothing either way.
+  if (is.null(origin)) return(if (isTRUE(deployment$allow_native)) "native" else "unknown")
+  if (origin %in% origins_ok) return("served")
+  if (identical(origin, FILE_ORIGIN)) return("file")
+  # Anything else reached a 101 only by being in published_approvals.
+  "published"
 }
 
 # Commands the supervisor is willing to forward. An allow-list, not a
@@ -563,11 +664,84 @@ start_sibling_session <- function() {
 # machine's other state lives: the user's own R config directory, 0600.
 #
 # THE SUPERVISOR ANSWERS THIS ITSELF. It never reaches worker.R (which evaluates
-# user code) or analyze.R, and a declared MCP agent is refused it outright,
-# alongside exec — an agent may run chunks, it may not read your credentials.
-# Ops a declared MCP agent is refused outright. Raw evaluation (it must go
+# user code) or analyze.R.
+#
+# Ops a declared MCP agent is refused outright: raw evaluation (it must go
 # through a visible chunk_run) and the user's credentials.
-AGENT_REFUSED <- c("exec", "interrupt", "restart", "debug_cmd", "ai-key")
+AGENT_REFUSED <- c("exec", "interrupt", "restart", "debug_cmd", "ai-key",
+                   "console_history", "input_reply", "ai-audit-read",
+                   "job_start", "job_stop", "job_open")
+
+# `job_start` is on that list DELIBERATELY, and it is the entry most open to
+# argument. A job is visible — it announces itself, streams into a pane and
+# survives in a list — so the "run it where the user can see it" rule that
+# sends an agent through chunk_run is already satisfied, and "run the test
+# suite" is among the most useful things an agent could ask for.
+#
+# It is refused anyway, for now, because it would be a SECOND evaluation door
+# and the case for opening it is a policy decision, not a consequence of
+# building the mechanism. Reading job state (`job_list`, `job_root`) is not
+# refused: an agent that can see the suite is red is more useful and evaluates
+# nothing.
+
+# ...and WHO may touch the key, which is a different question with a different
+# kind of answer. AGENT_REFUSED asks "did this client DECLARE itself an agent?"
+# — an honour system: rec$role is "page" until the client volunteers mcp-hello,
+# so an agent CLI that simply never declared used to be handed the key. This
+# asks what the upgrade gate already PROVED about the connection, which nothing
+# the client says afterwards can change. Two lists rather than one flagged one,
+# for the same reason FORWARDED and ANALYZE_FORWARDED stay two.
+#
+# Only a notebook page qualifies. A native client is refused even though it
+# could read the 0600 file itself as this user: the point is not that CarmaR
+# can stop it, but that CarmaR does not hand the key over — so the promise
+# holds for every agent instead of only the polite ones. A published site is
+# refused because its reader approved it to RUN THE CHUNKS THEY PRESS, not to
+# collect a credential on the way past.
+PAGE_ONLY_CLASSES <- c("served", "file")
+
+# ── what the page may write into the audit stream ───────────────────────────
+#
+# The AI conversation happens in the BROWSER — a key-based turn is a fetch from
+# the page — so the kernel cannot observe it and the page has to report it. That
+# makes this the one op where the log's content comes from outside, which is a
+# log-injection surface if it is a free-text channel. It is not one:
+#
+#   · `event` must be one of a fixed vocabulary,
+#   · every other field is an ALLOW-LIST of scalars, bounded and stripped of
+#     control characters (a newline in a JSON-lines log is a forged record),
+#   · and the fields that ESTABLISH the record — the timestamp, the pid, which
+#     connection sent it and whether that connection is a page or a declared
+#     agent — are stamped by the supervisor and cannot be supplied at all.
+#
+# An allow-list rather than a deny-list, for the same reason FORWARDED is one:
+# a field added to the page later is absent from the log until someone puts it
+# here on purpose.
+AI_AUDIT_EVENTS <- c("turn", "tool", "insert", "patch", "accept", "reject", "error")
+AI_AUDIT_FIELDS <- c("provider", "model", "lane", "tool", "chunk", "decision",
+                     "kind", "by", "reason", "ms", "input_tokens",
+                     "output_tokens", "prompt_chars", "response_chars", "error")
+
+# The prompt and the response themselves. OFF unless an administrator asks,
+# because a notebook that silently recorded everything its user typed at an AI
+# would be a worse thing to ship than no audit at all — the same judgement
+# CARMAR_LOG itself is off by default for. A compliance deployment turns it on
+# knowingly; a laptop never does.
+AI_AUDIT_TEXT_FIELDS <- c("prompt", "response")
+ai_audit_text <- identical(Sys.getenv("CARMAR_LOG_AI_TEXT", ""), "1")
+
+# How many ai-* records the reviewer export may read back at once.
+AI_AUDIT_READ_MAX <- 5000L
+
+#' One field of an audit record, made safe to write on one line.
+ai_audit_scalar <- function(value, limit) {
+  if (is.null(value) || length(value) != 1L || is.list(value)) return(NULL)
+  if (is.numeric(value) && is.finite(value)) return(value)
+  if (is.logical(value) && !is.na(value)) return(value)
+  if (!is.character(value) || is.na(value)) return(NULL)
+  out <- gsub("[[:cntrl:]]", " ", value)
+  trimws(substr(out, 1L, limit))
+}
 
 ai_key_path <- function() {
   dir <- tools::R_user_dir("carmar", "config")
@@ -607,6 +781,63 @@ ai_key_write <- function(value) {
   ok <- tryCatch({ writeLines(value, path); TRUE }, error = function(e) FALSE)
   if (!ok) unlink(path)
   ok
+}
+
+# ── the console's history, across sessions ───────────────────────────────────
+#
+# RStudio keeps `.Rhistory`; a console whose ↑ forgets everything the moment the
+# tab reloads is a demo, not a tool. It lives beside the key and for the same
+# reason: this is MACHINE state, not notebook content, so it belongs in the R
+# user directory and never in the notebook file, an export, or localStorage —
+# where any local page sharing the file:// origin could read the user's code.
+#
+# Off entirely with CARMAR_NO_HISTORY=1, because "record everything I type"
+# must be refusable.
+HISTORY_MAX <- 2000L
+HISTORY_ENABLED <- !nzchar(Sys.getenv("CARMAR_NO_HISTORY", ""))
+
+history_path <- function() {
+  dir <- tools::R_user_dir("carmar", "data")
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+  file.path(dir, "console-history")
+}
+
+history_read <- function() {
+  if (!HISTORY_ENABLED) return(character())
+  path <- history_path()
+  if (!file.exists(path)) return(character())
+  lines <- tryCatch(readLines(path, warn = FALSE), error = function(e) character())
+  # ONE JSON STRING PER LINE, not raw text. A history entry can be a whole
+  # multi-line function definition, and the file is line-oriented, so the entry
+  # has to survive a newline inside it — hand-rolled backslash escaping got
+  # this wrong in both directions on the first attempt. jsonlite already knows
+  # how; a malformed line is dropped rather than allowed to poison the rest.
+  raw <- lines[nzchar(lines)]
+  if (!length(raw)) return(character())
+  decoded <- vapply(raw, function(x) {
+    v <- tryCatch(fromJSON(x), error = function(e) NA_character_)
+    if (is.character(v) && length(v) == 1L) v else NA_character_
+  }, character(1), USE.NAMES = FALSE)
+  decoded[!is.na(decoded)]
+}
+
+history_add <- function(line) {
+  if (!HISTORY_ENABLED || !nzchar(trimws(line))) return(TRUE)
+  path <- history_path()
+  flat <- as.character(toJSON(line, auto_unbox = TRUE))
+  kept <- tryCatch({
+    prior <- if (file.exists(path)) readLines(path, warn = FALSE) else character()
+    # Consecutive duplicates are noise in a history: pressing ↑ twice should
+    # reach the command BEFORE the one just run, not the same one again.
+    if (length(prior) && identical(prior[[length(prior)]], flat)) prior
+    else c(prior, flat)
+  }, error = function(e) flat)
+  if (length(kept) > HISTORY_MAX) kept <- utils::tail(kept, HISTORY_MAX)
+  # Same order as the key: create, lock, then write. History is a record of
+  # everything the user has typed and is nobody else's business.
+  if (!file.exists(path) && !file.create(path)) return(FALSE)
+  if (!isTRUE(Sys.chmod(path, "0600"))) return(FALSE)
+  tryCatch({ writeLines(kept, path); TRUE }, error = function(e) FALSE)
 }
 
 FORWARDED <- c("env", "obj", "struct", "view", "colstats", "rm", "packages",
@@ -704,7 +935,14 @@ app <- list(
     # launcher opened.
     launched <- identical(origin, FILE_ORIGIN) &&
       identical(query_param(req$QUERY_STRING, "pair"), FILE_LAUNCH_CAP)
-    if (!is.null(origin) && !identical(origin, origin_ok) &&
+    # THE INVERSION, and the whole security change of serving off loopback: an
+    # absent Origin is allowed on 127.0.0.1 because it proves the client is not
+    # a browser and therefore is this same OS user. Bound to the network it
+    # proves nothing at all, so it is refused instead of trusted.
+    if (is.null(origin) && !isTRUE(deployment$allow_native)) {
+      return(reject("origin required", "(none)"))
+    }
+    if (!is.null(origin) && !(origin %in% origins_ok) &&
         !approved && !launched) {
       return(reject("bad origin", origin))
     }
@@ -867,6 +1105,15 @@ app <- list(
     rec$ws <- ws
     rec$role <- "page"
     rec$name <- ""
+    # What the upgrade gate proved, kept. Read once here rather than per frame:
+    # the Rook environment belongs to the request that opened this socket and
+    # cannot change under it.
+    rec$class <- socket_class(ws$request)
+    # Who the reverse proxy says this is. "" on loopback, always — CarmaR has
+    # no login of its own and must not grow one here: a header is an identity
+    # only for as long as nobody but the proxy can reach the port, which is a
+    # property of the deployment, not of this process.
+    rec$user <- proxy_user(ws$request, deployment)
     # Liveness: `last_seen` is stamped by every frame this socket sends, and
     # `beats` records that it speaks the heartbeat at all. Both are read only
     # by reap_dead_sockets().
@@ -874,7 +1121,8 @@ app <- list(
     rec$beats <- FALSE
     sockets$open <- c(sockets$open, rec)
     sockets$ever_connected <- TRUE
-    audit("socket-open", sockets = length(sockets$open))
+    audit("socket-open", sockets = length(sockets$open), class = rec$class,
+          user = rec$user)
     if (!is.null(sockets$hello)) try(ws$send(sockets$hello), silent = TRUE)
     # Replay the agent roster too — same lesson as the ready frame: a page
     # opened AFTER an agent connected must still learn the agent is there,
@@ -994,6 +1242,16 @@ chat_start <- function(rec, cmd) {
   id <- cmd$id
   client <- chat_client(cmd)
   label <- chat_cli_label(client)
+  # THE OTHER DOOR THE SUPERVISOR OWNS, and the one with no page-side bypass
+  # at all: a Claude Code / Codex turn is a process THIS process spawns. If the
+  # policy does not name the provider, it is never spawned — there is nothing
+  # in the browser to work around, because the spawn was never there.
+  if (!ai_provider_allowed(client, ai_policy)) {
+    audit("agent-chat-refused", client = client, reason = "policy")
+    chat_send(rec, id, done = TRUE, code = -1L,
+      error = sprintf("%s is not permitted here. %s", label, ai_policy_reason(ai_policy)))
+    return(invisible(NULL))
+  }
   bin <- if (identical(client, "codex")) codex_bin() else claude_bin()
   if (!nzchar(bin)) {
     chat_send(rec, id, done = TRUE, code = -1L,
@@ -1119,6 +1377,256 @@ pump_chats <- function() {
       rm(list = id, envir = sockets$chats)
     }
   }
+  invisible(NULL)
+}
+
+# ── the jobs plane ──────────────────────────────────────────────────────────
+#
+# A development task (test / check / document / load / build / install) runs
+# in its OWN R process, spawned here. Three properties, each of which is the
+# reason a stage doc asked for this:
+#
+#   * It never consumes the interactive worker. `devtools::check()` takes
+#     minutes and evaluates the package's own tests; doing that in the session
+#     would take the user's variables with it and make Stop a lie for the
+#     duration. (Stage 5 slice 3.)
+#   * It is DETACHED: the job belongs to the kernel, not to the socket that
+#     started it. Its output is broadcast to every page, its log is buffered
+#     so a page that reloads mid-check catches up, and it keeps the kernel
+#     alive past the idle linger. (Stage 6 item 7.)
+#   * It carries no session identity. Nothing it does can be mistaken for the
+#     notebook's state, which is what makes it safe for a third child process
+#     to evaluate at all — see the header of spike/job-run.R.
+#
+# Reuses kernel_start/kernel_poll rather than a second spawn path, so a job
+# inherits the UTF-8 child locale, the scrubbed R_HOME/R_LIBS environment and
+# the bounded pipe drain that keep the event loop responsive.
+
+# How much of a job's output is kept for a page that reconnects. A `check`
+# prints a few thousand lines; this holds a whole one and truncates the
+# pathological case rather than letting one job's log grow without limit in a
+# supervisor that must stay responsive.
+JOB_LOG_MAX <- 5000L
+# Finished jobs stay in the list so their log can still be read. Beyond this
+# the oldest are dropped.
+JOB_HISTORY_MAX <- 20L
+# Concurrent jobs. R package tasks are CPU- and disk-heavy; four at once is
+# already more than any machine enjoys, and an unbounded count is a way to
+# fork-bomb a laptop by holding down a button.
+MAX_JOBS <- 4L
+
+#' Send one frame to every notebook page.
+#'
+#' Broadcast, not addressed, because a job is detached: the page that pressed
+#' Test may be gone, and the page that is here now is the one that needs to
+#' see the result.
+#' @param text A JSON frame, already encoded.
+#' @return Invisibly NULL.
+job_broadcast <- function(text) {
+  lapply(page_recs(), function(r) try(r$ws$send(text), silent = TRUE))
+  invisible(NULL)
+}
+
+#' Build and broadcast a supervisor-authored job frame.
+#' @param id Job id.
+#' @param ... Fields of the frame.
+#' @return Invisibly NULL.
+job_emit <- function(id, ...) {
+  job_broadcast(toJSON(list(type = "job", id = id, ...),
+                       auto_unbox = TRUE, null = "null"))
+}
+
+#' Append output to a job's buffer, bounded.
+#' @param job A job record.
+#' @param text One or more lines.
+#' @return Invisibly NULL.
+job_log <- function(job, text) {
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1L]]
+  if (!length(lines)) return(invisible(NULL))
+  job$log <- c(job$log, lines)
+  if (length(job$log) > JOB_LOG_MAX) {
+    dropped <- length(job$log) - JOB_LOG_MAX
+    job$dropped <- job$dropped + dropped
+    job$log <- utils::tail(job$log, JOB_LOG_MAX)
+  }
+  invisible(NULL)
+}
+
+#' What a page needs to render one job in a list.
+#' @param job A job record.
+#' @param with_log Include the buffered log.
+#' @return A list.
+job_snapshot <- function(job, with_log = FALSE) {
+  out <- list(id = job$id, task = job$task, root = job$root,
+              target = job$target, output = job$output, title = job$title,
+              state = job$state, ok = job$ok, error = job$error,
+              started = job$started, elapsed = job$elapsed,
+              counts = job$counts, rows = I(job$rows),
+              truncated = job$truncated, dropped = job$dropped)
+  if (with_log) out$log <- I(as.list(job$log))
+  out
+}
+
+#' Start one development task.
+#' @param rec The page socket that asked.
+#' @param cmd The parsed frame.
+#' @return Invisibly NULL.
+job_start <- function(rec, cmd) {
+  running <- Filter(function(j) identical(j$state, "running"),
+                    mget(ls(sockets$jobs), envir = sockets$jobs))
+  if (length(running) >= MAX_JOBS) {
+    job_emit("", event = "refused",
+             error = sprintf("%d jobs are already running. Wait for one to finish, or stop it.",
+                             length(running)))
+    return(invisible(NULL))
+  }
+  # The pure decision, made in one place so the UI's message and the
+  # supervisor's behaviour cannot disagree.
+  # `target` is the one thing the task acts on — a package root, or a document
+  # for `render`. jobs.R decides which of those it must be; the supervisor
+  # does not guess, and does not build a command out of any of it.
+  spec <- job_spec(cmd$task %||% "", cmd$target %||% "",
+                   list(filter = cmd$filter %||% "", format = cmd$format %||% ""))
+  if (!isTRUE(spec$ok)) {
+    audit("job-refused", detail = spec$error)
+    job_emit("", event = "refused", error = spec$error)
+    return(invisible(NULL))
+  }
+  sockets$job_seq <- sockets$job_seq + 1L
+  id <- paste0("job-", sockets$job_seq)
+  started <- tryCatch(
+    kernel_start(file.path(here, "job-run.R"),
+                 env_extra = c(spec$env, CARMAR_JOB_ID = id)),
+    error = function(e) conditionMessage(e))
+  if (is.character(started)) {
+    audit("job-start-failed", detail = started)
+    job_emit(id, event = "refused",
+             error = paste("the job process could not start:", started))
+    return(invisible(NULL))
+  }
+  job <- new.env(parent = emptyenv())
+  job$id <- id
+  job$k <- started
+  job$task <- spec$task
+  job$root <- spec$root
+  job$target <- spec$target
+  job$output <- NA_character_
+  job$title <- job_title(spec)
+  job$state <- "running"
+  job$ok <- NA
+  job$error <- ""
+  job$started <- as.numeric(Sys.time())
+  job$elapsed <- NA_real_
+  job$log <- character(0)
+  job$dropped <- 0L
+  job$rows <- list()
+  job$renderer <- ""
+  job$counts <- NULL
+  job$truncated <- 0L
+  sockets$jobs[[id]] <- job
+  audit("job-start", id = id, detail = spec$task)
+  # Announced before it runs, in the words of the thing that will happen —
+  # the same rule Stage 6's describePlan follows.
+  job_emit(id, event = "accepted", task = spec$task, root = spec$root,
+           target = spec$target, title = job$title, started = job$started)
+  invisible(NULL)
+}
+
+#' Stop a running job. Any page may stop any job: a job is the kernel's, not
+#' a socket's, so the page that can see it is the page that can stop it.
+#' @param id Job id.
+#' @return Invisibly NULL.
+job_stop <- function(id) {
+  job <- sockets$jobs[[id]]
+  if (is.null(job) || !identical(job$state, "running")) return(invisible(NULL))
+  # No graceful shutdown protocol: job-run.R never reads stdin, so kernel_stop's
+  # shutdown frame would go unread and only its kill would land. Kill directly.
+  try(job$k$proc$kill(), silent = TRUE)
+  job$state <- "stopped"
+  job$ok <- FALSE
+  job$error <- "stopped"
+  job$elapsed <- round(as.numeric(Sys.time()) - job$started, 2)
+  audit("job-stop", id = id)
+  job_emit(id, event = "done", ok = FALSE, stopped = TRUE,
+           error = "stopped", elapsed = job$elapsed)
+  invisible(NULL)
+}
+
+#' Drop finished jobs beyond the history cap, oldest first.
+#' @return Invisibly NULL.
+prune_jobs <- function() {
+  jobs <- mget(ls(sockets$jobs), envir = sockets$jobs)
+  finished <- Filter(function(j) !identical(j$state, "running"), jobs)
+  if (length(finished) <= JOB_HISTORY_MAX) return(invisible(NULL))
+  order_by <- order(vapply(finished, function(j) j$started, numeric(1)))
+  drop <- names(finished)[order_by][seq_len(length(finished) - JOB_HISTORY_MAX)]
+  rm(list = drop, envir = sockets$jobs)
+  invisible(NULL)
+}
+
+#' Is any job still running? The idle linger must not stop a kernel that is
+#' three minutes into a check nobody is watching — that is precisely the case
+#' a detached job exists for.
+#' @return TRUE when at least one job is running.
+jobs_running <- function() {
+  any(vapply(mget(ls(sockets$jobs), envir = sockets$jobs),
+             function(j) identical(j$state, "running"), logical(1)))
+}
+
+#' Drain every running job: stream its output, keep it, and close it out.
+#' @return Invisibly NULL.
+pump_jobs <- function() {
+  for (id in ls(sockets$jobs)) {
+    job <- sockets$jobs[[id]]
+    if (!identical(job$state, "running")) next
+    for (e in kernel_poll(job$k, 0L)) {
+      if (identical(e$type, "stdout") || identical(e$type, "stderr")) {
+        text <- e$text %||% ""
+        job_log(job, text)
+        job_emit(id, event = "log", stream = e$type, text = text)
+        next
+      }
+      if (!identical(e$type, "job")) next
+      event <- e$event %||% ""
+      if (identical(event, "started")) job$pid <- e$pid
+      if (identical(event, "output")) {
+        # Kept so a page that connects after the render still learns where the
+        # file went — and so `job_open` has a path of its OWN to trust.
+        job$output <- if (scalar_chr(e$path)) e$path else NA_character_
+        job$renderer <- e$renderer %||% ""
+      }
+      if (identical(event, "tests")) {
+        # Kept for a page that connects after the run, and forwarded now.
+        job$rows <- e$rows
+        job$counts <- e$counts
+        job$truncated <- e$truncated %||% 0L
+      }
+      if (identical(event, "done")) {
+        job$state <- "done"
+        job$ok <- isTRUE(e$ok)
+        job$error <- e$error %||% ""
+        job$elapsed <- e$elapsed %||% NA_real_
+      }
+      # The child stamps its own id, so this is byte-faithful: no re-encode,
+      # no four-digit rounding, no `{}` where the child wrote null.
+      job_broadcast(relay_frame(e))
+    }
+    if (identical(job$state, "running") && !job$k$proc$is_alive()) {
+      # Died without a `done`. Never silent: an empty log and a crashed job
+      # look identical on screen and mean opposite things.
+      code <- as.integer(tryCatch(job$k$proc$get_exit_status(),
+                                  error = function(e) NA_integer_) %||% NA_integer_)
+      job$state <- "done"
+      job$ok <- FALSE
+      job$error <- sprintf("the job process stopped unexpectedly (exit %s)",
+                           if (is.na(code)) "unknown" else code)
+      job$elapsed <- round(as.numeric(Sys.time()) - job$started, 2)
+      audit("job-died", id = id, detail = as.character(code))
+      job_emit(id, event = "done", ok = FALSE, error = job$error,
+               elapsed = job$elapsed)
+    }
+  }
+  prune_jobs()
   invisible(NULL)
 }
 
@@ -1593,6 +2101,81 @@ handle_frame <- function(message, rec) {
     chat_start(rec, cmd)
     return(invisible(NULL))
   }
+  # ── development jobs ──────────────────────────────────────────────────────
+  # Pages only (see AGENT_REFUSED above). The wire carries a task NAME and a
+  # folder; spike/jobs.R decides whether that pair may run and the supervisor
+  # builds the argument vector. Nothing here is pasted into an expression.
+  if (identical(cmd$type, "job_start")) {
+    if (!identical(rec$role, "page")) return(invisible(NULL))
+    job_start(rec, cmd)
+    return(invisible(NULL))
+  }
+  if (identical(cmd$type, "job_stop")) {
+    if (!identical(rec$role, "page")) return(invisible(NULL))
+    if (!scalar_chr(cmd$job)) return(invisible(NULL))
+    job_stop(cmd$job)
+    return(invisible(NULL))
+  }
+  # Reattachment: everything a page needs to render the pane it just opened,
+  # including the buffered log of a job that started before this page existed.
+  # This is what makes a job detached rather than merely asynchronous.
+  if (identical(cmd$type, "job_list")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    want_log <- scalar_chr(cmd$job)
+    jobs <- mget(ls(sockets$jobs), envir = sockets$jobs)
+    ordered <- jobs[order(vapply(jobs, function(j) j$started, numeric(1)))]
+    payload <- lapply(ordered, function(j)
+      job_snapshot(j, with_log = want_log && identical(j$id, cmd$job)))
+    try(rec$ws$send(toJSON(list(type = "job_list", id = cmd$id,
+                                jobs = I(unname(payload))),
+                           auto_unbox = TRUE, null = "null")), silent = TRUE)
+    return(invisible(NULL))
+  }
+  # "What can I do with what I am looking at?" — the question the UI asks
+  # before it offers any button at all, and it is ONE question with two
+  # halves: the file may be inside a package, and the file may itself be
+  # renderable. It was called `job_root` while it could only answer the first;
+  # a reply carrying `document` under that name would have been a lie.
+  # Read-only, and answered without starting anything.
+  if (identical(cmd$type, "job_context")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    path <- cmd$path %||% ""
+    root <- find_package_root(path)
+    renderable <- scalar_chr(path) && nzchar(path) && file.exists(path) &&
+      !dir.exists(path) && path_extension(path) %in% RENDER_EXTENSIONS
+    # Report the path the JOB will act on, not the one the page happened to
+    # send. job_spec() normalizes, so echoing the raw string here would show
+    # the reader one path and use another — and on macOS those differ by a
+    # /private prefix on everything under /var.
+    if (renderable) {
+      path <- tryCatch(normalizePath(path, mustWork = TRUE), error = function(e) path)
+    }
+    try(rec$ws$send(toJSON(list(type = "job_context", id = cmd$id,
+                                root = root, package = package_name(root),
+                                document = if (renderable) path else "",
+                                formats = I(RENDER_FORMATS),
+                                tasks = I(names(JOB_TASKS))),
+                           auto_unbox = TRUE, null = "null")), silent = TRUE)
+    return(invisible(NULL))
+  }
+  # Open what a render produced.
+  #
+  # The wire names a JOB, never a path, and the supervisor opens the path IT
+  # recorded from the child's own `output` frame. That is the whole security
+  # content of this op: `utils::browseURL` on a wire-supplied string would be
+  # "open any file on this machine" wearing a helpful label, and there is no
+  # reason to accept a path here when the kernel already knows the answer.
+  if (identical(cmd$type, "job_open")) {
+    if (!identical(rec$role, "page") || !scalar_chr(cmd$job)) return(invisible(NULL))
+    job <- sockets$jobs[[cmd$job]]
+    if (is.null(job) || !scalar_chr(job$output) || !file.exists(job$output)) {
+      return(invisible(NULL))
+    }
+    audit("job-open", id = cmd$job)
+    try(utils::browseURL(job$output), silent = TRUE)
+    return(invisible(NULL))
+  }
+
   if (identical(cmd$type, "agent-chat-stop")) {
     if (!scalar_chr(cmd$id)) return(invisible(NULL))
     ch <- sockets$chats[[cmd$id]]
@@ -1739,11 +2322,15 @@ handle_frame <- function(message, rec) {
   if (cmd$type %in% AGENT_REFUSED && identical(rec$role, "mcp")) {
     audit("mcp-refused", reason = paste("agent asked for", cmd$type))
     if (scalar_chr(cmd$id)) {
-      why <- if (identical(cmd$type, "ai-key")) {
-        "Agents cannot read or write the stored key."
-      } else {
-        "Agents run code through notebook chunks (chunk_run), not raw exec."
-      }
+      why <- switch(cmd$type,
+        "ai-key" = "Agents cannot read or write the stored key.",
+        "console_history" = "Agents cannot read the console history.",
+        "input_reply" = "Agents cannot answer a prompt on the user's behalf.",
+        "ai-audit-read" = "Agents cannot read the audit stream.",
+        "job_start" = "Agents cannot start development jobs; ask the user to run one.",
+        "job_stop" = "Agents cannot stop development jobs.",
+        "job_open" = "Agents cannot open files on the user's desktop.",
+        "Agents run code through notebook chunks (chunk_run), not raw exec.")
       reply <- toJSON(list(type = cmd$type, id = cmd$id, error = why), auto_unbox = TRUE)
       try(rec$ws$send(reply), silent = TRUE)
     }
@@ -1797,6 +2384,46 @@ handle_frame <- function(message, rec) {
   # debugger REPL is reading them. This is arbitrary code execution by
   # design, exactly like exec: pages only (agents are refused above with
   # exec), and only the page that owns the paused run.
+  # Answering a readline(). Deliberately the same shape as debug_cmd below —
+  # both write a RAW console line into an interactive worker, and both are only
+  # safe while something is actually reading one. A line sent at any other
+  # moment reaches the dispatch loop as junk.
+  if (identical(cmd$type, "input_reply")) {
+    reply_err <- function(msg) {
+      if (scalar_chr(cmd$id)) {
+        try(rec$ws$send(toJSON(list(type = "input_reply", id = cmd$id, error = msg),
+                               auto_unbox = TRUE)), silent = TRUE)
+      }
+    }
+    if (!identical(k$mode, "interactive")) {
+      reply_err("this worker cannot read input")
+      return(invisible(NULL))
+    }
+    if (!isTRUE(sockets$input_waiting)) {
+      reply_err("R is not waiting for input")
+      return(invisible(NULL))
+    }
+    route <- if (!is.null(sockets$worker_active))
+      sockets$worker_routes[[sockets$worker_active]] else NULL
+    if (is.null(route) || !identical(route$rec, rec)) {
+      reply_err("another page owns the waiting run")
+      return(invisible(NULL))
+    }
+    value <- if (scalar_chr(cmd$value)) cmd$value else ""
+    # One line, always. A newline would be a SECOND console line, and the second
+    # one lands wherever R happens to be reading next.
+    if (grepl("[\n\r]", value) || nchar(value) > 4000L) {
+      reply_err("an answer must be a single line under 4000 characters")
+      return(invisible(NULL))
+    }
+    # The ANSWER is the user's own text and never reaches the audit log; that a
+    # prompt was answered, and how big the answer was, does.
+    audit("input_reply", bytes = nchar(value, type = "bytes"))
+    sockets$input_waiting <- FALSE
+    try(kernel_console(k, value), silent = TRUE)
+    return(invisible(NULL))
+  }
+
   if (identical(cmd$type, "debug_cmd")) {
     reply_err <- function(msg) {
       if (scalar_chr(cmd$id)) {
@@ -1887,20 +2514,183 @@ handle_frame <- function(message, rec) {
     if (!scalar_chr(cmd$id)) return(invisible(NULL))
     reply <- function(...) try(rec$ws$send(toJSON(list(type = "ai-key", id = cmd$id, ...),
                                                   auto_unbox = TRUE, null = "null")), silent = TRUE)
+    # See PAGE_ONLY_CLASSES: the key is for the notebook page, and "is this the
+    # notebook page?" is answered by the connection, not by the sender.
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit("ai-key-refused", class = rec$class %||% "unknown")
+      reply(error = "Only the notebook page may read or write the stored key.")
+      return(invisible(NULL))
+    }
+    # ONE OF THE TWO DOORS THE SUPERVISOR ACTUALLY OWNS. A policy that permits
+    # no key-based provider means CarmaR does not keep a provider key at all:
+    # not handed out, not stored. The user can still paste one into the tab —
+    # this is their own browser and no kernel can prevent that — but nothing
+    # persists it for them and the attempt is in the audit log. The refusal
+    # covers `set` as much as `get`, because a key CarmaR holds under a
+    # local-only policy is a key CarmaR should never have accepted.
+    if (isTRUE(ai_policy$set) && !isTRUE(ai_policy$allows_key)) {
+      audit("ai-key-refused", reason = "policy", class = rec$class %||% "unknown")
+      reply(error = ai_policy_reason(ai_policy), policy = TRUE)
+      return(invisible(NULL))
+    }
     action <- if (scalar_chr(cmd$action)) cmd$action else "get"
     if (identical(action, "get")) {
-      audit("ai-key", detail = "get")
+      audit("ai-key", detail = "get", class = rec$class)
       reply(key = ai_key_read())
     } else if (action %in% c("set", "clear")) {
+      # A `set` whose key is not a string used to fall through to value = "",
+      # DELETE the stored key, and answer ok:true. A malformed request must not
+      # be answered by destroying the thing it named. (`set ""` is still a
+      # clear — that one is deliberate, and is how the browser moves a key out
+      # of the kernel.)
+      if (identical(action, "set") && !scalar_chr(cmd$key)) {
+        reply(error = "ai-key: `set` needs `key` to be a string.")
+        return(invisible(NULL))
+      }
       # One branch: ai_key_write("") already deletes the file, so "clear" is
       # "set to nothing" and does not need a second tryCatch/audit pair to keep
       # in step with this one.
-      value <- if (identical(action, "set") && scalar_chr(cmd$key)) cmd$key else ""
+      value <- if (identical(action, "set")) cmd$key else ""
       ok <- tryCatch(ai_key_write(value), error = function(e) FALSE)
-      audit("ai-key", detail = if (nzchar(value)) "set" else "clear")
+      # `ok` belongs in the log. Recording only the INTENT left the one question
+      # an audit trail exists to answer — did the write land? — unanswerable.
+      audit("ai-key", detail = if (nzchar(value)) "set" else "clear",
+            class = rec$class, ok = isTRUE(ok))
       reply(ok = isTRUE(ok))
     } else {
       reply(error = "ai-key: action must be get, set or clear.")
+    }
+    return(invisible(NULL))
+  }
+
+  # What the administrator permits. Deliberately readable by ANY socket,
+  # including a declared agent: it discloses provider names and an
+  # administrator's own sentence, never a credential, and an agent that knows
+  # the constraint can respect it instead of failing into it.
+  if (identical(cmd$type, "ai-policy")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    try(rec$ws$send(toJSON(list(
+      type = "ai-policy", id = cmd$id,
+      set = isTRUE(ai_policy$set),
+      # I() so a single permitted provider stays a JSON ARRAY. jsonlite
+      # collapses a length-1 vector to a scalar under auto_unbox, and a page
+      # that received "anthropic" where it expected ["anthropic"] would render
+      # every provider as forbidden. Same trap frame-fidelity pins for bins.
+      providers = I(as.character(ai_policy$providers)),
+      # Each entry wrapped so a provider pinned to ONE model still arrives as
+      # an array. Same collapsed-scalar trap as `providers` above, one level
+      # deeper — and here the page would render a select with no options.
+      models = lapply(ai_policy$models, I),
+      local_only = isTRUE(ai_policy$local_only),
+      note = ai_policy$note,
+      # Is anything listening? The page asks once, here, rather than sending
+      # audit frames into a kernel that discards them — and rather than a
+      # second round trip, since "what governance is configured" is the same
+      # question this op already answers.
+      audit = nzchar(log_path),
+      audit_text = ai_audit_text,
+      source = if (identical(ai_policy$source, "env")) "environment"
+               else if (nzchar(ai_policy$source)) "file" else ""),
+      auto_unbox = TRUE, null = "null")), silent = TRUE)
+    return(invisible(NULL))
+  }
+
+  # The AI conversation, into the audit stream. Fire-and-forget: there is no
+  # reply, because a turn must never wait on its own logging, and a page that
+  # could tell whether the write landed would be a probe for whether auditing
+  # is on. `audit()` is already a no-op without CARMAR_LOG, so an ordinary
+  # laptop pays nothing here beyond the parse it already did.
+  if (identical(cmd$type, "ai-audit")) {
+    event <- ai_audit_scalar(cmd$event, 32L)
+    if (is.null(event) || !(event %in% AI_AUDIT_EVENTS)) return(invisible(NULL))
+    rec_fields <- list()
+    for (f in AI_AUDIT_FIELDS) {
+      v <- ai_audit_scalar(cmd[[f]], 200L)
+      if (!is.null(v) && !identical(v, "")) rec_fields[[f]] <- v
+    }
+    if (ai_audit_text) {
+      for (f in AI_AUDIT_TEXT_FIELDS) {
+        v <- ai_audit_scalar(cmd[[f]], 4000L)
+        if (!is.null(v) && !identical(v, "")) rec_fields[[f]] <- v
+      }
+    }
+    # Stamped, never accepted: who this is, and what kind of client it is.
+    # A declared agent reporting its own work is exactly what should be in the
+    # log — labelled as an agent, which is a thing it cannot say otherwise.
+    do.call(audit, c(list(paste0("ai-", event)), rec_fields,
+                     list(class = rec$class %||% "unknown",
+                          role = rec$role %||% "page",
+                          user = rec$user %||% "")))
+    return(invisible(NULL))
+  }
+
+  # Reading the audit stream BACK, for the reviewer export.
+  #
+  # Page-only on the same grounds as the console history, and more so: with
+  # CARMAR_LOG_AI_TEXT on, these lines contain the prompts the user typed. A
+  # declared agent is refused (AGENT_REFUSED); a published origin and a native
+  # client are refused by class.
+  #
+  # Only `ai-*` records are returned. The same file also holds socket opens,
+  # refusals and the startup posture — operational security detail that a
+  # notebook page has no business reading back, and that the reviewer export
+  # would have no use for. The narrower answer is the whole point of having a
+  # separate op rather than "read me the log".
+  if (identical(cmd$type, "ai-audit-read")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    reply <- function(...) try(rec$ws$send(toJSON(list(type = "ai-audit-read", id = cmd$id, ...),
+                                                  auto_unbox = TRUE, null = "null")), silent = TRUE)
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit("ai-audit-read-refused", class = rec$class %||% "unknown")
+      reply(error = "Only the notebook page may read the audit stream.")
+      return(invisible(NULL))
+    }
+    if (!nzchar(log_path) || !file.exists(log_path)) {
+      # Not an error: no log configured is the ordinary single-user state, and
+      # the export says so in words rather than showing an empty table that
+      # would read as "the AI did nothing".
+      reply(records = I(list()), configured = nzchar(log_path))
+      return(invisible(NULL))
+    }
+    lines <- tryCatch(readLines(log_path, warn = FALSE), error = function(e) character())
+    lines <- grep('"event":"ai-', lines, fixed = TRUE, value = TRUE)
+    # Bounded: a long-lived kernel accumulates, and one frame must not become
+    # megabytes. The TAIL, because a reviewer wants this session.
+    if (length(lines) > AI_AUDIT_READ_MAX) {
+      lines <- utils::tail(lines, AI_AUDIT_READ_MAX)
+    }
+    # Forwarded as the BYTES they were written as, parsed once by the browser:
+    # re-encoding through jsonlite here would round numbers and collapse
+    # fields, which is the frame-fidelity lesson one level down.
+    reply(records = I(lines), configured = TRUE,
+          truncated = length(lines) >= AI_AUDIT_READ_MAX)
+    return(invisible(NULL))
+  }
+
+  # The console's cross-session history. Page-only on the same grounds as the
+  # key: it is a record of everything this user has typed at their own machine.
+  if (identical(cmd$type, "console_history")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    reply <- function(...) try(rec$ws$send(toJSON(list(type = "console_history", id = cmd$id, ...),
+                                                  auto_unbox = TRUE, null = "null")), silent = TRUE)
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit("console-history-refused", class = rec$class %||% "unknown")
+      reply(error = "Only the notebook page may read or write the console history.")
+      return(invisible(NULL))
+    }
+    action <- if (scalar_chr(cmd$action)) cmd$action else "get"
+    if (identical(action, "get")) {
+      # I() so a one-entry history stays an ARRAY on the wire. Without it
+      # jsonlite unboxes it to a bare string and the page's history becomes
+      # that string's characters.
+      reply(lines = I(as.character(history_read())), enabled = HISTORY_ENABLED)
+    } else if (identical(action, "add")) {
+      if (!scalar_chr(cmd$line)) { reply(error = "console_history: `line` must be a string."); return(invisible(NULL)) }
+      reply(ok = isTRUE(tryCatch(history_add(cmd$line), error = function(e) FALSE)))
+    } else if (identical(action, "clear")) {
+      reply(ok = identical(unlink(history_path()), 0L) && !file.exists(history_path()))
+    } else {
+      reply(error = "console_history: action must be get, add or clear.")
     }
     return(invisible(NULL))
   }
@@ -1964,6 +2754,10 @@ pump <- function() {
     # anything the client does.
     if (identical(e$type, "debug")) sockets$debug_paused <- TRUE
     if (identical(e$type, "done")) sockets$debug_paused <- FALSE
+    if (identical(e$type, "input_request")) sockets$input_waiting <- TRUE
+    if (identical(e$type, "input_done") || identical(e$type, "done")) {
+      sockets$input_waiting <- FALSE
+    }
     # Plain stdout/stderr has no protocol id. The worker is serial, so it
     # belongs to the oldest execution still in flight — and so does a debug
     # frame, which carries no id by design (it is emitted mid-pause, from
@@ -2022,6 +2816,30 @@ pump <- function() {
 }
 
 server <- httpuv::startServer(host, port, app)
+audit("listening", bind = host, port = port, loopback = deployment$loopback,
+      require_origin = deployment$require_origin,
+      trust_proxy = deployment$trust_proxy,
+      ai_policy = isTRUE(ai_policy$set),
+      ai_providers = paste(ai_policy$providers, collapse = ","),
+      unauthenticated = deployment$allow_unauthenticated)
+if (deployment$require_origin) {
+  # stderr, never stdout: the first stdout line is the {"url": ...} protocol
+  # frame the launcher parses, and a banner ahead of it is an unparseable
+  # first line. An operator who has bound to the network gets the posture
+  # stated back to them, because the two spellings differ enormously and the
+  # difference is invisible from the outside.
+  message("CarmaR listening on ", host, ":", port,
+          " — strict: a client with no Origin is refused")
+  message(if (deployment$trust_proxy)
+            paste0("  identity: ", deployment$user_header, " from ",
+                   paste(deployment$proxy_addrs, collapse = ", "))
+          else if (deployment$loopback)
+            "  identity: none — loopback, so reachable only from this machine"
+          else
+            "  identity: NONE, and bound off loopback — anyone who can reach this port can run R as this user")
+  message("  accepted Host headers: ", paste(deployment$hosts, collapse = ", "))
+  message("  accepted Origins:      ", paste(deployment$origins, collapse = ", "))
+}
 on.exit({
   httpuv::stopServer(server)
   kernel_stop(k)
@@ -2176,7 +2994,12 @@ linger_check <- function() {
   if (!isTRUE(sockets$ever_connected) && is.null(sockets$idle_since)) {
     sockets$idle_since <- sockets$boot_at
   }
-  idle <- length(sockets$open) == 0L && length(ls(sockets$running)) == 0L
+  # A running job counts as busy. This is the whole point of a DETACHED job:
+  # you press Check, close the tab, and come back to a finished check. Without
+  # this line the linger would stop the kernel — and the job with it — at the
+  # exact moment nobody is watching, which is when a long task is most useful.
+  idle <- length(sockets$open) == 0L && length(ls(sockets$running)) == 0L &&
+    !jobs_running()
   if (!idle) { sockets$idle_since <- NULL; return(invisible(NULL)) }
   now <- Sys.time()
   if (is.null(sockets$idle_since)) {
@@ -2196,6 +3019,7 @@ repeat {
   httpuv::service(50)
   pump()
   pump_chats()
+  pump_jobs()
   reap_dead_sockets()
   linger_check()
   if (isTRUE(sockets$quit)) break
@@ -2212,4 +3036,12 @@ repeat {
 # a runtime file (stale files are litter, not authority). Running Claude
 # conversations die with the kernel — nothing may keep billing after Quit.
 for (id in ls(sockets$chats)) chat_kill(id)
+# Detached from a page, never from the kernel: a job is a child of THIS
+# process, and a supervisor that exits leaving an orphaned `devtools::check()`
+# holding a lock on the library is exactly the stranded-process problem the
+# linger exists to prevent.
+for (id in ls(sockets$jobs)) {
+  job <- sockets$jobs[[id]]
+  if (identical(job$state, "running")) try(job$k$proc$kill(), silent = TRUE)
+}
 if (nzchar(runtime_file)) unlink(runtime_file)

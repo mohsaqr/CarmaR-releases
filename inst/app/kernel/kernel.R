@@ -48,8 +48,10 @@ detect_r_binary <- function(rscript) {
 #' Command-line R promotes itself to a foreground LaunchServices application
 #' when its Aqua/AppKit support initializes. On macOS 26 that gives every
 #' document worker a generic `exec` Dock tile. A packaged CarmaR kernel carries
-#' a tiny universal library beside kernel.R; calling it before worker.R is
-#' sourced registers this process as BackgroundOnly first. The process itself
+#' a tiny native library beside kernel.R; calling it before worker.R is
+#' sourced registers this process as BackgroundOnly first. Distributions may
+#' carry either an architecture-specific marker (R packages) or one universal
+#' marker (application bundles and source checkouts). The process itself
 #' must make the transition — a UIElement parent does not confer its activation
 #' policy on an exec'd child.
 #'
@@ -58,13 +60,36 @@ detect_r_binary <- function(rscript) {
 #'
 #' @param worker_path Path to the worker boot script.
 #' @param sysname Injectable platform name for source-only tests.
+#' @param arch Injectable R process architecture for source-only tests.
 #' @return A one-line R expression, or "" when no marker is available.
 macos_background_boot <- function(worker_path,
-                                  sysname = unname(Sys.info()[["sysname"]])) {
+                                  sysname = unname(Sys.info()[["sysname"]]),
+                                  arch = R.version$arch) {
   if (!identical(sysname, "Darwin")) return("")
+  # OPT-IN, and defaulting off is a reliability decision. TransformProcessType
+  # hides the worker's Dock icon, but on a GUI-launched process (macOS 26) it
+  # leaves R's console/event handling in a state where a plain readLines(stdin)
+  # — every single command the supervisor sends — can block forever in
+  # R_checkActivityEx, wedging the whole session at 0% CPU with Stop unable to
+  # reach it. Foreground R, which is what RStudio runs, never does this. So a
+  # visible Dock icon is the price of a kernel that answers; set
+  # CARMAR_MARK_BACKGROUND=1 to restore Dock hiding once a transform that does
+  # not wedge the console read is found.
+  if (!identical(Sys.getenv("CARMAR_MARK_BACKGROUND", "0"), "1")) return("")
   marker <- Sys.getenv("CARMAR_BACKGROUND_LIBRARY", "")
   if (!nzchar(marker)) {
-    marker <- file.path(dirname(worker_path), "carmar-background.dylib")
+    suffix <- if (grepl("^(aarch64|arm64)", arch, ignore.case = TRUE)) {
+      "arm64"
+    } else if (grepl("x86_64|x86-64|amd64", arch, ignore.case = TRUE)) {
+      "x86_64"
+    } else ""
+    beside <- dirname(worker_path)
+    candidates <- c(
+      if (nzchar(suffix)) file.path(
+        beside, paste0("carmar-background-", suffix, ".dylib")),
+      file.path(beside, "carmar-background.dylib"))
+    found <- candidates[file.exists(candidates)]
+    marker <- if (length(found)) found[[1L]] else candidates[[1L]]
   }
   if (!file.exists(marker)) return("")
   marker <- encodeString(normalizePath(marker, mustWork = TRUE), quote = '"')
@@ -165,10 +190,19 @@ kernel_start <- function(worker_path, sentinel = NULL, rscript = detect_rscript(
   # the common path and took the kernel down at startup.
   from_env <- function(name) if (name %in% names(clean_env)) clean_env[[name]] else ""
   lc_all <- from_env("LC_ALL")
-  effective <- if (nzchar(lc_all)) lc_all else {
-    ctype <- from_env("LC_CTYPE")
-    if (nzchar(ctype)) ctype else Sys.getlocale("LC_CTYPE")
-  }
+  # Decide from what the CHILD inherits - its ENVIRONMENT - never from
+  # Sys.getlocale(), which is the SUPERVISOR's RUNTIME locale. macOS boots a
+  # GUI-launched supervisor with a runtime C.UTF-8 that is NEVER in the env, so
+  # it never reaches the child; the child sees only these variables, and with
+  # LC_ALL/LC_CTYPE/LANG all unset it falls back to bare C. There a single
+  # multi-byte character in a command line (an en dash in a comment such as
+  # `orders 0-5`, an accent, an emoji) wedges the interactive console reader and
+  # freezes the kernel. Reading the runtime locale here let the guard skip in
+  # exactly that case, which is why the packaged app hung on the first non-ASCII
+  # chunk while a shell or RStudio (both of which export a UTF-8 locale) did not.
+  effective <- if (nzchar(lc_all)) lc_all
+    else if (nzchar(from_env("LC_CTYPE"))) from_env("LC_CTYPE")
+    else from_env("LANG")
   if (!utf8_locale(effective)) {
     # LC_ALL outranks LC_CTYPE, so a non-UTF-8 LC_ALL would win silently.
     if (nzchar(lc_all) && !utf8_locale(lc_all)) {

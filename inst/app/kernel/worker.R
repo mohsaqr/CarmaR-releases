@@ -241,10 +241,28 @@ R_KEYWORDS <- c("if", "else", "repeat", "while", "function", "for", "in",
 #' so every plot vanished with no error anywhere. The only honest test is to
 #' open a device, draw a page, and see whether bytes appear.
 #'
-#' @return The first working type: quartz on macOS, else cairo, else Xlib.
+#' CAIRO IS TRIED BEFORE QUARTZ, and that ORDER is a hang fix, not a
+#' preference. `png(type="quartz")` pulls in the macOS Aqua/AppKit graphics
+#' backend, which spawns a Cocoa event loop (an NSEventThread plus grDevices'
+#' own ELThread) the first time it opens. CarmaR's worker is a BackgroundOnly
+#' process with no window-server access, so when R pumps that event loop
+#' mid-evaluation — which it does from inside a long R-level loop, e.g. the
+#' permutation loop in `markov_order_test` — `ReceiveNextEventCommon` blocks
+#' and the whole session hangs at 0% CPU, uninterruptibly (Stop is a SIGINT R
+#' never reaches). It only bites a GUI-launched worker: a terminal R is a
+#' different session and never blocks, which is exactly why it presented as
+#' "only this one function hangs, and only in the app." Cairo renders the
+#' identical PNG headlessly with no AppKit thread at all, and — because Cairo
+#' is opened first and works — quartz is never even probed, so the event loop
+#' is never created. The `works()` guard below still protects the broken-CRAN
+#' case: if this R's Cairo is the libXrender-less one, it falls through to
+#' quartz, and a machine that reaches that fallback is not the GUI worker the
+#' hang needs anyway.
+#'
+#' @return The first working type: cairo (headless), else quartz, else Xlib.
 detect_plot_type <- function() {
-  candidates <- c(if (isTRUE(capabilities("aqua"))) "quartz",
-                  if (isTRUE(capabilities("cairo"))) "cairo",
+  candidates <- c(if (isTRUE(capabilities("cairo"))) "cairo",
+                  if (isTRUE(capabilities("aqua"))) "quartz",
                   "Xlib")
   works <- function(type) {
     f <- tempfile(fileext = ".png")
@@ -262,7 +280,41 @@ detect_plot_type <- function() {
   if (is.na(hit)) candidates[1L] else candidates[hit]
 }
 
-PLOT_TYPE <- detect_plot_type()
+#' The raster backend for cell plots. `ragg::agg_png` is a pure-C++ device with
+#' NO quartz and NO cairo, so it never opens the macOS AppKit graphics subsystem
+#' — and it is the only headless raster that both actually loads on a stock
+#' framework R (whose cairo fails to dlopen; see detect_plot_type) AND does not
+#' spawn the Cocoa event loop that hangs a BackgroundOnly worker. Probed the same
+#' honest way as the png types — an installed-but-broken ragg must fall through.
+#'
+#' @return "ragg" when agg_png renders bytes, else "png" (use grDevices::png).
+detect_raster_device <- function() {
+  if (!requireNamespace("ragg", quietly = TRUE)) return("png")
+  f <- tempfile(fileext = ".png")
+  ok <- tryCatch({
+    # A real-sized canvas with zero margins: a 12x12-pixel probe made
+    # plot.new() raise "figure margins too large", which this tryCatch counted
+    # as ragg FAILING — so the worker fell through to the png/quartz path and
+    # opened the AppKit event loop it was trying to avoid. The probe must fail
+    # only when ragg genuinely does not render.
+    ragg::agg_png(f, width = 200, height = 200, res = 72)
+    old <- graphics::par(mar = c(0, 0, 0, 0))
+    graphics::plot.new()
+    graphics::par(old)
+    grDevices::dev.off()
+    file.exists(f) && file.info(f)$size > 0L
+  }, error = function(e) FALSE, warning = function(w) FALSE)
+  if (!is.null(grDevices::dev.list())) try(grDevices::dev.off(), silent = TRUE)
+  unlink(f)
+  if (isTRUE(ok)) "ragg" else "png"
+}
+
+RASTER_DEVICE <- detect_raster_device()
+# Probing png TYPES opens a quartz device on macOS — the very thing whose AppKit
+# event loop hangs a background worker — so a worker that has ragg must never run
+# detect_plot_type() at all. Only compute PLOT_TYPE when the png fallback is what
+# we will actually use.
+PLOT_TYPE <- if (identical(RASTER_DEVICE, "png")) detect_plot_type() else NA_character_
 
 #' Find a VECTOR device that actually works, or NULL.
 #'
@@ -314,6 +366,42 @@ emit <- function(obj) {
                        digits = NA), "\n", sep = "")
   flush(stdout())
   invisible(NULL)
+}
+
+# ── interactive input ────────────────────────────────────────────────────────
+#
+# The worker runs under `R --interactive`, so base::readline() genuinely blocks
+# on the console — the SAME reader the debugger's Browse prompt uses, which is
+# why answering it needs no new channel: the supervisor writes a raw console
+# line exactly as it writes a debug step.
+#
+# What was missing was the announcement. R sat waiting on a prompt while the
+# notebook sat on a spinner with no way to answer it, so any code that asked a
+# question — readline(), and the menu()/select.list() built on it — could only
+# be stopped, never completed.
+#
+# `readline` is SHADOWED on the search path rather than replaced in base: user
+# code and every package keep seeing base's own function, and removing the
+# attached frame restores the original behaviour exactly. The delegation is the
+# whole implementation — announce, then let R do what it already did.
+carmar_readline <- function(prompt = "") {
+  text <- tryCatch(as.character(prompt)[[1]], error = function(e) "")
+  if (!length(text) || is.na(text)) text <- ""
+  emit(list(type = "input_request", prompt = text))
+  answer <- base::readline(prompt)
+  # Symmetry matters more than it looks: a page that opened an input row on the
+  # request must be told to close it, INCLUDING when the answer arrived by some
+  # other route (an interrupt, a second page). Without this the prompt row
+  # outlives the question it asked.
+  emit(list(type = "input_done"))
+  answer
+}
+INPUT_SHADOW <- "carmar:input"
+if (!(INPUT_SHADOW %in% search())) {
+  # warn.conflicts = FALSE: masking `readline` is the entire point, and a
+  # startup warning about it would be printed into the user's first cell.
+  attach(list(readline = carmar_readline), name = INPUT_SHADOW,
+         warn.conflicts = FALSE)
 }
 
 #' A function's formals as one display string, defaults included.
@@ -2188,11 +2276,15 @@ open_plot_device <- function(dir, seq, dims = NULL) {
     }
     return(invisible(NULL))
   }
-  grDevices::png(
-    filename = file.path(dir, sprintf("e%03d-%%03d.png", seq)),
-    width = width, height = height, res = res,
-    type = PLOT_TYPE
-  )
+  filename <- file.path(dir, sprintf("e%03d-%%03d.png", seq))
+  if (identical(RASTER_DEVICE, "ragg")) {
+    # Headless, and the reason the worker no longer hangs on macOS: no quartz,
+    # so no AppKit event loop for R to block pumping mid-run.
+    ragg::agg_png(filename = filename, width = width, height = height, res = res)
+  } else {
+    grDevices::png(filename = filename, width = width, height = height,
+                   res = res, type = PLOT_TYPE)
+  }
   invisible(NULL)
 }
 
@@ -2243,11 +2335,48 @@ emit_plot_frame <- function(id, f, dims = NULL) {
 #' @param dir Directory the device writes pages into.
 #' @param seen Character vector of filenames already emitted.
 #' @return The updated `seen` vector.
+#' Is this PNG a device's untouched blank page rather than a real plot?
+#'
+#' grDevices does not create its first file until something is drawn, so a
+#' non-zero size meant "a plot happened". ragg writes a fully-formed BLANK page
+#' the instant the device opens, so size > 0 no longer distinguishes "drew a
+#' plot" from "opened the device and drew nothing" — which made every cell that
+#' does not plot emit an empty figure. A blank page for a given width/height/res
+#' is byte-identical every time, so keep one reference per size and skip any
+#' harvested file that matches it. Only ragg needs this; other devices return
+#' FALSE immediately. A real plot never equals the blank, and a plot call that
+#' drew literally nothing visible is a blank the reader is better off not shown.
+.blank_png_cache <- new.env(parent = emptyenv())
+is_blank_plot <- function(f, dims) {
+  if (!identical(RASTER_DEVICE, "ragg")) return(FALSE)
+  w <- if (!is.null(dims$width))  dims$width  else PLOT_WIDTH
+  h <- if (!is.null(dims$height)) dims$height else PLOT_HEIGHT
+  r <- if (!is.null(dims$res))    dims$res    else PLOT_RES
+  key <- paste(w, h, r, sep = "x")
+  blank <- .blank_png_cache[[key]]
+  if (is.null(blank)) {
+    ref <- tempfile(fileext = ".png")
+    blank <- tryCatch({
+      ragg::agg_png(ref, width = w, height = h, res = r)
+      grDevices::dev.off()
+      if (file.exists(ref)) readBin(ref, "raw", file.info(ref)$size) else raw(0)
+    }, error = function(e) raw(0))
+    if (!is.null(grDevices::dev.list())) try(grDevices::dev.off(), silent = TRUE)
+    unlink(ref)
+    .blank_png_cache[[key]] <- blank
+  }
+  if (!length(blank)) return(FALSE)
+  sz <- file.info(f)$size
+  isTRUE(sz == length(blank)) && identical(readBin(f, "raw", sz), blank)
+}
+
 harvest_finished <- function(id, dir, seen, dims = NULL) {
   files <- list.files(dir, pattern = plot_pattern(dims), full.names = TRUE)
   # Only files with bytes join `seen`: a file still empty here gets another
   # look on the next harvest instead of being remembered as already emitted.
-  drawn <- Filter(function(f) file.info(f)$size > 0L, sort(setdiff(files, seen)))
+  # A ragg blank page (opened, nothing drawn) has bytes but is not a plot.
+  drawn <- Filter(function(f) file.info(f)$size > 0L && !is_blank_plot(f, dims),
+                  sort(setdiff(files, seen)))
   invisible(lapply(drawn, function(f) emit_plot_frame(id, f, dims)))
   c(seen, drawn)
 }
@@ -2264,8 +2393,10 @@ harvest_plots <- function(id, dir, seen, dims = NULL) {
   }
   files <- list.files(dir, pattern = plot_pattern(dims), full.names = TRUE)
   fresh <- setdiff(files, seen)
-  # A device always creates its first file, even with nothing drawn into it.
-  drawn <- Filter(function(f) file.info(f)$size > 0L, sort(fresh))
+  # A device always creates its first file, even with nothing drawn into it —
+  # empty (0 bytes) for grDevices, a byte-identical blank page for ragg.
+  drawn <- Filter(function(f) file.info(f)$size > 0L && !is_blank_plot(f, dims),
+                  sort(fresh))
   invisible(lapply(drawn, function(f) emit_plot_frame(id, f, dims)))
   c(seen, fresh)
 }
@@ -3010,7 +3141,11 @@ if (identical(WORKER_MODE, "interactive")) {
 # promoted R during startup cannot leave this document kernel in the Dock.
 # Existing workers cannot be changed by a newly installed build; every fresh
 # or restarted worker reaches this point automatically.
+# OPT-IN — see macos_background_boot in kernel.R. The background transform hides
+# the Dock icon but wedges R's console read on a GUI-launched macOS 26 worker,
+# so it is off unless CARMAR_MARK_BACKGROUND=1 is set.
 if (identical(unname(Sys.info()[["sysname"]]), "Darwin") &&
+    identical(Sys.getenv("CARMAR_MARK_BACKGROUND", "0"), "1") &&
     is.loaded("carmar_mark_background")) {
   invisible(try(.C("carmar_mark_background", result = integer(1)), silent = TRUE))
 }

@@ -53,7 +53,7 @@ run <- function(port = 4747, open = TRUE, new = TRUE) {
   if (!new && length(at_port)) {
     u <- unname(at_port[[1]])
     page <- notebook_launch_url(u, state)
-    if (open) utils::browseURL(page)
+    if (open) open_notebook(page, state)
     message("CarmaR is already running behind: ", page)
     return(invisible(page))
   }
@@ -141,12 +141,151 @@ run <- function(port = 4747, open = TRUE, new = TRUE) {
       "CarmaR started, but its session record could not be saved: ", url_file)
   }
   if (is.null(page) || !nzchar(page)) page <- notebook_launch_url(u, state)
-  if (open) utils::browseURL(page)
+  if (open) open_notebook(page, state)
   # ALWAYS printed, clickable in the RStudio console — the browser not
   # opening (locked-down default browser, broken association) must never
   # strand a student without the address.
   message("CarmaR is running behind this notebook file:\n  ", page)
   invisible(page)
+}
+
+#' Serve CarmaR to other people on the network
+#'
+#' The classroom deployment: one CarmaR per person, each started under that
+#' person's own operating-system account on its own port, with TLS and login
+#' handled entirely by a reverse proxy in front. CarmaR itself never sees a
+#' password — it trusts an identity header, and only when the request came
+#' from the proxy's own address.
+#'
+#' Binding off loopback INVERTS one of CarmaR's trust rules, and this verb
+#' exists so that inversion is stated rather than stumbled into. On
+#' `127.0.0.1`, a client that sends no `Origin` header is allowed outright:
+#' no Origin means it is not a browser, so it is a process belonging to this
+#' same user, who could have run `Rscript` anyway. Reachable from the network,
+#' the identical header means an unauthenticated stranger — so here it is
+#' refused. The kernel will not start at all without `hosts`, and will not
+#' start unauthenticated unless you say `allow_unauthenticated = TRUE` out
+#' loud.
+#'
+#' A worked Caddy configuration is in `docs/server.md` inside the package
+#' sources; `readme()` opens it.
+#'
+#' @param hosts The hostnames readers will type, e.g. `"stats.example.edu"`.
+#'   Required: off loopback the `Host` allow-list is the only thing standing
+#'   between this kernel and a DNS-rebinding attack, so an empty one is
+#'   refused rather than defaulted.
+#' @param port Port for this person's kernel (default 4747). One port per
+#'   person; the proxy maps each account to its own.
+#' @param bind Address to listen on (default `"0.0.0.0"`). Use the proxy-facing
+#'   interface address when the machine has more than one.
+#' @param user_header The header the proxy sets to the authenticated user's
+#'   name (default `"X-Forwarded-User"`; Caddy's `forward_auth` writes
+#'   `Remote-User`).
+#' @param trusted_proxy Address(es) the proxy connects from (default
+#'   `"127.0.0.1"`). The identity header is read from these and ignored from
+#'   anywhere else — it is an identity only for as long as nobody but the
+#'   proxy can reach the port.
+#' @param origins Extra exact browser origins allowed to open a socket, e.g.
+#'   `"https://stats.example.edu"`. The kernel's own address is always allowed.
+#' @param allow_unauthenticated Serve with no proxy identity at all? Default
+#'   `FALSE`. `TRUE` means everyone who can reach this port can run R as the
+#'   account this kernel runs under. There is no safe network on which that is
+#'   a shortcut.
+#' @return Invisibly, a one-row `data.frame` with `port`, `bind`, `url` (the
+#'   kernel's own address), `hosts` (comma-separated), `authenticated`
+#'   (logical) and `log` (path to the kernel log).
+#' @examples
+#' \dontrun{
+#' carmar::serve_shared(hosts = "stats.example.edu")
+#' carmar::serve_shared(hosts = "stats.example.edu", port = 4801,
+#'                      user_header = "Remote-User")
+#' }
+#' @export
+serve_shared <- function(hosts, port = 4747, bind = "0.0.0.0",
+                         user_header = "X-Forwarded-User",
+                         trusted_proxy = "127.0.0.1",
+                         origins = character(0),
+                         allow_unauthenticated = FALSE) {
+  stopifnot(
+    "`hosts` must name at least one hostname readers will use" =
+      is.character(hosts) && length(hosts) >= 1L && all(nzchar(trimws(hosts))),
+    "`port` must be a single port number" =
+      is.numeric(port) && length(port) == 1L && is.finite(port) &&
+      port == as.integer(port) && port > 0 && port < 65536,
+    "`bind` must be a single address" =
+      is.character(bind) && length(bind) == 1L && nzchar(trimws(bind)),
+    "`user_header` must be a single header name" =
+      is.character(user_header) && length(user_header) == 1L,
+    "`trusted_proxy` must name at least one address" =
+      is.character(trusted_proxy) && length(trusted_proxy) >= 1L,
+    "`origins` must be a character vector" = is.character(origins),
+    "`allow_unauthenticated` must be TRUE or FALSE" =
+      is.logical(allow_unauthenticated) && length(allow_unauthenticated) == 1L &&
+      !is.na(allow_unauthenticated))
+
+  state <- tools::R_user_dir("carmar", "data")
+  dir.create(state, recursive = TRUE, showWarnings = FALSE)
+  try(sync_notebook(), silent = TRUE)
+
+  serve <- system.file("app", "kernel", "serve.R", package = "carmar")
+  if (!nzchar(serve)) stop("carmar is not installed correctly (serve.R is missing) - reinstall the package.")
+  rscript <- file.path(R.home("bin"),
+                       if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript")
+  log <- file.path(state, paste0("kernel-", port, ".log"))
+
+  # An empty CARMAR_TRUST_PROXY is not the same as unset: serve.R compares it
+  # to "1", so the unauthenticated case must pass the flag off rather than on.
+  cfg <- c(CARMAR_PORT = as.character(as.integer(port)),
+           CARMAR_BIND = trimws(bind),
+           CARMAR_HOSTS = paste(trimws(hosts), collapse = ","),
+           CARMAR_DIST = file.path(state, "dist"))
+  if (allow_unauthenticated) {
+    cfg <- c(cfg, CARMAR_ALLOW_UNAUTHENTICATED = "1")
+  } else {
+    cfg <- c(cfg, CARMAR_TRUST_PROXY = "1",
+             CARMAR_USER_HEADER = trimws(user_header),
+             CARMAR_TRUSTED_PROXY = paste(trimws(trusted_proxy), collapse = ","))
+  }
+  if (length(origins)) cfg <- c(cfg, CARMAR_ORIGINS = paste(trimws(origins), collapse = ","))
+
+  p <- processx::process$new(rscript, serve, env = c(Sys.getenv(), cfg),
+                             stdout = log, stderr = "2>&1", cleanup = FALSE)
+
+  u <- NULL
+  for (i in seq_len(240)) {
+    lines <- tryCatch(readLines(log, warn = FALSE), error = function(e) character(0))
+    hit <- grep('"url"', lines, value = TRUE)
+    if (length(hit)) {
+      rec <- tryCatch(jsonlite::fromJSON(hit[[1]], simplifyVector = TRUE),
+                      error = function(e) NULL)
+      if (!is.null(rec$url)) { u <- rec$url; break }
+    }
+    if (!p$is_alive()) break
+    Sys.sleep(0.5)
+  }
+  if (is.null(u)) {
+    said <- if (file.exists(log)) readLines(log, warn = FALSE) else character(0)
+    refused <- grep("refuses to start", said, value = TRUE)
+    # serve.R's own words, not a rewrite of them: it knows exactly which part
+    # of the posture was unsafe and says so in a full sentence.
+    if (length(refused)) stop(paste(refused, collapse = "\n"), call. = FALSE)
+    stop("CarmaR did not start. The kernel log is at: ", log,
+         if (length(said)) paste0("\nLast lines:\n",
+           paste(utils::tail(said, 5), collapse = "\n")) else "", call. = FALSE)
+  }
+
+  message("CarmaR is serving on ", bind, ":", port,
+          if (allow_unauthenticated)
+            " with NO authentication - anyone who can reach this port runs R as this account."
+          else paste0(", trusting ", user_header, " from ",
+                      paste(trusted_proxy, collapse = ", "), "."))
+  message("  Point your reverse proxy at ", u, " and see docs/server.md.")
+
+  invisible(data.frame(
+    port = as.integer(port), bind = trimws(bind), url = u,
+    hosts = paste(trimws(hosts), collapse = ","),
+    authenticated = !allow_unauthenticated, log = log,
+    stringsAsFactors = FALSE))
 }
 
 #' Start CarmaR for a published book
@@ -513,8 +652,58 @@ notebook_launch_url <- function(kernel_url,
   versions <- numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", basename(files)))
   file <- normalizePath(files[order(versions, decreasing = TRUE)][1], winslash = "/")
   prefix <- if (startsWith(file, "/")) "file://" else "file:///"
+  port <- kernel_port(kernel_url)
+  cap <- recorded_pair(port)
   paste0(prefix, utils::URLencode(file, reserved = FALSE),
-         "#kernel=", kernel_port(kernel_url))
+         "#kernel=", port, if (nzchar(cap)) paste0("&pair=", cap))
+}
+
+#' The file-page launch capability a kernel announced, read back from its
+#' shared runtime record (`~/.carmar/run/kernel-<port>.json`, written by
+#' serve.R). Since 0.60.88 a notebook opened from disk is refused without it
+#' (FILE_ORIGIN), so a page URL regenerated here has to carry it or it reopens
+#' a notebook the kernel will not talk to. `""` when the record is absent or
+#' predates the capability. @noRd
+recorded_pair <- function(port) {
+  port <- suppressWarnings(as.integer(port))
+  if (length(port) != 1L || is.na(port)) return("")
+  runtime_dir <- Sys.getenv("CARMAR_RUNTIME_DIR",
+                            file.path(path.expand("~"), ".carmar", "run"))
+  f <- file.path(runtime_dir, sprintf("kernel-%d.json", port))
+  if (!file.exists(f)) return("")
+  rec <- tryCatch(jsonlite::fromJSON(f, simplifyVector = TRUE),
+                  error = function(e) NULL)
+  page <- if (is.list(rec) && length(rec$file) == 1L && is.character(rec$file)) rec$file else ""
+  hit <- regmatches(page, regexpr("(?<=[#&]pair=)[A-Za-z0-9]+", page, perl = TRUE))
+  if (length(hit)) hit else ""
+}
+
+#' Open the notebook page in the browser with its fragment intact.
+#'
+#' `browseURL()` ends in `open` (macOS), `ShellExecute` (Windows) or
+#' `xdg-open`, each of which hands a file:// URL to the browser as a PATH:
+#' the `#kernel=…&pair=…` fragment never arrives, the page walks the ports,
+#' finds the kernel that was just started for it and is refused — "kernel
+#' closed" beside a healthy R. So the browser is given a one-line page it
+#' can carry, whose only job is to navigate to the real URL. 0600 in the
+#' package's state directory; earlier trampolines are swept on every launch,
+#' so at most one — the newest session's — is ever on disk. @noRd
+open_notebook <- function(page, state = tools::R_user_dir("carmar", "data"),
+                          browse = utils::browseURL) {
+  if (!grepl("#", page, fixed = TRUE)) return(browse(page))
+  unlink(list.files(state, pattern = "^open-[0-9]+\\.html$", full.names = TRUE))
+  tramp <- file.path(state, sprintf("open-%d.html", Sys.getpid()))
+  esc <- gsub("<", "&lt;", gsub("\"", "&quot;", gsub("&", "&amp;", page,
+                                                     fixed = TRUE), fixed = TRUE), fixed = TRUE)
+  writeLines(paste0(
+    '<!doctype html><meta charset="utf-8"><title>CarmaR</title>',
+    '<meta http-equiv="refresh" content="0;url=', esc, '">',
+    '<a id="go" href="', esc, '">Opening CarmaR&hellip;</a>',
+    '<script>location.replace(document.getElementById("go").href)</script>'),
+    tramp)
+  Sys.chmod(tramp, "0600")
+  browse(tramp)
+  invisible(tramp)
 }
 
 #' Port number carried by a clean CarmaR URL. @noRd
