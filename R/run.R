@@ -22,6 +22,9 @@
 #' @param open Open the browser once the kernel answers? Default `TRUE`.
 #' @param new Start an independent session? Default `TRUE`. Set `FALSE` to
 #'   reopen a live session on `port` when there is one.
+#' @param file Optional document path delivered to the notebook. File
+#'   associations use this with `new = FALSE`, so a double-click reuses the
+#'   live session when possible and starts one only when necessary.
 #' @return Invisibly, the versioned notebook file URL with its kernel selected.
 #' @examples
 #' \dontrun{
@@ -30,32 +33,36 @@
 #' }
 #' @importFrom httpuv startServer
 #' @export
-run <- function(port = 4747, open = TRUE, new = TRUE) {
+run <- function(port = 4747, open = TRUE, new = TRUE, file = NULL) {
   stopifnot(is.numeric(port), length(port) == 1L, is.finite(port),
             port == as.integer(port), port > 0, port < 65536)
   stopifnot(is.logical(new), length(new) == 1L, !is.na(new))
+  if (!is.null(file)) {
+    if (!is.character(file) || length(file) != 1L || is.na(file) || !nzchar(file) ||
+        !file.exists(file) || dir.exists(file)) {
+      stop("`file` must name one existing document.")
+    }
+    file <- normalizePath(file, winslash = "/", mustWork = TRUE)
+  }
   state <- tools::R_user_dir("carmar", "data")
   dir.create(state, recursive = TRUE, showWarnings = FALSE)
 
-  # The fast channel runs on EVERY call — including the reuse path below.
-  # The first version upgraded only on a fresh launch, and the reuse branch
-  # returned before ever reaching it: exactly when someone re-runs run() to
-  # "get the update", nothing updated. Quiet, and never allowed to block or
-  # fail the launch.
+  # The signed update CHECK runs on every call, including reuse. It may cache a
+  # verified full-product installer and report it in the UI; it never replaces
+  # package/app/page files in the background.
   try(upgrade(quiet = TRUE), silent = TRUE)
-  # ...and the freshest notebook is copied where EVERY server generation
-  # looks, so even a long-lived kernel from an older install serves it on
-  # the very next reload.
-  try(sync_notebook(), silent = TRUE)
 
   live <- live_kernel_urls(state)
   at_port <- live[vapply(live, kernel_port, integer(1)) == as.integer(port)]
   if (!new && length(at_port)) {
     u <- unname(at_port[[1]])
-    page <- notebook_launch_url(u, state)
-    if (open) open_notebook(page, state)
-    message("CarmaR is already running behind: ", page)
-    return(invisible(page))
+    delivered <- is.null(file) || deliver_open_file(u, file)
+    if (delivered) {
+      page <- notebook_launch_url(u, state)
+      if (open) open_notebook(page, state)
+      message("CarmaR is already running behind: ", page)
+      return(invisible(page))
+    }
   }
 
   # Independent sessions get stable adjacent origins. That preserves browser
@@ -75,11 +82,15 @@ run <- function(port = 4747, open = TRUE, new = TRUE) {
   rscript <- file.path(R.home("bin"),
                        if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript")
   log <- file.path(state, paste0("kernel-", port, ".log"))
+  update_script <- trimws(Sys.getenv("CARMAR_UPDATE_SCRIPT", ""))
+  if (!nzchar(update_script)) update_script <- system.file("app", "update.sh", package = "carmar")
 
   p <- processx::process$new(
     rscript, serve,
     env = c(Sys.getenv(), CARMAR_PORT = as.character(port),
-            CARMAR_DIST = file.path(state, "dist")),
+            CARMAR_OPEN_FILE = if (is.null(file)) "" else file,
+            CARMAR_UPDATE_SCRIPT = update_script,
+            CARMAR_STATE = state),
     stdout = log, stderr = "2>&1",
     cleanup = FALSE                     # the notebook outlives this session
   )
@@ -147,6 +158,23 @@ run <- function(port = 4747, open = TRUE, new = TRUE) {
   # strand a student without the address.
   message("CarmaR is running behind this notebook file:\n  ", page)
   invisible(page)
+}
+
+#' Deliver a double-clicked document to an already-running local supervisor.
+#' The worker remains the authority on readable paths, size, and file type; this
+#' request only puts the path into the same pending-open slot cold launch uses.
+#' @noRd
+deliver_open_file <- function(kernel_url, file) {
+  target <- paste0(sub("/$", "", kernel_url), "/open?file=",
+                   utils::URLencode(file, reserved = TRUE))
+  con <- NULL
+  tryCatch({
+    con <- url(target, open = "rb")
+    readBin(con, "raw", n = 1024L)
+    TRUE
+  }, error = function(e) FALSE, finally = {
+    if (!is.null(con)) try(close(con), silent = TRUE)
+  })
 }
 
 #' Serve CarmaR to other people on the network
@@ -225,7 +253,6 @@ serve_shared <- function(hosts, port = 4747, bind = "0.0.0.0",
 
   state <- tools::R_user_dir("carmar", "data")
   dir.create(state, recursive = TRUE, showWarnings = FALSE)
-  try(sync_notebook(), silent = TRUE)
 
   serve <- system.file("app", "kernel", "serve.R", package = "carmar")
   if (!nzchar(serve)) stop("carmar is not installed correctly (serve.R is missing) - reinstall the package.")
@@ -238,7 +265,9 @@ serve_shared <- function(hosts, port = 4747, bind = "0.0.0.0",
   cfg <- c(CARMAR_PORT = as.character(as.integer(port)),
            CARMAR_BIND = trimws(bind),
            CARMAR_HOSTS = paste(trimws(hosts), collapse = ","),
-           CARMAR_DIST = file.path(state, "dist"))
+           # A shared deployment is updated by its fleet operator, never by a
+           # reader's browser or an inherited desktop-app environment.
+           CARMAR_UPDATE_SCRIPT = "")
   if (allow_unauthenticated) {
     cfg <- c(cfg, CARMAR_ALLOW_UNAUTHENTICATED = "1")
   } else {
@@ -448,158 +477,96 @@ stop_kernel <- function(port = 4747) {
   invisible(ok)
 }
 
-#' Put the newest notebook where every kernel looks
+#' Refuse the removed unsigned notebook synchronisation path
 #'
-#' The contract of `run()` is "serve the latest" — not "check for updates".
-#' Downloads land in the per-user dist; a CURRENT kernel pools that folder
-#' at request time, but a long-lived kernel from an older install only
-#' scans the package's own app/ folder. So on every `run()`, whatever the
-#' newest `carmar_V*.html` on this machine is gets copied into app/ too —
-#' after that, EVERY kernel generation serves it on its very next reload.
+#' Retained as an internal compatibility stub for callers from older package
+#' versions. It deliberately never reads or copies the historical per-user
+#' `dist` directory: updates are accepted only as signed full products.
 #'
-#' @param app The package app directory every serve.R scans.
-#' @param dist The per-user dist directory where downloads land.
-#' @return Invisibly, `TRUE` if a newer notebook was put in place.
+#' @param ... Ignored legacy arguments.
+#' @return Invisibly, `FALSE`.
 #' @keywords internal
-sync_notebook <- function(app = dirname(system.file("app", "kernel", package = "carmar")),
-                          dist = file.path(tools::R_user_dir("carmar", "data"), "dist")) {
-  v_of <- function(f) numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", basename(f)))
-  newest <- function(d) {
-    f <- list.files(d, pattern = "^carmar_V[0-9.]+\\.html$", full.names = TRUE)
-    if (!length(f)) return(NULL)
-    f[order(v_of(f), decreasing = TRUE)][1]
+sync_notebook <- function(...) invisible(FALSE)
+
+#' Execute the product-owned updater on this platform. @noRd
+run_updater <- function(script, args, stdout = FALSE, stderr = FALSE) {
+  sysname <- unname(Sys.info()[["sysname"]])
+  if (identical(sysname, "Windows")) {
+    choices <- Sys.which(c("powershell.exe", "powershell"))
+    command <- unname(choices[nzchar(choices)][1L])
+    if (!length(command) || is.na(command) || !grepl("[.]ps1$", script, ignore.case = TRUE)) {
+      return(list(ok = FALSE, output = character()))
+    }
+    command_args <- c("-NoLogo", "-NoProfile", "-NonInteractive",
+                      "-ExecutionPolicy", "Bypass", "-File", shQuote(script), args)
+  } else {
+    command <- "sh"
+    command_args <- c(shQuote(script), args)
   }
-  best <- newest(dist)
-  if (is.null(best)) return(invisible(FALSE))
-  have <- newest(app)
-  if (!is.null(have) && v_of(have) >= v_of(best)) return(invisible(FALSE))
-  # A library the user cannot write to just means this kernel serves from
-  # the per-user dist instead — file.copy returning FALSE is not an error.
-  invisible(isTRUE(suppressWarnings(
-    file.copy(best, file.path(app, basename(best)), overwrite = TRUE))))
+  output <- tryCatch(system2(command, command_args, stdout = stdout, stderr = stderr),
+                     error = function(e) structure(character(), status = 1L))
+  status <- if (is.numeric(output) && length(output) == 1L) output else attr(output, "status")
+  if (is.null(status)) status <- 0L
+  list(ok = identical(as.integer(status), 0L), output = as.character(output))
 }
 
-#' Upgrade CarmaR — the notebook and the package
+#' Check for a signed full-product CarmaR update
 #'
-#' Reads the release feed once and updates BOTH halves of an installation:
-#' the newest notebook is downloaded into your user data folder, and when the
-#' release is newer than the installed carmar package, the release's own
-#' package is installed too. `run()` calls this automatically. On macOS, a
-#' successful package update also refreshes CarmaR.app and CarmaR Helper.app
-#' from that package. Neither check may block or fail a launch: any trouble is
-#' a quiet no-op and CarmaR starts on what it has.
+#' Invokes the signed updater carried by CarmaR.app (or by this package). The
+#' updater verifies a detached release signature, unified component versions,
+#' artifact SHA-256 and the platform publisher identity. A check may cache a
+#' verified installer, but it never replaces executable files in the
+#' background. Unsigned legacy GitHub release metadata is not accepted.
 #'
 #' @param quiet Say nothing unless something was updated? Default `FALSE`.
 #' @return Invisibly, `TRUE` if anything was updated.
 #' @export
 upgrade <- function(quiet = FALSE) {
   say <- function(...) if (!quiet) message(...)
-  feed <- Sys.getenv("CARMAR_FEED",
-    "https://api.github.com/repos/mohsaqr/CarmaR-releases/releases/latest")
-  rel <- tryCatch(jsonlite::fromJSON(paste(slurp(feed), collapse = "\n"),
-                                     simplifyVector = FALSE),
-                  error = function(e) NULL)
-  if (is.null(rel)) { say("The release page is unreachable - no update check."); return(invisible(FALSE)) }
-  nb <- upgrade_notebook(rel, say)
-  pkg <- upgrade_package(rel, say)
-  invisible(isTRUE(nb) || isTRUE(pkg))
+  explicit <- Sys.getenv("CARMAR_UPDATE_SCRIPT", "")
+  candidates <- c(explicit,
+    path.expand("~/Applications/CarmaR.app/Contents/Resources/update.sh"),
+    "/Applications/CarmaR.app/Contents/Resources/update.sh",
+    system.file("app", "update.sh", package = "carmar"))
+  script <- candidates[nzchar(candidates) & file.exists(candidates)][1]
+  if (!length(script) || is.na(script)) {
+    say("No signed updater is installed; CarmaR left the installed version unchanged.")
+    return(invisible(FALSE))
+  }
+  if (!identical(unname(Sys.info()["sysname"]), "Darwin") && !nzchar(explicit)) {
+    say("Use the signed CarmaR installer to update this platform.")
+    return(invisible(FALSE))
+  }
+  checked <- run_updater(script, "check", stdout = FALSE, stderr = FALSE)
+  if (!isTRUE(checked$ok)) {
+    say("The signed update check could not run; CarmaR was not changed.")
+    return(invisible(FALSE))
+  }
+  line <- run_updater(script, "status", stdout = TRUE, stderr = FALSE)$output
+  fields <- if (length(line)) strsplit(line[[1]], "\t", fixed = TRUE)[[1]] else character(0)
+  state <- if (length(fields)) fields[[1]] else "unknown"
+  available <- if (length(fields) >= 3L) fields[[3]] else ""
+  if (state == "available") {
+    say("A verified CarmaR ", available, " update is ready in Settings > R session.")
+  } else if (!quiet && state %in% c("refused", "error", "unconfigured")) {
+    detail <- if (length(fields) >= 6L) fields[[6]] else "The signed update check did not complete."
+    say(detail)
+  }
+  invisible(identical(state, "available"))
 }
 
-#' The notebook half of `upgrade()`: newest `carmar_V*.html` into the
-#' per-user dist. One release JSON in, `TRUE` if a newer file landed.
+#' Removed legacy unsigned notebook update door.
 #' @keywords internal
 upgrade_notebook <- function(rel, say) {
-  dist <- file.path(tools::R_user_dir("carmar", "data"), "dist")
-  dir.create(dist, recursive = TRUE, showWarnings = FALSE)
-  assets <- rel$assets %||% list()
-  names_ <- vapply(assets, function(a) a$name %||% "", character(1))
-  hit <- grepl("^carmar_V[0-9.]+\\.html$", names_)
-  if (!any(hit)) { say("No notebook in the latest release."); return(FALSE) }
-  best <- which(hit)[order(numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", names_[hit])),
-                           decreasing = TRUE)][1]
-  want_name <- names_[[best]]
-  want_v <- numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", want_name))
-
-  have <- list.files(c(dist, dirname(system.file("app", "kernel", package = "carmar"))),
-                     pattern = "^carmar_V.*\\.html$")
-  have_v <- if (length(have)) max(numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", have))) else numeric_version("0")
-  if (want_v <= have_v) { say("CarmaR is up to date (", as.character(have_v), ")."); return(FALSE) }
-
-  target <- file.path(dist, want_name)
-  part <- paste0(target, ".part")
-  ok <- tryCatch({
-    old <- options(timeout = 120); on.exit(options(old), add = TRUE)
-    utils::download.file(assets[[best]]$browser_download_url, part,
-                         mode = "wb", quiet = TRUE) == 0
-  }, error = function(e) FALSE)
-  if (ok && file.exists(part) && file.size(part) > 10000) {
-    file.rename(part, target)
-    say("Updated to ", want_name, " - reload the CarmaR tab (or run carmar::run()).")
-    return(TRUE)
-  }
-  unlink(part)
-  say("The update download failed - CarmaR keeps working on its current version.")
-  FALSE
+  stop("Legacy unsigned notebook updates were removed; use the signed full-product updater.",
+       call. = FALSE)
 }
 
-#' The package half of `upgrade()`: when the release tag outruns the
-#' installed carmar, install the release's own `carmar.tar.gz` — the same
-#' payload the feed announced, so the check and the install can never
-#' disagree about what "latest" means. The kernel a launch spawns AFTER this
-#' reads serve.R from the new files, so the update takes effect immediately;
-#' only the R code of the session that ran the update stays old until the
-#' next launch. Verified by re-reading the installed version — a failed
-#' `R CMD INSTALL` only warns, it does not throw.
+#' Removed legacy unsigned R-package install door.
 #' @keywords internal
 upgrade_package <- function(rel, say) {
-  want <- tryCatch(numeric_version(sub("^[vV]", "", rel$tag_name %||% "")),
-                   error = function(e) NULL)
-  have <- tryCatch(utils::packageVersion("carmar"), error = function(e) NULL)
-  if (is.null(want) || is.null(have) || want <= have) return(FALSE)
-  assets <- rel$assets %||% list()
-  names_ <- vapply(assets, function(a) a$name %||% "", character(1))
-  hit <- which(names_ == "carmar.tar.gz")
-  if (!length(hit)) return(FALSE)
-
-  say("Updating the carmar package ", as.character(have), " -> ",
-      as.character(want), " ...")
-  part <- tempfile("carmar-", fileext = ".tar.gz")
-  on.exit(unlink(part), add = TRUE)
-  got <- tryCatch({
-    old <- options(timeout = 300); on.exit(options(old), add = TRUE)
-    utils::download.file(assets[[hit[1]]]$browser_download_url, part,
-                         mode = "wb", quiet = TRUE) == 0
-  }, error = function(e) FALSE)
-  if (!got || !file.exists(part) || file.size(part) < 1000) {
-    say("The package update download failed - CarmaR keeps its current version.")
-    return(FALSE)
-  }
-  ok <- tryCatch({
-    suppressWarnings(utils::install.packages(part, repos = NULL,
-                                             type = "source", quiet = TRUE))
-    isTRUE(utils::packageVersion("carmar") >= want)
-  }, error = function(e) FALSE)
-  if (ok) {
-    say("The carmar package is now ", as.character(want), ".")
-    # A macOS package also carries the current CarmaR.app and menu helper.
-    # Use a fresh R process so it loads install_app() from the package that was
-    # just written, rather than this still-running namespace. This keeps the
-    # carmar:// handler and embedded kernel on the same release as the package.
-    bundles <- system.file("app", "macos", "carmar-apps.tar.gz",
-                           package = "carmar")
-    if (identical(unname(Sys.info()["sysname"]), "Darwin") && file.exists(bundles)) {
-      package_lib <- dirname(find.package("carmar"))
-      lib_literal <- encodeString(package_lib, quote = '"')
-      expr <- paste0(".libPaths(c(", lib_literal,
-        ",.libPaths())); try(carmar::install_app(quiet=TRUE,helper=TRUE),silent=TRUE)")
-      refreshed <- tryCatch(system2(file.path(R.home("bin"), "Rscript"),
-        c("--vanilla", "-e", shQuote(expr)), stdout = FALSE, stderr = FALSE) == 0L,
-        error = function(e) FALSE)
-      if (refreshed) say("CarmaR.app and its menu helper are now on the same release.")
-      else say("The package updated, but the application bundles could not be refreshed.")
-    }
-  } else say("The package update could not be installed - CarmaR keeps its current version.")
-  ok
+  stop("Legacy unsigned package updates were removed; use the signed full-product updater.",
+       call. = FALSE)
 }
 
 `%||%` <- function(a, b) if (is.null(a)) b else a

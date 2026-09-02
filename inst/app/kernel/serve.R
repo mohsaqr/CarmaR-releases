@@ -21,6 +21,12 @@ source(file.path(here, "notebook-page.R"))
 source(file.path(here, "deployment.R"))
 source(file.path(here, "ai-policy.R"))
 source(file.path(here, "jobs.R"))
+source(file.path(here, "settings.R"))
+
+# Apply an administrator-owned desktop policy before any subsystem reads its
+# environment. Invalid or user-writable policy fails closed at the shared
+# startup gate below; no partial values are applied.
+managed_config <- carmar_managed_environment()
 
 # Before anything reads or writes a frame. The supervisor parses every browser
 # message and re-encodes every worker reply, so its own character locale
@@ -31,6 +37,40 @@ source(file.path(here, "jobs.R"))
 # {"url": ...} line. A stray [1] "UTF-8" ahead of that is noise at best and an
 # unparseable first line at worst.
 invisible(utf8_ctype())
+
+# Browser/supervisor compatibility. The protocol changes only when the wire
+# contract becomes incompatible; the build changes on every release. Packages
+# and app bundles stamp kernel-version beside this script. A source checkout
+# falls back to notebook.version.cjs so `npm run kernel` has the same identity.
+read_kernel_protocol <- function() {
+  candidates <- c(file.path(here, "kernel-protocol"),
+                  file.path(here, "..", "kernel.protocol"))
+  hit <- candidates[file.exists(candidates)][1L]
+  if (!length(hit) || is.na(hit)) stop("CarmaR kernel protocol stamp is missing.")
+  value <- suppressWarnings(as.integer(trimws(readLines(hit, warn = FALSE, n = 1L))))
+  if (length(value) != 1L || is.na(value) || value < 1L) {
+    stop("CarmaR kernel protocol stamp is invalid.")
+  }
+  value
+}
+CARMAR_PROTOCOL_VERSION <- read_kernel_protocol()
+read_kernel_build <- function() {
+  from_env <- trimws(Sys.getenv("CARMAR_KERNEL_BUILD", ""))
+  if (nzchar(from_env)) return(from_env)
+  stamp <- file.path(here, "kernel-version")
+  if (file.exists(stamp)) {
+    value <- trimws(readLines(stamp, warn = FALSE, n = 1L))
+    if (nzchar(value)) return(value)
+  }
+  source_version <- file.path(here, "..", "notebook.version.cjs")
+  if (file.exists(source_version)) {
+    src <- paste(readLines(source_version, warn = FALSE), collapse = "\n")
+    hit <- regmatches(src, regexec('version\\s*:\\s*"([^"]+)"', src))[[1]]
+    if (length(hit) >= 2L && nzchar(hit[[2]])) return(hit[[2]])
+  }
+  "unknown"
+}
+CARMAR_KERNEL_BUILD <- read_kernel_build()
 
 # Where to listen. 127.0.0.1 unless an operator says otherwise, and saying
 # otherwise inverts the trust model — see spike/deployment.R, which owns that
@@ -96,7 +136,7 @@ deployment <- carmar_deployment(port)
 # nobody finds out until the data has already gone to the wrong vendor.
 ai_policy <- carmar_ai_policy()
 
-startup_errors <- c(deployment$errors, ai_policy$errors)
+startup_errors <- c(managed_config$errors, deployment$errors, ai_policy$errors)
 if (length(startup_errors)) {
   # Refusing to start is the correct outcome. A server that binds to the
   # network with the loopback trust model is not a degraded CarmaR, it is a
@@ -137,7 +177,30 @@ audit <- function(event, ...) {
 # console becomes the stdin pipe). The analyzer below stays batch — it parses
 # and never pauses. Falls back to batch by itself on Windows or a missing R
 # binary; the ready frame's `mode` says which one booted.
-k <- kernel_start(file.path(here, "worker-boot.R"), interactive = TRUE)
+# The user's own settings, resolved once. `settings_state` is re-resolved by a
+# successful settings_set so a later read reports the value that is actually
+# in force, and `linger_s` / `HISTORY_ENABLED` below are the two the running
+# kernel can honour immediately (see each one's `effect`).
+settings_state <- carmar_settings_resolve()
+settings_value <- function(key) carmar_settings_value(settings_state, key)
+audit("settings", detail = "startup", status = settings_state$file$status,
+      keys = length(settings_state$file$values))
+
+# What every child inherits from the user's settings, and which R to run.
+# Defined here so the three spawn sites cannot drift: a setting that reaches
+# the worker but not the restarted worker is the worst kind of half-applied.
+settings_child_env <- function() carmar_settings_child_env(settings_state)
+settings_rscript <- function() {
+  chosen <- settings_value("rscript_path")
+  detect_rscript(if (is.character(chosen) && nzchar(chosen)) chosen
+                 else Sys.getenv("CARMAR_RSCRIPT", ""))
+}
+
+start_execution_worker <- function() {
+  kernel_start(file.path(here, "worker-boot.R"), interactive = TRUE,
+               rscript = settings_rscript(), env_extra = settings_child_env())
+}
+k <- start_execution_worker()
 sockets <- new.env(parent = emptyenv())
 # Each connection is a RECORD (an environment), not a bare ws: the MCP plane
 # below needs to know which socket is a notebook page and which is an agent,
@@ -149,6 +212,9 @@ sockets$open <- list()
 # connects. Without replaying it, every page that opens later sits on
 # "connecting…" forever waiting for a frame that was broadcast to nobody.
 sockets$hello <- NULL
+sockets$worker_recovering <- FALSE
+sockets$worker_restart_attempts <- 0L
+sockets$worker_restart_after <- 0
 # MCP routing state: which page most recently claimed to be the user's active
 # window, and which agent socket is waiting for which request id.
 sockets$active_page <- NULL
@@ -173,7 +239,7 @@ sockets$job_seq <- 0L
 # cancels the clock). CARMAR_LINGER is the grace in seconds; 0 or negative
 # disables. The clock never starts before the first connection ever, so a
 # slow browser launch cannot lose the kernel it was opening.
-linger_s <- suppressWarnings(as.numeric(Sys.getenv("CARMAR_LINGER", "600")))
+linger_s <- suppressWarnings(as.numeric(settings_value("linger_seconds")))
 if (!length(linger_s) || !is.finite(linger_s)) linger_s <- 600
 # A socket that stopped answering is not a connection, and until 0.60.1 the
 # supervisor could not tell the difference. `ws$onClose` is the ONLY thing that
@@ -249,7 +315,7 @@ notebook_page <- function() {
   # One implementation, in notebook-page.R, because tools/app/launch.sh has to
   # ask the same question at open time — the announcement below is computed
   # once at startup and goes stale the moment a new build lands.
-  page <- carmar_notebook_page(here)
+  page <- carmar_notebook_page(here, CARMAR_KERNEL_BUILD)
   if (nzchar(page)) return(page)
   file.path(here, "index.html")
 }
@@ -668,9 +734,11 @@ start_sibling_session <- function() {
 #
 # Ops a declared MCP agent is refused outright: raw evaluation (it must go
 # through a visible chunk_run) and the user's credentials.
-AGENT_REFUSED <- c("exec", "interrupt", "restart", "debug_cmd", "ai-key",
+AGENT_REFUSED <- c("exec", "interrupt", "force_stop", "restart", "debug_cmd", "ai-key",
                    "console_history", "input_reply", "ai-audit-read",
-                   "job_start", "job_stop", "job_open")
+                   "job_start", "job_stop", "job_open",
+                   "settings_get", "settings_set", "settings_reset",
+                   "update_status", "update_action", "project_action")
 
 # `job_start` is on that list DELIBERATELY, and it is the entry most open to
 # argument. A job is visible — it announces itself, streams into a pane and
@@ -794,7 +862,10 @@ ai_key_write <- function(value) {
 # Off entirely with CARMAR_NO_HISTORY=1, because "record everything I type"
 # must be refusable.
 HISTORY_MAX <- 2000L
-HISTORY_ENABLED <- !nzchar(Sys.getenv("CARMAR_NO_HISTORY", ""))
+# Consulted INSIDE history_read()/history_add() per call, never captured at the
+# top — which is what makes flipping it in Settings take effect immediately
+# rather than at the next launch.
+HISTORY_ENABLED <- isTRUE(settings_value("history_enabled"))
 
 history_path <- function() {
   dir <- tools::R_user_dir("carmar", "data")
@@ -840,8 +911,8 @@ history_add <- function(line) {
   tryCatch({ writeLines(kept, path); TRUE }, error = function(e) FALSE)
 }
 
-FORWARDED <- c("env", "obj", "struct", "view", "colstats", "rm", "packages",
-               "package_action", "package_help", "help", "wd",
+FORWARDED <- c("env", "obj", "struct", "view", "colstats", "rm", "packages", "doctor",
+               "package_action", "package_help", "project_status", "project_action", "help", "wd",
                "parse", "complete", "files", "import", "readfile", "writefile", "writefiles_atomic",
                "hover", "format", "sniff", "choose",
                # The file tree's New Folder, Rename and Delete. These MUTATE
@@ -960,6 +1031,8 @@ app <- list(
       return(resp(200L, "application/json",
                   toJSON(list(ok = TRUE, worker = k$proc$is_alive(),
                               pending_open = !is.null(sockets$pending_open),
+                              protocol = CARMAR_PROTOCOL_VERSION,
+                              kernel_build = CARMAR_KERNEL_BUILD,
                               capabilities = c("published-direct-v1",
                                                "published-pairing-v3")),
                          auto_unbox = TRUE),
@@ -1495,8 +1568,11 @@ job_start <- function(rec, cmd) {
   sockets$job_seq <- sockets$job_seq + 1L
   id <- paste0("job-", sockets$job_seq)
   started <- tryCatch(
-    kernel_start(file.path(here, "job-run.R"),
-                 env_extra = c(spec$env, CARMAR_JOB_ID = id)),
+    # The job's own env FIRST, then the job's identity — and the user's
+    # settings under both, so a quarto_path set in Settings reaches the render
+    # while a job that names its own still wins.
+    kernel_start(file.path(here, "job-run.R"), rscript = settings_rscript(),
+                 env_extra = c(settings_child_env(), spec$env, CARMAR_JOB_ID = id)),
     error = function(e) conditionMessage(e))
   if (is.character(started)) {
     audit("job-start-failed", detail = started)
@@ -1645,6 +1721,175 @@ notify_mcp_clients <- function() {
 #' rules are exactly permissive enough to turn a JSON array or object into
 #' something that runs but is not what anybody meant.
 scalar_chr <- function(x) is.character(x) && length(x) == 1L && !is.na(x)
+
+# ── signed product updates ─────────────────────────────────────────────────
+#
+# The updater is a product-owned script injected by the launcher. The browser
+# never supplies a path or a command line: it may name one action from this
+# fixed vocabulary, and the supervisor starts that exact script directly.
+# Checks run out-of-process because a slow proxy/download must not freeze the
+# R worker, WebSocket heartbeats, recovery, or document saves.
+update_job <- new.env(parent = emptyenv())
+update_job$proc <- NULL
+update_job$action <- ""
+update_job$started <- as.POSIXct(NA)
+
+update_runner_spec <- function(script, args = character(),
+                               sysname = unname(Sys.info()[["sysname"]]),
+                               which = Sys.which) {
+  if (identical(sysname, "Windows")) {
+    candidates <- unname(which(c("powershell.exe", "powershell")))
+    command <- candidates[nzchar(candidates)][1L]
+    if (!length(command) || is.na(command) || !grepl("[.]ps1$", script, ignore.case = TRUE)) {
+      return(NULL)
+    }
+    return(list(command = command,
+                args = c("-NoLogo", "-NoProfile", "-NonInteractive",
+                         "-ExecutionPolicy", "Bypass", "-File", script, args)))
+  }
+  if (!file.exists("/bin/sh")) return(NULL)
+  list(command = "/bin/sh", args = c(script, args))
+}
+
+update_script_path <- function() {
+  script <- trimws(Sys.getenv("CARMAR_UPDATE_SCRIPT", ""))
+  if (!isTRUE(deployment$loopback) || !nzchar(script) || !file.exists(script)) return("")
+  script <- normalizePath(script, winslash = "/", mustWork = TRUE)
+  if (is.null(update_runner_spec(script))) return("")
+  script
+}
+
+update_text <- function(x, max = 240L) {
+  if (!length(x) || is.na(x[[1L]])) return("")
+  value <- enc2utf8(as.character(x[[1L]]))
+  value <- gsub("[[:cntrl:]]", " ", value)
+  trimws(substr(value, 1L, max))
+}
+
+update_version <- function(x) {
+  value <- update_text(x, 64L)
+  if (grepl("^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$", value)) value else ""
+}
+
+update_job_busy <- function() {
+  proc <- update_job$proc
+  if (is.null(proc)) return(FALSE)
+  alive <- isTRUE(tryCatch(proc$is_alive(), error = function(e) FALSE))
+  if (alive && is.finite(as.numeric(update_job$started)) &&
+      as.numeric(difftime(Sys.time(), update_job$started, units = "secs")) > 360) {
+    try(proc$kill(), silent = TRUE)
+    alive <- FALSE
+    audit("update-timeout", detail = update_job$action)
+  }
+  if (!alive) {
+    update_job$proc <- NULL
+    update_job$action <- ""
+  }
+  alive
+}
+
+#' Read the updater's deliberately small status record.
+#'
+#' The fourth TSV field is an installer PATH. It is intentionally discarded:
+#' the settings page needs state and versions, not a map of the user's disk.
+update_status_state <- function() {
+  script <- update_script_path()
+  if (!nzchar(script)) return(list(
+    supported = FALSE, state = "unavailable", current = CARMAR_KERNEL_BUILD,
+    offered = "", previous = "", busy = FALSE, action = "",
+    can_check = FALSE, can_update = FALSE, can_defer = FALSE,
+    can_rollback = FALSE,
+    message = "Signed desktop updates are not available in this deployment."
+  ))
+
+  busy <- update_job_busy()
+  if (busy) return(list(
+    supported = TRUE, state = "checking", current = CARMAR_KERNEL_BUILD,
+    offered = "", previous = "", busy = TRUE, action = update_job$action,
+    can_check = FALSE, can_update = FALSE, can_defer = FALSE,
+    can_rollback = FALSE,
+    message = switch(update_job$action,
+      check = "Checking and verifying the signed update…",
+      install = "Opening the verified installer…",
+      rollback = "Opening the last-known-good installer…",
+      defer = "Saving the defer choice…", "Working…")
+  ))
+
+  spec <- update_runner_spec(script, "status")
+  ran <- tryCatch(processx::run(
+    spec$command, spec$args, timeout = 5000,
+    error_on_status = FALSE, echo = FALSE
+  ), error = function(e) NULL)
+  line <- if (!is.null(ran) && identical(ran$status, 0L)) {
+    strsplit(ran$stdout %||% "", "\n", fixed = TRUE)[[1L]][1L]
+  } else ""
+  fields <- if (nzchar(line)) strsplit(line, "\t", fixed = TRUE)[[1L]] else character()
+  at <- function(i) if (length(fields) >= i) fields[[i]] else ""
+  state <- update_text(at(1L), 32L)
+  allowed <- c("unknown", "current", "available", "deferred", "installing",
+               "rolling-back", "error", "offline", "refused", "unconfigured")
+  if (!(state %in% allowed)) state <- "error"
+  current <- update_version(at(2L))
+  offered <- update_version(at(3L))
+  previous <- update_version(at(5L))
+  message <- update_text(at(6L))
+  if (!nzchar(message)) message <- if (identical(state, "error"))
+    "The signed updater did not return a valid status." else "Update status is available."
+  list(
+    supported = TRUE, state = state,
+    current = current %||% "", offered = offered, previous = previous,
+    busy = FALSE, action = "", can_check = !identical(state, "unconfigured"),
+    can_update = identical(state, "available") && nzchar(offered),
+    can_defer = state %in% c("current", "available", "deferred", "offline"),
+    can_rollback = !identical(state, "unconfigured") && nzchar(previous), message = message
+  )
+}
+
+update_start_action <- function(action, days = NULL) {
+  script <- update_script_path()
+  if (!nzchar(script)) return(list(ok = FALSE, reason = "unavailable",
+    error = "Signed desktop updates are not available in this deployment."))
+  if (!(action %in% c("check", "defer", "install", "rollback"))) {
+    return(list(ok = FALSE, reason = "action", error = "No such update action."))
+  }
+  if (update_job_busy()) return(list(ok = FALSE, reason = "busy",
+    error = "Another update action is still running."))
+
+  status <- update_status_state()
+  if (identical(action, "check") && !isTRUE(status$can_check)) {
+    return(list(ok = FALSE, reason = "state", error = status$message))
+  }
+  if (identical(action, "defer") && !isTRUE(status$can_defer)) {
+    return(list(ok = FALSE, reason = "state", error = "Update checks cannot be deferred in the current state."))
+  }
+  if (identical(action, "install") && !isTRUE(status$can_update)) {
+    return(list(ok = FALSE, reason = "state", error = "No verified update is ready."))
+  }
+  if (identical(action, "rollback") && !isTRUE(status$can_rollback)) {
+    return(list(ok = FALSE, reason = "state", error = "No last-known-good version is available."))
+  }
+  if (identical(action, "defer")) {
+    days <- suppressWarnings(as.integer(days))
+    if (length(days) != 1L || is.na(days) || days < 1L || days > 30L) {
+      return(list(ok = FALSE, reason = "days", error = "Defer days must be from 1 to 30."))
+    }
+  }
+
+  args <- c(action, if (identical(action, "defer")) as.character(days))
+  spec <- update_runner_spec(script, args)
+  proc <- tryCatch(processx::process$new(
+    spec$command, spec$args, env = Sys.getenv(),
+    stdout = if (.Platform$OS.type == "windows") "NUL" else "/dev/null",
+    stderr = "2>&1", cleanup = TRUE
+  ), error = function(e) NULL)
+  if (is.null(proc)) return(list(ok = FALSE, reason = "start",
+    error = "The signed updater could not be started."))
+  update_job$proc <- proc
+  update_job$action <- action
+  update_job$started <- Sys.time()
+  audit("update-action", detail = action)
+  list(ok = TRUE, accepted = TRUE, action = action)
+}
 
 #' Give a browser command a session-unique worker id and remember its owner.
 route_command <- function(cmd, rec, kind) {
@@ -1810,7 +2055,9 @@ ensure_analyzer <- function() {
     sockets$analyze_queue <- list()
     audit("analyzer-restart")
   }
-  started <- tryCatch(kernel_start(file.path(here, "analyze.R")),
+  started <- tryCatch(kernel_start(file.path(here, "analyze.R"),
+                                   rscript = settings_rscript(),
+                                   env_extra = settings_child_env()),
                       error = function(e) NULL)
   sockets$analyzer <- started
   if (is.null(started)) audit("analyzer-start-failed")
@@ -1952,6 +2199,48 @@ fail_worker_routes <- function(reason) {
     drop_worker_route(wire_id)
   }
   invisible(NULL)
+}
+
+#' Recover the execution worker without taking the notebook server down.
+#'
+#' The page, its unsaved buffers, WebSocket and analysis worker all belong to
+#' the supervisor. Only R's in-memory session is lost. A dead worker therefore
+#' starts a bounded-backoff respawn loop instead of ending serve.R and turning a
+#' recoverable calculation crash into a dead application.
+recover_execution_worker <- function() {
+  if (!isTRUE(sockets$worker_recovering)) {
+    sockets$worker_recovering <- TRUE
+    sockets$worker_restart_attempts <- 0L
+    sockets$worker_restart_after <- 0
+    sockets$hello <- NULL
+    fail_worker_routes("The R worker stopped unexpectedly. Its session state was lost; CarmaR is starting a fresh R session.")
+    rm(list = ls(sockets$running), envir = sockets$running)
+    rm(list = ls(sockets$worker_routes), envir = sockets$worker_routes)
+    sockets$worker_queue <- list()
+    sockets$worker_active <- NULL
+    sockets$worker_terminal <- NULL
+    sockets$debug_paused <- FALSE
+    sockets$input_waiting <- FALSE
+    payload <- toJSON(list(type = "worker-died", recovering = TRUE), auto_unbox = TRUE)
+    lapply(sockets$open, function(r) try(r$ws$send(payload), silent = TRUE))
+    audit("worker-died", recovering = TRUE)
+  }
+  now <- as.numeric(Sys.time())
+  if (now < sockets$worker_restart_after) return(invisible(FALSE))
+  sockets$worker_restart_attempts <- sockets$worker_restart_attempts + 1L
+  attempt <- sockets$worker_restart_attempts
+  delay <- c(0.25, 0.5, 1, 2, 5, 10)[min(attempt, 6L)]
+  sockets$worker_restart_after <- now + delay
+  started <- tryCatch(start_execution_worker(), error = function(e) {
+    audit("worker-respawn-failed", attempt = attempt, detail = conditionMessage(e))
+    NULL
+  })
+  if (is.null(started)) return(invisible(FALSE))
+  k <<- started
+  audit("worker-respawn", attempt = attempt)
+  payload <- toJSON(list(type = "worker-restarting", attempt = attempt), auto_unbox = TRUE)
+  lapply(sockets$open, function(r) try(r$ws$send(payload), silent = TRUE))
+  invisible(TRUE)
 }
 
 #' Best-effort refusal for a frame that cannot be forwarded. A silent drop
@@ -2329,11 +2618,61 @@ handle_frame <- function(message, rec) {
         "ai-audit-read" = "Agents cannot read the audit stream.",
         "job_start" = "Agents cannot start development jobs; ask the user to run one.",
         "job_stop" = "Agents cannot stop development jobs.",
+        # settings_GET is refused as firmly as the writes. Not because the
+        # values are secret, but because handing back the confinement root,
+        # the audit-log path and whether AI-text logging is on is a MAP OF THE
+        # DEPLOYMENT'S CONTROLS, given to a process whose entire premise is
+        # that it is not the user.
+        "settings_get" = "Agents cannot read CarmaR's settings.",
+        "settings_set" = "Agents cannot change CarmaR's settings.",
+        "settings_reset" = "Agents cannot reset CarmaR's settings.",
+        "update_status" = "Agents cannot inspect desktop update state.",
+        "update_action" = "Agents cannot install, defer, or roll back CarmaR.",
+        "project_action" = "Agents cannot install or restore project packages.",
         "job_open" = "Agents cannot open files on the user's desktop.",
         "Agents run code through notebook chunks (chunk_run), not raw exec.")
       reply <- toJSON(list(type = cmd$type, id = cmd$id, error = why), auto_unbox = TRUE)
       try(rec$ws$send(reply), silent = TRUE)
     }
+    return(invisible(NULL))
+  }
+
+  # Signed desktop updates are supervisor operations, never worker commands.
+  # Local notebook pages only: a remote/shared kernel is updated by its fleet
+  # operator, and a native or agent socket does not get a UI gesture by
+  # pretending to be the person looking at this settings pane.
+  if (cmd$type %in% c("update_status", "update_action")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    reply <- function(payload) try(rec$ws$send(toJSON(c(
+      list(type = cmd$type, id = cmd$id), payload),
+      auto_unbox = TRUE, null = "null")), silent = TRUE)
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit("update-refused", reason = "class", class = rec$class %||% "unknown")
+      reply(list(ok = FALSE, reason = "class",
+                 error = "Only the local notebook page may manage desktop updates."))
+      return(invisible(NULL))
+    }
+    if (!isTRUE(deployment$loopback)) {
+      audit("update-refused", reason = "posture", class = rec$class %||% "unknown")
+      reply(list(ok = FALSE, reason = "posture",
+                 error = "This deployment is updated by its administrator."))
+      return(invisible(NULL))
+    }
+    if (identical(cmd$type, "update_status")) {
+      reply(update_status_state())
+    } else {
+      action <- if (scalar_chr(cmd$action)) cmd$action else ""
+      reply(update_start_action(action, cmd$days %||% NULL))
+    }
+    return(invisible(NULL))
+  }
+
+  if (identical(cmd$type, "project_action") && !isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+    if (scalar_chr(cmd$id)) try(rec$ws$send(toJSON(list(
+      type = "project_action", id = cmd$id, ok = FALSE, reason = "class",
+      error = "Only the local notebook page may change the project environment."
+    ), auto_unbox = TRUE)), silent = TRUE)
+    audit("project-action-refused", reason = "class", class = rec$class %||% "unknown")
     return(invisible(NULL))
   }
 
@@ -2466,6 +2805,14 @@ handle_frame <- function(message, rec) {
     }
     return(invisible(NULL))
   }
+  # Escalation after SIGINT did not land. This deliberately kills only the
+  # execution worker; the supervisor's recovery loop keeps the notebook,
+  # WebSocket, analyzer and unsaved text alive and starts a fresh R session.
+  if (identical(cmd$type, "force_stop")) {
+    audit("force-stop", class = rec$class %||% "unknown")
+    if (k$proc$is_alive()) try(k$proc$kill(), silent = TRUE)
+    return(invisible(NULL))
+  }
   # Restart: a NEW worker process — fresh globalenv, fresh packages. The stored
   # hello is stale the moment the old worker dies; the new worker's ready frame
   # replaces it via pump() and reaches every open socket.
@@ -2473,8 +2820,10 @@ handle_frame <- function(message, rec) {
     audit("restart")
     fail_worker_routes("R was restarted — this request was abandoned.")
     try(kernel_stop(k, grace = 1), silent = TRUE)
-    k <<- kernel_start(file.path(here, "worker-boot.R"), interactive = TRUE)
+    k <<- start_execution_worker()
     sockets$hello <- NULL
+    sockets$worker_recovering <- FALSE
+    sockets$worker_restart_attempts <- 0L
     # In-flight runs died with the old worker; the new one will never emit
     # their done frames, and a stuck entry would block idle linger forever.
     rm(list = ls(sockets$running), envir = sockets$running)
@@ -2483,6 +2832,7 @@ handle_frame <- function(message, rec) {
     sockets$worker_active <- NULL
     sockets$worker_terminal <- NULL
     sockets$debug_paused <- FALSE
+    sockets$input_waiting <- FALSE
     return(invisible(NULL))
   }
   # A SIBLING SESSION: another supervisor, another R process, another origin.
@@ -2581,6 +2931,9 @@ handle_frame <- function(message, rec) {
       # an array. Same collapsed-scalar trap as `providers` above, one level
       # deeper — and here the page would render a select with no options.
       models = lapply(ai_policy$models, I),
+      # Administrator-pinned, credential-free provider endpoints. Unlike a
+      # model list each value is deliberately scalar.
+      base_urls = ai_policy$base_urls,
       local_only = isTRUE(ai_policy$local_only),
       note = ai_policy$note,
       # Is anything listening? The page asks once, here, rather than sending
@@ -2692,6 +3045,166 @@ handle_frame <- function(message, rec) {
     } else {
       reply(error = "console_history: action must be get, add or clear.")
     }
+    return(invisible(NULL))
+  }
+
+  # ── the user's own settings ────────────────────────────────────────────────
+  #
+  # In NEITHER allow-list, and that is the decision rather than an omission.
+  # FORWARDED routes to the evaluating worker and ANALYZE_FORWARDED to the
+  # analyzer; these read a file the SUPERVISOR owns and mutate SUPERVISOR
+  # globals (linger_s, HISTORY_ENABLED), which worker.R could not change at
+  # all — and routing a config-file WRITER into the process that evaluates
+  # user code is precisely where such an op is most dangerous. Same shape and
+  # same reason as ai-key: the supervisor answers it itself.
+  #
+  # Page-only for the ai-key reason exactly: a native client could edit
+  # ~/.config/R/carmar/settings.json itself as this user, but CarmaR does not
+  # do it for it, so the promise holds for every client rather than only the
+  # polite ones. A published origin is refused because its reader approved that
+  # site to run the chunks they press, not to reconfigure their kernel.
+  if (cmd$type %in% c("settings_get", "settings_set", "settings_reset")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    reply <- function(...) try(rec$ws$send(toJSON(list(type = cmd$type, id = cmd$id, ...),
+                                                  auto_unbox = TRUE, null = "null")), silent = TRUE)
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit("settings-refused", reason = "class", detail = cmd$type,
+            class = rec$class %||% "unknown")
+      reply(ok = FALSE, reason = "class",
+            error = "Only the notebook page may read or change CarmaR's settings.")
+      return(invisible(NULL))
+    }
+    # An unauthenticated shared kernel has no "the user" whose home directory
+    # this is, so there is nobody to save a preference for.
+    if (!isTRUE(deployment$loopback) && !nzchar(rec$user %||% "")) {
+      audit("settings-refused", reason = "posture", detail = cmd$type)
+      reply(ok = FALSE, reason = "posture",
+            error = "This kernel serves unauthenticated clients, so it keeps no per-user settings.")
+      return(invisible(NULL))
+    }
+
+    send_state <- function(extra = list()) {
+      st <- settings_state
+      rows <- lapply(names(st$settings), function(k) {
+        e <- st$settings[[k]]
+        stored <- st$file$values[[k]]
+        list(key = e$key, label = e$label, kind = e$kind, effect = e$effect,
+             value = e$value, source = e$source, locked = isTRUE(e$locked),
+             writable = isTRUE(e$writable), env = e$env,
+             min = e$min, max = e$max,
+             # "the stored value differs from the one in force" — which is how
+             # a restart_r / next_launch setting shows a pending badge instead
+             # of pretending it already applied.
+             pending = !is.null(stored) && !identical(stored, e$value))
+      })
+      admin <- lapply(st$admin, function(a)
+        list(key = a$key, value = a$value, source = a$source))
+      # I() on both, or a one-entry list unboxes to a scalar and the page
+      # renders it character by character — the trap console_history and
+      # ai-policy each already carry a comment about.
+      args <- c(list(settings = I(rows), admin = I(admin),
+                     file = list(status = st$file$status, path = st$file$path,
+                                 error = st$file$error,
+                                 ignored = I(as.character(st$file$ignored)),
+                                 rejected = I(st$file$rejected))), extra)
+      do.call(reply, args)
+    }
+
+    if (identical(cmd$type, "settings_get")) {
+      # RE-RESOLVE, never report the cache. The file can change under a running
+      # kernel — a hand edit, another session, a restored backup — and a page
+      # that was told the cached value would be shown a setting the kernel is
+      # not actually using. The live ones are re-applied at the same moment,
+      # because those are precisely the ones that can be honoured now, and
+      # reporting a new linger while running on the old one is the lie the
+      # whole `effect` field exists to prevent.
+      settings_state <<- carmar_settings_resolve()
+      linger_s <<- suppressWarnings(as.numeric(settings_value("linger_seconds")))
+      if (!length(linger_s) || !is.finite(linger_s)) linger_s <<- 600
+      HISTORY_ENABLED <<- isTRUE(settings_value("history_enabled"))
+      audit("settings", detail = "get", status = settings_state$file$status)
+      send_state()
+      return(invisible(NULL))
+    }
+
+    if (identical(cmd$type, "settings_reset")) {
+      unlink(carmar_settings_path())
+      settings_state <<- carmar_settings_resolve()
+      linger_s <<- suppressWarnings(as.numeric(settings_value("linger_seconds")))
+      HISTORY_ENABLED <<- isTRUE(settings_value("history_enabled"))
+      audit("settings", detail = "reset", ok = TRUE)
+      send_state(list(ok = TRUE))
+      return(invisible(NULL))
+    }
+
+    # settings_set — one key per frame. A batch has to answer "three landed,
+    # one did not", and the honest answer is per-key anyway.
+    key <- if (scalar_chr(cmd$key)) cmd$key else ""
+    entry <- settings_entry(key)
+    if (is.null(entry)) {
+      audit("settings-refused", reason = "unknown", key = key)
+      reply(ok = FALSE, key = key, reason = if (key %in% SETTINGS_ADMIN) "admin" else "unknown",
+            error = if (key %in% SETTINGS_ADMIN)
+              "That setting belongs to this deployment's administrator."
+            else "No such setting.")
+      return(invisible(NULL))
+    }
+    if (isTRUE(settings_state$settings[[key]]$locked)) {
+      audit("settings-refused", reason = "env", key = key)
+      reply(ok = FALSE, key = key, reason = "env",
+            error = paste0("This deployment sets ", entry$env,
+                           ", so it cannot be changed here."))
+      return(invisible(NULL))
+    }
+    if (!identical(settings_state$file$status, "ok") &&
+        !identical(settings_state$file$status, "missing")) {
+      # Writing over a file a human hand-edited, because of one stray byte,
+      # would destroy their config. Reset is the documented way out.
+      audit("settings-refused", reason = "file", key = key)
+      reply(ok = FALSE, key = key, reason = "file", error = settings_state$file$error)
+      return(invisible(NULL))
+    }
+
+    values <- settings_state$file$values
+    if (is.null(cmd$value)) {
+      values[[key]] <- NULL                       # unset: back to env/default
+    } else {
+      verdict <- carmar_settings_validate(key, cmd$value)
+      if (!isTRUE(verdict$ok)) {
+        # Refused, never coerced, and the file is NOT written — the ai-key
+        # scar, where a payload of the wrong type fell through to "" and
+        # deleted the key while replying ok:true.
+        audit("settings-refused", reason = "value", key = key)
+        reply(ok = FALSE, key = key,
+              reason = if (identical(entry$kind, "number")) "range" else "type",
+              error = paste0(entry$label, " ", verdict$reason, "."))
+        return(invisible(NULL))
+      }
+      values[[key]] <- verdict$value
+    }
+
+    if (!isTRUE(carmar_settings_write(values))) {
+      audit("settings", detail = "set", key = key, ok = FALSE)
+      reply(ok = FALSE, key = key, reason = "write",
+            error = "The settings file could not be written.")
+      return(invisible(NULL))
+    }
+    settings_state <<- carmar_settings_resolve()
+    applied <- FALSE
+    if (identical(entry$effect, "live")) {
+      if (identical(key, "linger_seconds")) {
+        linger_s <<- suppressWarnings(as.numeric(settings_value("linger_seconds")))
+        applied <- TRUE
+      } else if (identical(key, "history_enabled")) {
+        HISTORY_ENABLED <<- isTRUE(settings_value("history_enabled"))
+        applied <- TRUE
+      } else if (identical(key, "quarto_path")) {
+        applied <- TRUE          # the job child is spawned per job
+      }
+    }
+    audit("settings", detail = "set", key = key, ok = TRUE)
+    send_state(list(ok = TRUE, key = key, effect = entry$effect,
+                    applied = applied, pending = !applied))
     return(invisible(NULL))
   }
 
@@ -2807,6 +3320,18 @@ pump <- function() {
 
     # Session-wide lifecycle frames have no owner and must reach every tab —
     # and no id to rewrite, so they forward exactly as the kernel wrote them.
+    if (identical(e$type, "ready")) {
+      e$protocol <- CARMAR_PROTOCOL_VERSION
+      e$kernel_build <- CARMAR_KERNEL_BUILD
+      # relay_frame normally preserves the worker's original bytes verbatim.
+      # This frame is now supervisor-owned, so force the faithful re-encode or
+      # the two fields above would exist only in this R object, not on the wire.
+      attr(e, "raw") <- NULL
+      sockets$worker_recovering <- FALSE
+      sockets$worker_restart_attempts <- 0L
+      sockets$worker_restart_after <- 0
+      audit("worker-ready", pid = e$pid %||% NA)
+    }
     payload <- relay_frame(e)
     if (identical(e$type, "ready")) sockets$hello <- payload
     lapply(sockets$open, function(r) try(r$ws$send(payload), silent = TRUE))
@@ -2819,6 +3344,7 @@ server <- httpuv::startServer(host, port, app)
 audit("listening", bind = host, port = port, loopback = deployment$loopback,
       require_origin = deployment$require_origin,
       trust_proxy = deployment$trust_proxy,
+      managed_config = identical(managed_config$status, "ok"),
       ai_policy = isTRUE(ai_policy$set),
       ai_providers = paste(ai_policy$providers, collapse = ","),
       unauthenticated = deployment$allow_unauthenticated)
@@ -3024,13 +3550,11 @@ repeat {
   linger_check()
   if (isTRUE(sockets$quit)) break
   if (!k$proc$is_alive()) {
-    lapply(sockets$open, function(r)
-      try(r$ws$send(toJSON(list(type = "worker-died"), auto_unbox = TRUE)), silent = TRUE))
-    break
+    recover_execution_worker()
   }
 }
 
-# The loop only breaks on a deliberate shutdown or a dead worker — take the
+# The loop only breaks on a deliberate shutdown — take the
 # discovery file with us so agents stop finding a kernel that is gone. A
 # SIGKILL skips this, which is why readers must health-check before trusting
 # a runtime file (stale files are litter, not authority). Running Claude

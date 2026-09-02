@@ -35,6 +35,16 @@ if (!isTRUE(l10n_info()[["UTF-8"]])) {
   }
 }
 
+# Finder also starts apps with the filesystem ROOT as their working directory,
+# and everything downstream inherits it: getwd() is "/", so every native file
+# dialog opens at the Computer view, "Reveal" reveals the root, and relative
+# paths land where nobody looks. Exactly "/" is the pathological case — a
+# kernel started from a terminal keeps that terminal's directory, which is the
+# developer's own choice and is left alone.
+if (identical(getwd(), "/")) {
+  try(setwd(path.expand("~")), silent = TRUE)
+}
+
 # jsonlite is used via :: only — attaching it would put it on the USER's search
 # path, and the worker must leave no trace in the session it hosts.
 stopifnot(requireNamespace("jsonlite", quietly = TRUE))
@@ -181,7 +191,7 @@ import_sources <- local({
   else if (length(file_arg)) {
     dirname(normalizePath(sub("^--file=", "", file_arg[1L]), mustWork = FALSE))
   } else getwd()
-  file.path(here, c("sniff.R", "chooser.R"))
+  file.path(here, c("sniff.R", "chooser.R", "project.R"))
 })
 # environment(), not parent.frame(): inside a nested local() the parent frame
 # is the eval machinery's, not this file's private scope, and the functions
@@ -203,10 +213,18 @@ invisible(lapply(Filter(file.exists, import_sources),
 # user already set: their .Rprofile loads here (we deliberately do not use
 # --vanilla), and it is where r-universe and institutional mirrors live.
 local({
+  managed_mirror <- trimws(Sys.getenv("CARMAR_CRAN_MIRROR", ""))
+  if (nzchar(managed_mirror) && !grepl("^https://", managed_mirror)) {
+    stop("CARMAR_CRAN_MIRROR must be an HTTPS URL.")
+  }
   repos <- getOption("repos")
   cran <- if (is.null(repos)) NA_character_ else unname(repos["CRAN"])
   unset <- is.null(repos) || is.na(cran) || !nzchar(cran) || identical(cran, "@CRAN@")
-  if (unset) {
+  if (nzchar(managed_mirror)) {
+    options(repos = unlist(utils::modifyList(as.list(if (is.null(repos)) character() else repos),
+                                              list(CRAN = managed_mirror))))
+    Sys.setenv(RENV_CONFIG_REPOS_OVERRIDE = managed_mirror)
+  } else if (unset) {
     # Keep every other repo the profile declared; only CRAN was missing.
     # modifyList says that in one verb: it replaces CRAN where it exists and
     # appends it where it does not, leaving r-universe and institutional
@@ -259,25 +277,67 @@ R_KEYWORDS <- c("if", "else", "repeat", "while", "function", "for", "in",
 #' quartz, and a machine that reaches that fallback is not the GUI worker the
 #' hang needs anyway.
 #'
-#' @return The first working type: cairo (headless), else quartz, else Xlib.
-detect_plot_type <- function() {
-  candidates <- c(if (isTRUE(capabilities("cairo"))) "cairo",
-                  if (isTRUE(capabilities("aqua"))) "quartz",
-                  "Xlib")
-  works <- function(type) {
-    f <- tempfile(fileext = ".png")
-    ok <- tryCatch({
-      suppressWarnings(grDevices::png(f, width = 12, height = 12, type = type))
-      graphics::plot.new()
-      grDevices::dev.off()
-      file.exists(f) && file.info(f)$size > 0L
-    }, error = function(e) FALSE, warning = function(w) FALSE)
-    if (!is.null(grDevices::dev.list())) try(grDevices::dev.off(), silent = TRUE)
-    unlink(f)
-    isTRUE(ok)
+#' THE TYPE VOCABULARY IS PER-PLATFORM, and getting that wrong is what
+#' produced "no cairo dll" on Windows. `png(type=)` accepts "windows",
+#' "cairo" and "cairo-png" on Windows; "cairo", "quartz" and "Xlib" on
+#' Unix-alikes. The old ladder was cairo → quartz → Xlib on every platform,
+#' which on Windows means: cairo, then a type that CANNOT work there. So a
+#' Windows R whose cairo.dll is missing — a stripped or portable install, or
+#' one where grDevices' cairo was not shipped — had no reachable candidate.
+#'
+#' It then hit the second half of the bug. `if (is.na(hit)) candidates[1L]`
+#' returns the FIRST candidate when nothing works, and the first candidate is
+#' cairo — the one just proven broken. PLOT_TYPE became "cairo", and every
+#' plot after that raised the cairo.dll load error at the user. The fallback
+#' is now the platform's OWN default, which on Windows is the GDI device and
+#' renders perfectly well without cairo.
+#'
+#' `os` and `works` are arguments so the ladder can be tested for every
+#' platform from one machine (spike/test-plot-type.R).
+#'
+#' @param os One of "windows" or "unix" (.Platform$OS.type).
+#' @param mac Whether this is macOS (quartz only exists there).
+#' @return The first working type; failing that, the platform's own default.
+detect_plot_type <- function(os = .Platform$OS.type,
+                             mac = isTRUE(capabilities("aqua")),
+                             works = NULL) {
+  windows <- identical(os, "windows")
+  candidates <- if (windows) {
+    # No Xlib and no quartz on Windows, ever. "windows" is the GDI device R
+    # itself defaults to and needs no external library at all.
+    c(if (isTRUE(capabilities("cairo"))) "cairo", "windows")
+  } else {
+    c(if (isTRUE(capabilities("cairo"))) "cairo",
+      if (mac) "quartz",
+      "Xlib")
+  }
+  if (is.null(works)) {
+    works <- function(type) {
+      f <- tempfile(fileext = ".png")
+      ok <- tryCatch({
+        # 200x200, not 12x12. plot.new() on a 12-pixel canvas raises "figure
+        # margins too large" — a PLOTTING error about the canvas, nothing to do
+        # with the device — and the tryCatch below turned that into "this
+        # device does not work". Measured: quartz fails the 12px probe and
+        # renders perfectly at 200. A probe that rejects a working device
+        # sends the worker down the ladder for no reason, and on Windows the
+        # bottom of that ladder was the broken cairo. Same size the ragg probe
+        # already uses.
+        suppressWarnings(grDevices::png(f, width = 200, height = 200, type = type))
+        graphics::plot.new()
+        grDevices::dev.off()
+        file.exists(f) && file.info(f)$size > 0L
+      }, error = function(e) FALSE, warning = function(w) FALSE)
+      if (!is.null(grDevices::dev.list())) try(grDevices::dev.off(), silent = TRUE)
+      unlink(f)
+      isTRUE(ok)
+    }
   }
   hit <- Position(works, candidates)
-  if (is.na(hit)) candidates[1L] else candidates[hit]
+  if (!is.na(hit)) return(candidates[hit])
+  # Nothing rendered. Return what R itself would use rather than the first
+  # candidate, which is the type the probe just disproved.
+  if (windows) "windows" else if (mac) "quartz" else "Xlib"
 }
 
 #' The raster backend for cell plots. `ragg::agg_png` is a pure-C++ device with
@@ -396,12 +456,42 @@ carmar_readline <- function(prompt = "") {
   emit(list(type = "input_done"))
   answer
 }
+# `print(df)` joins the same shadow, for the same reason readline did: the
+# machinery already exists, nothing announced the moment. Autoprint sends a
+# visible data.frame as a structured `dataframe` frame; an EXPLICIT print()
+# returned invisibly and streamed 51 rows of console text, so the two spellings
+# of "show me this table" produced different universes. The shadow narrows to
+# exactly the calls where table intent is unambiguous — a data.frame or matrix,
+# no formatting arguments — and delegates everything else to base untouched:
+#   - extra args (`print(df, digits = 3)`) ask for R's console formatting; honor it.
+#   - an active sink means the caller is CAPTURING text (capture.output); a
+#     frame emitted there would be captured with it — corrupted for the caller,
+#     lost to the page.
+#   - no run id means no page is listening; base behaviour is the only one.
+# RUN_STATE carries the current run's id from run_cell to the shadow.
+RUN_STATE <- new.env(parent = emptyenv())
+RUN_STATE$id <- NULL
+carmar_print <- function(x, ...) {
+  if (is.null(RUN_STATE$id) || length(list(...)) || sink.number() > 0L) {
+    return(base::print(x, ...))
+  }
+  if (is.data.frame(x)) {
+    emit_dataframe(RUN_STATE$id, x)
+    return(invisible(x))
+  }
+  if (is.matrix(x) && nrow(x) > 0L && ncol(x) > 0L) {
+    emit_dataframe(RUN_STATE$id, matrix_to_df(x))
+    return(invisible(x))
+  }
+  base::print(x, ...)
+}
 INPUT_SHADOW <- "carmar:input"
 if (!(INPUT_SHADOW %in% search())) {
-  # warn.conflicts = FALSE: masking `readline` is the entire point, and a
-  # startup warning about it would be printed into the user's first cell.
-  attach(list(readline = carmar_readline), name = INPUT_SHADOW,
-         warn.conflicts = FALSE)
+  # warn.conflicts = FALSE: masking `readline` (and `print`) is the entire
+  # point, and a startup warning about it would be printed into the user's
+  # first cell.
+  attach(list(readline = carmar_readline, print = carmar_print),
+         name = INPUT_SHADOW, warn.conflicts = FALSE)
 }
 
 #' A function's formals as one display string, defaults included.
@@ -497,7 +587,7 @@ emit_obj <- function(id, name = NULL, max_lines = 200L) {
     type = "obj", id = id, name = name, class = class(v)[1L],
     str = capped(tryCatch(utils::capture.output(utils::str(v)),
                           error = function(e) conditionMessage(e))),
-    preview = capped(tryCatch(utils::capture.output(print(v)),
+    preview = capped(tryCatch(utils::capture.output(base::print(v)),
                               error = function(e) conditionMessage(e)))
   )
   if (is.function(v)) {
@@ -1646,6 +1736,20 @@ emit_package_action <- function(id, action, name, lib = NULL) {
   emit(c(list(type = "package_action", id = id, action = action, name = name), result))
 }
 
+#' Project and renv state, without paths or lockfile contents on the wire.
+emit_project_status <- function(id) {
+  result <- tryCatch(carmar_project_status(), error = function(e)
+    list(error = conditionMessage(e)))
+  emit(c(list(type = "project_status", id = id), result))
+}
+
+#' One explicit, visible environment action: install renv or restore its lock.
+emit_project_action <- function(id, action) {
+  result <- tryCatch(carmar_project_action(action), error = function(e)
+    list(ok = FALSE, error = conditionMessage(e)))
+  emit(c(list(type = "project_action", id = id, action = action), result))
+}
+
 #' Package metadata and documentation index for the Help pane.
 emit_package_help <- function(id, name) {
   valid_name <- is.character(name) && length(name) == 1L &&
@@ -1700,7 +1804,7 @@ emit_help <- function(id, topic) {
     if (!is.null(rd)) {
       paste(utils::capture.output(tools::Rd2HTML(rd)), collapse = "\n")
     } else {
-      txt <- paste(utils::capture.output(print(paths)), collapse = "\n")
+      txt <- paste(utils::capture.output(base::print(paths)), collapse = "\n")
       if (!nzchar(trimws(txt))) NULL
       else paste0("<pre class=\"carmar-help-text\">",
                   gsub("<", "&lt;", gsub("&", "&amp;", txt), fixed = TRUE), "</pre>")
@@ -1769,7 +1873,7 @@ emit_hover <- function(id, name) {
   detail <- NULL
   if (is.function(obj)) {
     signature <- tryCatch({
-      txt <- paste(utils::capture.output(print(args(obj))), collapse = " ")
+      txt <- paste(utils::capture.output(base::print(args(obj))), collapse = " ")
       txt <- sub("^function\\s*", paste0(sym, " "), txt)
       txt <- sub("\\s*NULL\\s*$", "", txt)
       trimws(gsub("\\s+", " ", txt))
@@ -2075,6 +2179,90 @@ emit_revealpath <- function(id, path = NULL) {
   invisible(NULL)
 }
 
+#' Check whether CarmaR's current R session is usable without collecting user
+#' material.
+#'
+#' This reply is deliberately a FACT ALLOW-LIST. It never contains getwd(),
+#' R.home(), .libPaths(), environment values, notebook text, or file names.
+#' The browser turns these booleans and bounded version strings into the support
+#' report, so adding a field here cannot accidentally export a project path or
+#' credential.
+#'
+#' @param id Request id.
+#' @return Invisibly NULL. Emits one `doctor` frame.
+emit_doctor <- function(id) {
+  can_create_in <- function(dir) {
+    if (!is.character(dir) || length(dir) != 1L || !dir.exists(dir)) return(FALSE)
+    probe <- tempfile(".carmar-doctor-", tmpdir = dir)
+    on.exit(unlink(probe, force = TRUE), add = TRUE)
+    isTRUE(tryCatch(file.create(probe, showWarnings = FALSE), error = function(e) FALSE))
+  }
+
+  q_configured <- trimws(Sys.getenv("CARMAR_QUARTO", ""))
+  q_path <- if (nzchar(q_configured)) q_configured else unname(Sys.which("quarto"))
+  q_available <- is.character(q_path) && length(q_path) == 1L && nzchar(q_path) && file.exists(q_path)
+  q_version <- ""
+  if (q_available) {
+    raw_version <- tryCatch(
+      suppressWarnings(system2(q_path, "--version", stdout = TRUE, stderr = TRUE, timeout = 5L)),
+      error = function(e) character())
+    # A version NUMBER only. Never relay arbitrary command output: a wrapper
+    # could print its path, command line, or environment on stderr.
+    hit <- regmatches(paste(raw_version, collapse = " "),
+                      regexpr("[0-9]+(?:\\.[0-9]+){1,3}", paste(raw_version, collapse = " "),
+                              perl = TRUE))
+    if (length(hit) && nzchar(hit[[1L]])) q_version <- hit[[1L]]
+  }
+
+  required_names <- c("jsonlite", "httpuv", "processx")
+  required <- lapply(required_names, function(name) requireNamespace(name, quietly = TRUE))
+  names(required) <- required_names
+  sys <- Sys.info()
+  libs <- .libPaths()
+  rscript_name <- if (identical(unname(sys[["sysname"]]), "Windows")) "Rscript.exe" else "Rscript"
+
+  emit(list(
+    type = "doctor", id = id,
+    runtime = list(
+      r_version = paste(R.version$major, R.version$minor, sep = "."),
+      worker_mode = if (identical(WORKER_MODE, "interactive")) "interactive" else "batch",
+      os = unname(sys[["sysname"]] %||% ""),
+      os_release = unname(sys[["release"]] %||% ""),
+      architecture = unname(sys[["machine"]] %||% ""),
+      locale = Sys.getlocale("LC_CTYPE") %||% "",
+      rscript_available = file.exists(file.path(R.home("bin"), rscript_name))
+    ),
+    permissions = list(
+      working_directory_writable = can_create_in(getwd()),
+      temporary_directory_writable = can_create_in(tempdir()),
+      library_writable = any(vapply(libs, can_create_in, logical(1))),
+      library_count = length(libs)
+    ),
+    quarto = list(
+      available = q_available,
+      configured = nzchar(q_configured),
+      version = q_version
+    ),
+    required_packages = required,
+    deployment = list(
+      loopback = Sys.getenv("CARMAR_BIND", "127.0.0.1") %in% c("", "127.0.0.1", "localhost", "::1"),
+      confinement = nzchar(Sys.getenv("CARMAR_ROOT", "")),
+      audit = nzchar(Sys.getenv("CARMAR_LOG", "")),
+      ai_local_only = identical(Sys.getenv("CARMAR_AI_LOCAL_ONLY", ""), "1"),
+      ai_policy = nzchar(Sys.getenv("CARMAR_AI_POLICY", "")) || nzchar(Sys.getenv("CARMAR_AI_PROVIDERS", "")),
+      origin_required = !identical(Sys.getenv("CARMAR_REQUIRE_ORIGIN", "1"), "0"),
+      trusted_proxy = identical(Sys.getenv("CARMAR_TRUST_PROXY", ""), "1"),
+      unauthenticated = identical(Sys.getenv("CARMAR_ALLOW_UNAUTHENTICATED", ""), "1")
+    ),
+    proxy = list(
+      http = nzchar(Sys.getenv("HTTP_PROXY", "")) || nzchar(Sys.getenv("http_proxy", "")),
+      https = nzchar(Sys.getenv("HTTPS_PROXY", "")) || nzchar(Sys.getenv("https_proxy", "")),
+      bypass = nzchar(Sys.getenv("NO_PROXY", "")) || nzchar(Sys.getenv("no_proxy", ""))
+    )
+  ))
+  invisible(NULL)
+}
+
 #' Read a text file — the script editor's Open.
 #'
 #' Text only, and capped: the editor is for .R scripts, and handing a 400 MB
@@ -2150,10 +2338,24 @@ emit_writefile <- function(id, path = NULL, text = "", expected = NULL) {
   backup <- tempfile(pattern = ".carmar-backup-", tmpdir = dirname(p))
   existed <- file.exists(p)
   old_mode <- if (existed) file.info(p)$mode else NULL
-  on.exit({
+  committed <- FALSE
+  cleanup_save <- function() {
+    # An error after the old file moved aside but before the replacement landed
+    # must restore the old path. This is also the deterministic fault-injection
+    # seam used by the document-safety test; production never sets the variable.
+    if (!committed && existed && !file.exists(p) && file.exists(backup)) {
+      try(file.rename(backup, p), silent = TRUE)
+    }
     if (file.exists(temp)) unlink(temp)
     if (file.exists(backup) && file.exists(p)) unlink(backup)
-  }, add = TRUE)
+  }
+  # Error replies are observable by the browser immediately. Clean first so a
+  # completed failure reply also means recovery has finished on disk.
+  fail_after_cleanup <- function(msg) {
+    cleanup_save()
+    fail(msg)
+  }
+  on.exit(cleanup_save(), add = TRUE)
   ok <- tryCatch({
     con <- file(temp, open = "wb")
     writeBin(charToRaw(enc2utf8(body)), con)
@@ -2163,12 +2365,16 @@ emit_writefile <- function(id, path = NULL, text = "", expected = NULL) {
     TRUE
   }, error = function(e) conditionMessage(e),
   finally = if (exists("con", inherits = FALSE) && !is.null(con)) try(close(con), silent = TRUE))
-  if (is.character(ok)) return(fail(ok))
-  if (existed && !file.rename(p, backup)) return(fail("could not prepare the existing file for replacement"))
+  if (is.character(ok)) return(fail_after_cleanup(ok))
+  if (existed && !file.rename(p, backup)) return(fail_after_cleanup("could not prepare the existing file for replacement"))
+  if (identical(Sys.getenv("CARMAR_TEST_SAVE_FAILURE", ""), "after-backup")) {
+    return(fail_after_cleanup("simulated failure after backup"))
+  }
   if (!file.rename(temp, p)) {
     if (existed && file.exists(backup)) file.rename(backup, p)
-    return(fail("could not atomically replace the file; the original was restored"))
+    return(fail_after_cleanup("could not atomically replace the file; the original was restored"))
   }
+  committed <- TRUE
   if (file.exists(backup)) unlink(backup)
   emit(list(type = "writefile", id = id, path = normalizePath(p),
             bytes = nchar(body, type = "bytes")))
@@ -2849,6 +3055,28 @@ capture_trace <- function(max_frames = 40L) {
   })
 }
 
+#' Return a package name only when R or its message identifies one safely.
+#'
+#' `packageNotFoundError` carries a structured `$package` field in current R.
+#' The narrow message fallback covers older R releases.  In both cases the
+#' allow-list is deliberately the same one used by `package_action`, so an
+#' error message can never become code or an arbitrary install target.
+carmar_missing_package <- function(error) {
+  valid <- function(value) {
+    is.character(value) && length(value) == 1L && !is.na(value) &&
+      grepl("^[A-Za-z][A-Za-z0-9.]*$", value)
+  }
+  package <- tryCatch(error$package, error = function(e) NULL)
+  if (valid(package)) return(package)
+
+  message <- tryCatch(conditionMessage(error), error = function(e) "")
+  match <- regexec(
+    "(?:there is no package called|package) [‘’'\"]([A-Za-z][A-Za-z0-9.]*)[‘’'\"](?: is not installed)?",
+    message, perl = TRUE, ignore.case = TRUE)
+  pieces <- regmatches(message, match)[[1L]]
+  if (length(pieces) >= 2L && valid(pieces[[2L]])) pieces[[2L]] else NULL
+}
+
 #' @return Invisibly NULL. Emits exactly one `done` frame.
 run_cell <- function(id, source, dims = NULL, srcname = NULL) {
   stopifnot(is.character(source), length(source) == 1L)
@@ -2864,8 +3092,13 @@ run_cell <- function(id, source, dims = NULL, srcname = NULL) {
   # run_cell entirely and wedge the whole exec route. A dims that is not a
   # list is no dims.
   if (!is.null(dims) && !is.list(dims)) dims <- NULL
+  # The print shadow needs to know which run an explicit print(df) belongs to;
+  # cleared on every exit so a print outside a run falls back to base.
+  RUN_STATE$id <- id
+  on.exit(RUN_STATE$id <- NULL, add = TRUE)
   status <- "ok"
   detail <- NULL
+  missing_package <- NULL
   plot_dir <- tempfile("carmar-plots-")
   dir.create(plot_dir)
   seen <- character(0)
@@ -2944,7 +3177,7 @@ run_cell <- function(id, source, dims = NULL, srcname = NULL) {
             if (inherits(v, "htmlwidget")) emit_widget(id, v)
             else if (is.data.frame(v)) emit_dataframe(id, v)
             else if (is.matrix(v) && nrow(v) > 0L && ncol(v) > 0L) emit_dataframe(id, matrix_to_df(v))
-            else print(v)
+            else base::print(v)
           }
           # Re-arm function breakpoints after EVERY top-level expression, not
           # after the cell: the RStudio-typical chunk defines a function and
@@ -2994,6 +3227,7 @@ run_cell <- function(id, source, dims = NULL, srcname = NULL) {
     error = function(e) {
       status <<- "error"
       detail <<- conditionMessage(e)
+      missing_package <<- carmar_missing_package(e)
       # A parse error has no stack and no expression index; its position comes
       # from the message instead, exactly as the analyzer reads it.
       emit(list(type = "traceback", id = id,
@@ -3018,7 +3252,8 @@ run_cell <- function(id, source, dims = NULL, srcname = NULL) {
   unlink(plot_dir, recursive = TRUE)
 
   flush(stdout())
-  emit(list(type = "done", id = id, status = status, message = detail))
+  emit(list(type = "done", id = id, status = status, message = detail,
+            missingPackage = missing_package))
 }
 
 #' Read one command line from stdin, tolerating an interrupt that lands while
@@ -3171,8 +3406,9 @@ emit(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
           # debugger exists. "batch" (Windows, or no R binary beside Rscript)
           # means it cannot, and clients must not offer breakpoints.
           mode = WORKER_MODE,
-          commands = I(c("exec", "env", "obj", "struct", "parse", "format",
+          commands = I(c("exec", "env", "obj", "struct", "parse", "format", "doctor",
                          "complete", "packages", "package_action", "package_help",
+                         "project_status", "project_action",
                          "help", "hover", "wd", "files", "choose", "sniff",
                          "import", "readfile", "writefile", "writefiles_atomic", "view", "colstats",
                          "mkdir", "renamepath", "deletepath", "copypath", "revealpath",
@@ -3219,10 +3455,13 @@ repeat {
   if (identical(cmd$type, "struct"))   emit_struct(cmd$id, cmd$name, cmd$path)
   if (identical(cmd$type, "parse"))    emit_parse(cmd$id, cmd$source)
   if (identical(cmd$type, "format"))   emit_format(cmd$id, cmd$source)
+  if (identical(cmd$type, "doctor"))   emit_doctor(cmd$id)
   if (identical(cmd$type, "complete")) emit_complete(cmd$id, cmd$line, cmd$cursor)
   if (identical(cmd$type, "packages")) emit_packages(cmd$id, cmd$scope)
   if (identical(cmd$type, "package_action")) emit_package_action(cmd$id, cmd$action, cmd$name, cmd$lib)
   if (identical(cmd$type, "package_help")) emit_package_help(cmd$id, cmd$name)
+  if (identical(cmd$type, "project_status")) emit_project_status(cmd$id)
+  if (identical(cmd$type, "project_action")) emit_project_action(cmd$id, cmd$action)
   if (identical(cmd$type, "help"))     emit_help(cmd$id, cmd$topic)
   if (identical(cmd$type, "hover"))    emit_hover(cmd$id, cmd$name)
   if (identical(cmd$type, "wd"))       emit_wd(cmd$id, cmd$path)

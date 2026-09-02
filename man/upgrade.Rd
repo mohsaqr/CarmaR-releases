@@ -1,6 +1,6 @@
 \name{upgrade}
 \alias{upgrade}
-\title{Upgrade CarmaR --- the notebook and the package}
+\title{Check for a signed full-product CarmaR update}
 \usage{
 upgrade(quiet = FALSE)
 }
@@ -11,12 +11,9 @@ upgrade(quiet = FALSE)
 Invisibly, \code{TRUE} if anything was updated.
 }
 \description{
-Reads the release feed once and updates BOTH halves of an installation: the
-newest notebook is downloaded into your user data folder, and when the
-release is newer than the installed carmar package, the release's own
-package is installed too. \code{run()} calls this automatically.
-On macOS, a package update also refreshes CarmaR.app and CarmaR Helper.app so
-the custom URL handler and embedded kernel stay on the same release.
-Neither check may block or fail a launch: any trouble is a quiet no-op and
-CarmaR starts on what it has.
+Invokes the signed updater carried by CarmaR.app or the package. The updater
+verifies a detached release signature, unified component versions, artifact
+SHA-256 and the platform publisher identity. A check may cache a verified
+installer, but never replaces executable files in the background. Unsigned
+legacy release metadata is refused. \code{run()} performs this check quietly.
 }

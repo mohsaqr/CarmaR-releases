@@ -80,6 +80,36 @@ normalise_models <- function(raw) {
   out
 }
 
+#' Normalise administrator-pinned provider endpoints.
+#'
+#' These values are returned to the page, so credentials, query strings and
+#' fragments are forbidden. Hosted gateways must use HTTPS. Loopback HTTP is
+#' allowed only for the providers that genuinely run on this machine.
+normalise_base_urls <- function(raw) {
+  if (is.null(raw) || !length(raw) || is.null(names(raw))) {
+    return(list(values = list(), errors = character(0)))
+  }
+  out <- list()
+  errors <- character(0)
+  for (provider in names(raw)[nzchar(names(raw))]) {
+    values <- as.character(unlist(raw[[provider]]))
+    value <- if (length(values)) trimws(values[[1L]]) else ""
+    hosted <- grepl("^https://[^/@?#[:space:]]+(?::[0-9]+)?(?:/[^?#[:space:]]*)?/?$",
+                    value, perl = TRUE, ignore.case = TRUE)
+    loopback <- provider %in% ON_MACHINE_PROVIDERS &&
+      grepl("^http://(?:localhost|127[.]0[.]0[.]1|\\[::1\\])(?::[0-9]+)?(?:/[^?#[:space:]]*)?/?$",
+            value, perl = TRUE, ignore.case = TRUE)
+    if (!nzchar(value) || length(values) != 1L || (!hosted && !loopback)) {
+      errors <- c(errors, paste0(
+        "AI policy base_urls.", provider,
+        " must be one credential-free HTTPS URL (or loopback HTTP for an on-machine provider)."))
+    } else {
+      out[[provider]] <- value
+    }
+  }
+  list(values = out, errors = errors)
+}
+
 policy_split <- function(value) {
   parts <- trimws(unlist(strsplit(value %||% "", "[,[:space:]]+")))
   parts[nzchar(parts)]
@@ -101,6 +131,7 @@ carmar_ai_policy <- function(env = Sys.getenv) {
   path <- trimws(env("CARMAR_AI_POLICY", ""))
   named <- character(0)
   models <- list()
+  base_urls <- list()
   local_only <- identical(env("CARMAR_AI_LOCAL_ONLY", ""), "1")
   note <- ""
   source <- ""
@@ -127,6 +158,9 @@ carmar_ai_policy <- function(env = Sys.getenv) {
         # a typo hides in. An administrator pinning models is already writing a
         # file.
         models <- normalise_models(doc$models)
+        endpoints <- normalise_base_urls(doc$base_urls)
+        base_urls <- endpoints$values
+        errors <- c(errors, endpoints$errors)
       }
     }
   } else if (nzchar(env("CARMAR_AI_PROVIDERS", ""))) {
@@ -169,10 +203,14 @@ carmar_ai_policy <- function(env = Sys.getenv) {
   # leaving it in would make the page render a constraint on a control the user
   # cannot reach anyway.
   models <- models[intersect(names(models), providers)]
-  if (length(errors)) models <- list()
+  base_urls <- base_urls[intersect(names(base_urls), providers)]
+  if (length(errors)) {
+    models <- list()
+    base_urls <- list()
+  }
 
   list(set = set, source = source, providers = providers,
-       models = models,
+       models = models, base_urls = base_urls,
        local_only = local_only, note = note, unknown = unknown,
        errors = errors,
        # The two doors the supervisor actually owns, precomputed so the call

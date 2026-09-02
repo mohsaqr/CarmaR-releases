@@ -18,11 +18,30 @@ suppressPackageStartupMessages(library(jsonlite))
 #' Order: an explicit `CARMAR_RSCRIPT`, then the macOS framework R, then PATH.
 #'
 #' @return Path to an Rscript binary.
-detect_rscript <- function() {
-  explicit <- Sys.getenv("CARMAR_RSCRIPT", "")
+#' `explicit` is an argument rather than only an env read so serve.R can pass
+#' the RESOLVED value (a user's rscript_path from settings, or the env var when
+#' a deployment set one). Defaulting to the env var keeps every existing call
+#' correct without changing it.
+detect_rscript <- function(explicit = Sys.getenv("CARMAR_RSCRIPT", "")) {
   if (nzchar(explicit) && file.exists(explicit)) return(explicit)
-  framework <- "/Library/Frameworks/R.framework/Versions/Current/Resources/bin/Rscript"
-  if (file.exists(framework)) return(framework)
+  # The same ladder tools/app/launch.sh walks, and for the same reason: this
+  # process may itself have been started by a Finder launch, whose PATH is
+  # /usr/bin:/bin:/usr/sbin:/sbin — so Sys.which() finds a CRAN framework
+  # install and misses Homebrew, rig, conda and Posit entirely. PATH is the
+  # LAST rung, not the second.
+  known <- c(
+    "/Library/Frameworks/R.framework/Versions/Current/Resources/bin/Rscript",
+    "/opt/homebrew/bin/Rscript",
+    "/usr/local/bin/Rscript",
+    "/opt/local/bin/Rscript",
+    "/usr/bin/Rscript"
+  )
+  for (cand in known) if (file.exists(cand)) return(cand)
+  # `Versions/Current` is a symlink CRAN maintains and other installers do
+  # not; newest version first.
+  versioned <- sort(Sys.glob(
+    "/Library/Frameworks/R.framework/Versions/*/Resources/bin/Rscript"), decreasing = TRUE)
+  if (length(versioned)) return(versioned[[1]])
   unname(Sys.which("Rscript"))
 }
 

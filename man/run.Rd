@@ -2,7 +2,7 @@
 \alias{run}
 \title{Launch CarmaR}
 \usage{
-run(port = 4747, open = TRUE, new = TRUE)
+run(port = 4747, open = TRUE, new = TRUE, file = NULL)
 }
 \arguments{
 \item{port}{Port for the kernel. The default 4747 is deliberate and fixed:
@@ -13,6 +13,10 @@ ports would greet the student with an empty notebook every time.}
 
 \item{new}{Start an independent session? Default \code{TRUE}. Set \code{FALSE}
 to reopen a live session on \code{port} when there is one.}
+
+\item{file}{Optional document path delivered to the notebook. File
+associations use this with \code{new = FALSE}, so a double-click reuses the
+live session when possible and starts one only when necessary.}
 
 }
 \value{

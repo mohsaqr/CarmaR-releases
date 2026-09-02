@@ -10,22 +10,29 @@
 # Character sort is wrong for versions twice over (V0.9 > V0.12, V0.13 > V1.0);
 # numeric_version knows. That is the whole reason this is R and not a shell glob.
 
-#' The newest built notebook across every place one can land.
+#' The newest built notebook carried by this installed product.
 #'
 #' @param here  the directory holding serve.R (the repo's spike/, or a
 #'   distribution's kernel/ folder).
-#' @return Path to an HTML file, or "" when no build is present.
-carmar_notebook_page <- function(here) {
-  # ALL locations pooled, best VERSION wins — updaters drop new files in a
-  # dist/ (the app bundle's, or CARMAR_DIST: the per-user dir carmar::run()
-  # announces) while the bundle carries its own. `.beta.min` is ignored so a
-  # debuggable build is served during development.
-  user_dist <- Sys.getenv("CARMAR_DIST", "")
-  dirs <- c(if (nzchar(user_dist)) user_dist,
-            file.path(here, "..", "dist"), file.path(here, ".."))
+#' @param build Optional exact release identity. A running kernel passes its
+#'   stamped build so an independently downloaded page cannot replace the
+#'   matching page underneath a live supervisor.
+#' @return Path to an HTML file, or "" when no matching build is present.
+carmar_notebook_page <- function(here, build = "") {
+  # Only product-owned locations are eligible. Historical package releases
+  # accepted CARMAR_DIST and let an unsigned per-user download replace the
+  # page executed beside a trusted kernel. Full-product updates now replace
+  # the signed/notarized installation, so that mutable override is both
+  # unnecessary and a supply-chain bypass. `.beta.min` remains ignored so a
+  # debuggable product-owned build is served during development.
+  dirs <- c(file.path(here, "..", "dist"), file.path(here, ".."))
   built <- unlist(lapply(dirs, function(d)
     list.files(d, pattern = "^carmar_V.*[^n]\\.html$", full.names = TRUE)))
   if (length(built) == 0L) return("")
+  if (nzchar(build) && !identical(build, "unknown")) {
+    built <- built[basename(built) == paste0("carmar_V", build, ".html")]
+    if (length(built) == 0L) return("")
+  }
   v <- tryCatch(numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", basename(built))),
                 error = function(e) NULL)
   if (!is.null(v)) return(built[order(v, decreasing = TRUE)][1L])
