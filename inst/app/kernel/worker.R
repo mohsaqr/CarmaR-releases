@@ -483,6 +483,11 @@ carmar_print <- function(x, ...) {
     emit_dataframe(RUN_STATE$id, matrix_to_df(x))
     return(invisible(x))
   }
+  rich <- rich_html_of(x)
+  if (!is.null(rich)) {
+    emit_rich(RUN_STATE$id, rich)
+    return(invisible(x))
+  }
   base::print(x, ...)
 }
 INPUT_SHADOW <- "carmar:input"
@@ -2743,8 +2748,10 @@ dep_files <- function(x) {
 #'
 #' @param w An htmlwidget.
 #' @return A single HTML string.
-widget_standalone_html <- function(w) {
-  rendered <- htmltools::renderTags(htmltools::as.tags(w, standalone = FALSE))
+widget_standalone_html <- function(w, fit = FALSE) {
+  tags <- if (inherits(w, "htmlwidget")) htmltools::as.tags(w, standalone = FALSE)
+          else htmltools::as.tags(w)
+  rendered <- htmltools::renderTags(tags)
   deps <- htmltools::resolveDependencies(rendered$dependencies)
   slurp <- function(path) paste(readLines(path, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
   inline_one <- function(d) {
@@ -2764,13 +2771,82 @@ widget_standalone_html <- function(w) {
     head_html <- if (!is.null(d$head)) paste(as.character(d$head), collapse = "\n") else ""
     paste(c(css, js, head_html), collapse = "\n")
   }
+  # A widget fills its frame (height:100%); a plain HTML fragment is as tall
+  # as its content, and SAYS so: the frame is sandboxed (allow-scripts, no
+  # same-origin), so the page cannot measure it — the document posts its own
+  # scrollHeight to the parent and lib/output-pane.js sizes the iframe.
+  base_css <- if (fit) {
+    paste0("<style>html,body{margin:0;padding:0;overflow:hidden;}",
+           "body{font:13px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,",
+           "Helvetica,Arial,sans-serif;color:#1d1d1f;background:transparent;}",
+           "table{border-collapse:collapse;}</style>")
+  } else {
+    "<style>html,body{margin:0;padding:0;height:100%;}</style>"
+  }
+  fit_js <- if (fit) paste0(
+    "<script>(function(){var r=function(){try{parent.postMessage({carmarHtmlHeight:",
+    "Math.ceil(document.documentElement.getBoundingClientRect().height)},'*')}catch(e){}};",
+    "window.addEventListener('load',r);if(window.ResizeObserver){new ResizeObserver(r)",
+    ".observe(document.documentElement)}setTimeout(r,0);setTimeout(r,250)})()</script>") else ""
   paste0(
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\">",
-    "<style>html,body{margin:0;padding:0;height:100%;}</style>",
+    base_css,
     paste(vapply(deps, inline_one, character(1)), collapse = "\n"),
     rendered$head,
-    "</head><body>", rendered$html, "</body></html>"
+    "</head><body>", rendered$html, fit_js, "</body></html>"
   )
+}
+
+#' Everything that is HTML by nature, as ONE htmltools object — or NULL.
+#'
+#' The dispatch that turns a value into a rich frame instead of printed text.
+#' htmlwidgets were the only rich output until 2026-09-03; a `gt` table, a
+#' `kable(format = "html")`, an `htmltools::tags` tree, `knitr::asis_output()`
+#' and `display_html()` all printed their own markup as text. Each is now a
+#' standalone document in a sandboxed frame — the widget path, generalised —
+#' so a chunk can produce what a Jupyter display() can: any HTML, its own
+#' scripts included, with no reach into the notebook.
+#'
+#' @param v A value.
+#' @return `list(x = <htmltools object>, kind = "widget" | "html")`, or NULL
+#'   when `v` is not HTML.
+rich_html_of <- function(v) {
+  if (inherits(v, "htmlwidget")) return(list(x = v, kind = "widget"))
+  if (inherits(v, "carmar_html")) return(list(x = htmltools::HTML(unclass(v)), kind = "html"))
+  if (inherits(v, c("shiny.tag", "shiny.tag.list", "html"))) return(list(x = v, kind = "html"))
+  if (inherits(v, "knit_asis")) return(list(x = htmltools::HTML(paste(as.character(v), collapse = "\n")), kind = "html"))
+  if (inherits(v, "knitr_kable") && identical(attr(v, "format"), "html")) {
+    return(list(x = htmltools::HTML(paste(as.character(v), collapse = "\n")), kind = "html"))
+  }
+  if (inherits(v, "gt_tbl") && requireNamespace("gt", quietly = TRUE)) {
+    html <- tryCatch(gt::as_raw_html(v, inline_css = TRUE), error = function(e) NULL)
+    if (!is.null(html)) return(list(x = htmltools::HTML(html), kind = "html"))
+  }
+  NULL
+}
+
+#' Emit one rich value (see `rich_html_of`) as a `widget` frame.
+#' @param id Cell id.
+#' @param rich The list `rich_html_of()` returned.
+#' @return Invisibly NULL.
+emit_rich <- function(id, rich) {
+  if (identical(rich$kind, "widget")) return(emit_widget(id, rich$x))
+  if (!requireNamespace("htmltools", quietly = TRUE)) {
+    cat("<html output: the htmltools package is required to display it>\n")
+    return(invisible(NULL))
+  }
+  html <- tryCatch(widget_standalone_html(rich$x, fit = TRUE), error = function(e) NULL)
+  if (is.null(html)) {
+    cat("<html output: could not render it>\n")
+    return(invisible(NULL))
+  }
+  if (nchar(html, type = "bytes") > MAX_WIDGET_BYTES) {
+    cat(sprintf("<html output: %.1f MB is too large to display here>\n",
+                nchar(html, type = "bytes") / 1e6))
+    return(invisible(NULL))
+  }
+  emit(list(type = "widget", id = id, kind = "html", class = class(rich$x)[1L], html = html))
+  invisible(NULL)
 }
 
 MAX_WIDGET_BYTES <- 15e6
@@ -2798,7 +2874,7 @@ emit_widget <- function(id, w) {
                 nchar(html, type = "bytes") / 1e6))
     return(invisible(NULL))
   }
-  emit(list(type = "widget", id = id, class = class(w)[1L], html = html))
+  emit(list(type = "widget", id = id, kind = "widget", class = class(w)[1L], html = html))
   invisible(NULL)
 }
 
@@ -3174,7 +3250,8 @@ run_cell <- function(id, source, dims = NULL, srcname = NULL) {
           }
           if (isTRUE(res$visible)) {
             v <- res$value
-            if (inherits(v, "htmlwidget")) emit_widget(id, v)
+            rich <- rich_html_of(v)
+            if (!is.null(rich)) emit_rich(id, rich)
             else if (is.data.frame(v)) emit_dataframe(id, v)
             else if (is.matrix(v) && nrow(v) > 0L && ncol(v) > 0L) emit_dataframe(id, matrix_to_df(v))
             else base::print(v)
@@ -3338,6 +3415,27 @@ carmar_tools$.carmar_debug_where <- function() {
             stack = debug_stack(calls[-n], frames[-n]),
             locals = frame_vars(parent.frame())))
   invisible(NULL)
+}
+#' Show HTML in the chunk's result — a string of markup, an htmltools tree,
+#' a gt table, a kable, an htmlwidget. The one verb for "this is HTML":
+#' Jupyter's display(HTML(...)). Outside a running chunk it prints the markup.
+#' @param x HTML as a character vector (joined with newlines) or any value
+#'   `rich_html_of()` understands.
+#' @return Invisibly `x`.
+carmar_tools$display_html <- function(x) {
+  rich <- if (is.character(x)) {
+    list(x = htmltools::HTML(paste(x, collapse = "\n")), kind = "html")
+  } else {
+    rich_html_of(x)
+  }
+  if (is.null(rich)) {
+    stop("display_html(): not HTML — pass a character string of markup, an htmltools tag, ",
+         "a gt table, a kable(format = \"html\") or an htmlwidget (got ", class(x)[1L], ")",
+         call. = FALSE)
+  }
+  if (is.null(RUN_STATE$id)) { cat(as.character(rich$x), "\n"); return(invisible(x)) }
+  emit_rich(RUN_STATE$id, rich)
+  invisible(x)
 }
 carmar_tools$View <- function(x, title = NULL) {
   # The LABEL is what the user typed; the FETCH NAME is where the viewer reads

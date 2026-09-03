@@ -230,6 +230,10 @@ sockets$chats <- new.env(parent = emptyenv())
 # asked for, which is why neither was built without the other.
 sockets$jobs <- new.env(parent = emptyenv())
 sockets$job_seq <- 0L
+# Terminals: id -> record of one PTY shell, owned by the page that opened it.
+# See "the terminal plane" below.
+sockets$terms <- new.env(parent = emptyenv())
+sockets$term_seq <- 0L
 # Idle linger: a kernel nobody is connected to stops itself, so closing the
 # notebook tab does not strand an R process (and five stranded days do not
 # greet day six with the capacity prompt). The clock starts when the LAST
@@ -737,6 +741,7 @@ start_sibling_session <- function() {
 AGENT_REFUSED <- c("exec", "interrupt", "force_stop", "restart", "debug_cmd", "ai-key",
                    "console_history", "input_reply", "ai-audit-read",
                    "job_start", "job_stop", "job_open",
+                   "term_open", "term_input", "term_close",
                    "settings_get", "settings_set", "settings_reset",
                    "update_status", "update_action", "project_action")
 
@@ -1224,6 +1229,10 @@ app <- list(
       for (id in ls(sockets$chats)) {
         if (identical(sockets$chats[[id]]$rec, rec)) chat_kill(id)
       }
+      # A terminal is the page's: no page, no shell.
+      for (id in ls(sockets$terms)) {
+        if (identical(sockets$terms[[id]]$rec, rec)) term_close(id, "page closed")
+      }
       # An agent that vanishes must not leave its request ids parked forever.
       pending <- ls(sockets$mcp_pending)
       for (id in pending) {
@@ -1448,6 +1457,137 @@ pump_chats <- function() {
       audit("agent-chat-done", id = id, detail = as.character(code))
       if (nzchar(ch$cfg)) unlink(ch$cfg, recursive = TRUE)
       rm(list = id, envir = sockets$chats)
+    }
+  }
+  invisible(NULL)
+}
+
+# ── the terminal plane ──────────────────────────────────────────────────────
+#
+# A shell in the page: a FOURTH kind of child, and the same argument as the
+# jobs plane one step further out. It evaluates whatever the user types, so it
+# may not be analyze.R; it holds no session anybody else can see, so it need
+# not be worker.R — a `make` that runs for a minute costs neither the user's
+# variables nor a working Stop. Three properties, each a decision:
+#
+#   * It is a REAL pty (processx pty = TRUE): the shell sees a terminal, so
+#     prompts, colours, line editing, ^C and password prompts all behave. A
+#     pipe would give a shell that prints "not a tty" and buffers everything.
+#   * It belongs to the PAGE, not to the kernel (the opposite of a job): it
+#     dies with the socket that opened it. A shell nobody can see is not a
+#     detached task, it is an orphan with the user's credentials.
+#   * It is page-only and agent-refused. An agent runs code through chunk_run,
+#     visibly, or not at all — a terminal would be exactly the raw `exec` door
+#     the MCP plane refuses, wearing a prompt.
+#
+# What the shell can do is what the user can do; this grants nothing new and
+# is audited like every other door. `CARMAR_NO_TERMINAL=1` removes it (a
+# deployment that must not offer a shell); Windows has no pty here and says so.
+MAX_TERMS <- 4L
+TERM_INPUT_MAX <- 65536L
+
+term_send <- function(rec, id, ...) {
+  frame <- toJSON(list(type = "term", id = id, ...), auto_unbox = TRUE, null = "null")
+  try(rec$ws$send(frame), silent = TRUE)
+}
+
+#' The shell to run and how to make it interactive. bash and zsh get a login
+#' shell so PATH matches the user's own terminal; sh gets -i.
+#' @return `list(cmd, args)`.
+term_shell <- function() {
+  shell <- Sys.getenv("SHELL", "")
+  if (!nzchar(shell) || !file.exists(shell)) shell <- "/bin/sh"
+  base <- basename(shell)
+  args <- if (base %in% c("bash", "zsh", "fish")) c("-i", "-l") else "-i"
+  list(cmd = shell, args = args)
+}
+
+term_open <- function(rec, cmd) {
+  refuse <- function(why) {
+    audit("term-refused", detail = why)
+    term_send(rec, "", event = "refused", error = why)
+    invisible(NULL)
+  }
+  if (identical(Sys.getenv("CARMAR_NO_TERMINAL"), "1")) {
+    return(refuse("The terminal is turned off on this kernel (CARMAR_NO_TERMINAL=1)."))
+  }
+  if (.Platform$OS.type == "windows") {
+    return(refuse("The terminal needs a pty, which CarmaR does not provide on Windows yet."))
+  }
+  mine <- Filter(function(t) identical(t$rec, rec), mget(ls(sockets$terms), envir = sockets$terms))
+  if (length(mine) >= MAX_TERMS) {
+    return(refuse(sprintf("%d terminals are already open on this page.", length(mine))))
+  }
+  clamp <- function(x, lo, hi, default) {
+    v <- suppressWarnings(as.integer(x))
+    if (length(v) != 1L || is.na(v)) default else max(lo, min(hi, v))
+  }
+  cols <- clamp(cmd$cols, 20L, 400L, 100L)
+  rows <- clamp(cmd$rows, 5L, 200L, 30L)
+  wd <- if (scalar_chr(cmd$cwd) && dir.exists(cmd$cwd)) cmd$cwd else getwd()
+  sh <- term_shell()
+  proc <- tryCatch(
+    processx::process$new(sh$cmd, sh$args, pty = TRUE,
+                          pty_options = list(rows = rows, cols = cols),
+                          wd = wd, encoding = "UTF-8",
+                          env = c("current", TERM = "xterm-256color",
+                                  COLORTERM = "truecolor",
+                                  COLUMNS = as.character(cols), LINES = as.character(rows),
+                                  CARMAR_PORT = as.character(port))),
+    error = function(e) conditionMessage(e))
+  if (is.character(proc)) return(refuse(paste("the shell could not start:", proc)))
+  sockets$term_seq <- sockets$term_seq + 1L
+  id <- paste0("term-", sockets$term_seq)
+  rec_t <- new.env(parent = emptyenv())
+  rec_t$id <- id
+  rec_t$proc <- proc
+  rec_t$rec <- rec
+  rec_t$started <- as.numeric(Sys.time())
+  sockets$terms[[id]] <- rec_t
+  audit("term-open", id = id, detail = sh$cmd, class = rec$class %||% "unknown")
+  term_send(rec, id, event = "open", shell = sh$cmd, pid = proc$get_pid(),
+            cols = cols, rows = rows, cwd = wd)
+  invisible(NULL)
+}
+
+#' Only the page that opened a terminal may type into it or close it.
+term_owned <- function(rec, id) {
+  t <- if (scalar_chr(id)) sockets$terms[[id]] else NULL
+  if (is.null(t) || !identical(t$rec, rec)) NULL else t
+}
+
+term_input <- function(rec, cmd) {
+  t <- term_owned(rec, cmd$id)
+  if (is.null(t) || !scalar_chr(cmd$text) || !nzchar(cmd$text)) return(invisible(NULL))
+  if (nchar(cmd$text, type = "bytes") > TERM_INPUT_MAX) return(invisible(NULL))
+  try(t$proc$write_input(cmd$text), silent = TRUE)
+  invisible(NULL)
+}
+
+term_close <- function(id, why = "closed") {
+  t <- sockets$terms[[id]]
+  if (is.null(t)) return(invisible(NULL))
+  try(t$proc$kill(), silent = TRUE)
+  rm(list = id, envir = sockets$terms)
+  audit("term-close", id = id, detail = why)
+  term_send(t$rec, id, event = "exit", code = NA, reason = why)
+  invisible(NULL)
+}
+
+#' Stream every terminal's bytes to its page; close out the ones that ended.
+pump_terms <- function() {
+  for (id in ls(sockets$terms)) {
+    t <- sockets$terms[[id]]
+    try(t$proc$poll_io(0L), silent = TRUE)
+    out <- tryCatch(t$proc$read_output(), error = function(e) "")
+    if (length(out) == 1L && nzchar(out)) term_send(t$rec, id, event = "data", text = out)
+    if (!t$proc$is_alive()) {
+      leftover <- tryCatch(t$proc$read_output(), error = function(e) "")
+      if (length(leftover) == 1L && nzchar(leftover)) term_send(t$rec, id, event = "data", text = leftover)
+      code <- as.integer(tryCatch(t$proc$get_exit_status(), error = function(e) NA_integer_) %||% NA_integer_)
+      rm(list = id, envir = sockets$terms)
+      audit("term-exit", id = id, detail = as.character(code))
+      term_send(t$rec, id, event = "exit", code = code, reason = "exited")
     }
   }
   invisible(NULL)
@@ -2394,6 +2534,23 @@ handle_frame <- function(message, rec) {
   # Pages only (see AGENT_REFUSED above). The wire carries a task NAME and a
   # folder; spike/jobs.R decides whether that pair may run and the supervisor
   # builds the argument vector. Nothing here is pasted into an expression.
+  # ── terminals ─────────────────────────────────────────────────────────────
+  # Page-only in BOTH senses (see PAGE_ONLY_CLASSES): a declared agent is
+  # refused above, and a client that merely never declared is refused here.
+  # A declared agent falls THROUGH to the AGENT_REFUSED reply below, so it is
+  # told why in the op's own name rather than met with silence.
+  if (cmd$type %in% c("term_open", "term_input", "term_close") && identical(rec$role, "page")) {
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit("term-refused", reason = "class", class = rec$class %||% "unknown")
+      term_send(rec, cmd$id %||% "", event = "refused",
+                error = "Only the local notebook page may open a terminal.")
+      return(invisible(NULL))
+    }
+    if (identical(cmd$type, "term_open")) term_open(rec, cmd)
+    else if (identical(cmd$type, "term_input")) term_input(rec, cmd)
+    else if (!is.null(term_owned(rec, cmd$id))) term_close(cmd$id)
+    return(invisible(NULL))
+  }
   if (identical(cmd$type, "job_start")) {
     if (!identical(rec$role, "page")) return(invisible(NULL))
     job_start(rec, cmd)
@@ -2618,6 +2775,9 @@ handle_frame <- function(message, rec) {
         "ai-audit-read" = "Agents cannot read the audit stream.",
         "job_start" = "Agents cannot start development jobs; ask the user to run one.",
         "job_stop" = "Agents cannot stop development jobs.",
+        "term_open" = "Agents cannot open a terminal; run code through chunk_run.",
+        "term_input" = "Agents cannot type into the user's terminal.",
+        "term_close" = "Agents cannot close the user's terminal.",
         # settings_GET is refused as firmly as the writes. Not because the
         # values are secret, but because handing back the confinement root,
         # the audit-log path and whether AI-text logging is on is a MAP OF THE
@@ -3546,6 +3706,7 @@ repeat {
   pump()
   pump_chats()
   pump_jobs()
+  pump_terms()
   reap_dead_sockets()
   linger_check()
   if (isTRUE(sockets$quit)) break
