@@ -1,7 +1,7 @@
 Package: carmar
 Type: Package
 Title: CarmaR - an R Notebook That Runs on Your Own R
-Version: 7.8
+Version: 7.9
 Authors@R: person("Mohammed", "Saqr", email = "saqr@saqr.me", role = c("aut", "cre"))
 Description: A single-file R notebook served from a local kernel: your R, your
     packages, your files. The package carries the notebook and its kernel;
