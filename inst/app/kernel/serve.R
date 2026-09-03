@@ -443,6 +443,22 @@ secure_token <- function(n = 32L) {
 
 FILE_ORIGIN <- "null"
 
+# A notebook page SERVED BY ANOTHER CarmaR KERNEL on this machine. When a
+# page's own kernel dies the page stays open (it is HTML the browser already
+# holds) and can attach to a different session through the badge's plug icon;
+# it arrives here with the Origin of the kernel that served it,
+# `http://127.0.0.1:<other port>`. That origin is approved through the same
+# /pair click as a published site — nothing is granted for being loopback —
+# but once approved it is classed `local`, not `published`, and `local` is in
+# PAGE_ONLY_CLASSES: the page is the user's own notebook, and a notebook that
+# could run R but not open its terminal or read its console history would be
+# a half-attached one. Loopback only, so off-loopback deployments never see
+# this class; a `localhost` origin is not a proxy's.
+LOCAL_ORIGIN_RE <- "^http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):[0-9]{1,5}$"
+local_origin <- function(origin) {
+  length(origin) == 1L && !is.na(origin) && grepl(LOCAL_ORIGIN_RE, origin)
+}
+
 # The capability that lets the notebook this kernel POINTED AT skip the
 # consent click, while a file page that merely found the port cannot.
 #
@@ -494,6 +510,7 @@ prune_pairing_requests <- function(now = as.numeric(Sys.time())) {
 pairing_page <- function(origin, nonce = "") {
   prune_pairing_requests()
   is_file <- identical(origin, FILE_ORIGIN)
+  is_local <- local_origin(origin)
   challenge <- pairing_challenge()
   sockets$pairing_requests[[challenge]] <- list(
     origin = origin, nonce = substr(nonce, 1L, 200L), created = as.numeric(Sys.time()))
@@ -502,6 +519,7 @@ pairing_page <- function(origin, nonce = "") {
     '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; ',
     "style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'\">",
     '<title>', if (is_file) 'Allow this notebook file to use CarmaR?'
+               else if (is_local) 'Attach this notebook to this CarmaR session?'
                else 'Allow this book to use CarmaR?', '</title><style>',
     'body{font:16px/1.5 system-ui,sans-serif;max-width:42rem;margin:10vh auto;padding:0 1.25rem;color:#172033}',
     '.site{padding:.75rem 1rem;background:#f3f6fb;border-radius:.55rem;overflow-wrap:anywhere}',
@@ -515,13 +533,24 @@ pairing_page <- function(origin, nonce = "") {
         'and can access your files and network. A page opened from a file ',
         'cannot be identified any more exactly than this, so approve it only ',
         'if you just opened a notebook of your own.</p>')
+    else if (is_local)
+      paste0('<h1>Attach this notebook to this R session?</h1>',
+        '<p>A CarmaR notebook page served at</p>',
+        '<p class="site"><strong>', html_escape(origin), '</strong></p>',
+        '<p>wants to use this CarmaR session instead of its own &mdash; usually ',
+        'because the session that served it has stopped. It will be treated as ',
+        'your notebook: its chunks run as your user, and it may open a terminal ',
+        'and use your saved AI settings. Approve it only if you just asked a ',
+        'notebook of your own to attach.</p>')
     else
       paste0('<h1>Run this book with your R?</h1><p>The published site</p>',
         '<p class="site"><strong>', html_escape(origin), '</strong></p>',
         '<p>wants to send R chunks to this CarmaR session on your computer. ',
         'The code will run as your user and can access your files and network.</p>'),
     '<form method="get" action="/pair/approve"><input type="hidden" name="challenge" value="',
-    challenge, '"><button type="submit">Allow for this session</button></form>',
+    challenge, '"><button type="submit">',
+    if (is_local) 'Attach for this session' else 'Allow for this session',
+    '</button></form>',
     '<p><small>Nothing runs until you press a chunk\'s Run button. ',
     'Approval disappears when this CarmaR session stops.</small></p></body></html>')
 }
@@ -567,7 +596,29 @@ pairing_approval_page <- function(challenge) {
   rm(list = challenge, envir = sockets$pairing_requests)
   sockets$published_approvals[[rec$origin]] <- TRUE
   audit("published-origin-approved", origin = rec$origin)
+  # A published site talks through the bridge window; a file or local notebook
+  # page dials this kernel directly the moment its retry fires, so the only
+  # thing left for this window to do is say so and let the user close it.
+  if (identical(rec$origin, FILE_ORIGIN) || local_origin(rec$origin)) {
+    return(pairing_done_page(rec))
+  }
   pairing_bridge_page(rec)
+}
+
+pairing_done_page <- function(rec) {
+  paste0('<!doctype html><html><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; ',
+    "style-src 'unsafe-inline'; base-uri 'none'\">",
+    '<title>CarmaR attached</title><style>',
+    'body{font:16px/1.5 system-ui,sans-serif;max-width:38rem;margin:10vh auto;padding:0 1.25rem;color:#172033}',
+    '.site{overflow-wrap:anywhere;color:#2357d9}</style></head><body>',
+    '<h1>Attached</h1><p>The notebook</p>',
+    '<p class="site"><strong>',
+    if (identical(rec$origin, FILE_ORIGIN)) 'a page opened from disk (file://)' else html_escape(rec$origin),
+    '</strong></p>',
+    '<p>may use this CarmaR session until it stops. It reconnects by itself within ',
+    'a few seconds; you can close this window.</p></body></html>')
 }
 
 #' Reject with a reason, and record it.
@@ -642,6 +693,9 @@ socket_class <- function(req) {
   if (is.null(origin)) return(if (isTRUE(deployment$allow_native)) "native" else "unknown")
   if (origin %in% origins_ok) return("served")
   if (identical(origin, FILE_ORIGIN)) return("file")
+  # A page another loopback kernel served, approved through /pair (see
+  # LOCAL_ORIGIN_RE): the user's own notebook re-attached, not a reader's site.
+  if (local_origin(origin)) return("local")
   # Anything else reached a 101 only by being in published_approvals.
   "published"
 }
@@ -742,6 +796,7 @@ AGENT_REFUSED <- c("exec", "interrupt", "force_stop", "restart", "debug_cmd", "a
                    "console_history", "input_reply", "ai-audit-read",
                    "job_start", "job_stop", "job_open",
                    "term_open", "term_input", "term_close",
+                   "session_list", "r_versions",
                    "settings_get", "settings_set", "settings_reset",
                    "update_status", "update_action", "project_action")
 
@@ -771,7 +826,7 @@ AGENT_REFUSED <- c("exec", "interrupt", "force_stop", "restart", "debug_cmd", "a
 # holds for every agent instead of only the polite ones. A published site is
 # refused because its reader approved it to RUN THE CHUNKS THEY PRESS, not to
 # collect a credential on the way past.
-PAGE_ONLY_CLASSES <- c("served", "file")
+PAGE_ONLY_CLASSES <- c("served", "file", "local")
 
 # ── what the page may write into the audit stream ───────────────────────────
 #
@@ -1036,6 +1091,12 @@ app <- list(
       return(resp(200L, "application/json",
                   toJSON(list(ok = TRUE, worker = k$proc$is_alive(),
                               pending_open = !is.null(sockets$pending_open),
+                              # For the attach chooser on a page whose own
+                              # kernel died: which R, and how old the
+                              # session is. No title, no path — /health is
+                              # unauthenticated and CORS-open on purpose.
+                              r = paste(R.version$major, R.version$minor, sep = "."),
+                              started = as.numeric(sockets$boot_at),
                               protocol = CARMAR_PROTOCOL_VERSION,
                               kernel_build = CARMAR_KERNEL_BUILD,
                               capabilities = c("published-direct-v1",
@@ -1460,6 +1521,71 @@ pump_chats <- function() {
     }
   }
   invisible(NULL)
+}
+
+# ── sessions and R installations ───────────────────────────────────────────
+
+#' Every kernel this user is running, from the runtime records, health-checked.
+#' @return An unnamed list of `list(port, url, title, pid, alive, this)`.
+session_list <- function() {
+  dir <- Sys.getenv("CARMAR_RUNTIME_DIR", file.path(path.expand("~"), ".carmar", "run"))
+  files <- list.files(dir, pattern = "^kernel-[0-9]+\\.json$", full.names = TRUE)
+  out <- lapply(files, function(f) {
+    rec <- tryCatch(jsonlite::fromJSON(f, simplifyVector = TRUE), error = function(e) NULL)
+    if (!is.list(rec) || is.null(rec$port) || is.null(rec$url)) return(NULL)
+    p <- suppressWarnings(as.integer(rec$port))
+    if (is.na(p)) return(NULL)
+    this <- identical(p, as.integer(port))
+    alive <- if (this) TRUE else tryCatch({
+      con <- url(paste0(sub("/+$", "", rec$url), "/health"))
+      on.exit(try(close(con), silent = TRUE), add = TRUE)
+      old <- options(timeout = 1); on.exit(options(old), add = TRUE)
+      txt <- readLines(con, n = 1L, warn = FALSE)
+      length(txt) == 1L && grepl("\"ok\":true", txt, fixed = TRUE)
+    }, error = function(e) FALSE, warning = function(w) FALSE)
+    list(port = p, url = as.character(rec$url), title = rec$title %||% "",
+         pid = rec$pid %||% NA, alive = alive, this = this)
+  })
+  out <- Filter(Negate(is.null), out)
+  out[order(vapply(out, function(s) s$port, integer(1)))]
+}
+
+#' The Rscript the running worker was started with.
+current_rscript <- function() tryCatch(normalizePath(settings_rscript(), mustWork = FALSE),
+                                        error = function(e) "")
+
+#' Every R installation on this machine, with its version. Discovery walks the
+#' same ladder detect_rscript() does plus the versioned framework directories,
+#' /opt/R (rig, Posit) and Homebrew; versions are read once per kernel life.
+#' @return An unnamed list of `list(path, version, current)`, newest first.
+r_versions <- function() {
+  if (!is.null(sockets$r_versions_cache)) return(sockets$r_versions_cache)
+  cands <- c(
+    Sys.glob("/Library/Frameworks/R.framework/Versions/*/Resources/bin/Rscript"),
+    Sys.glob("/opt/R/*/bin/Rscript"),
+    Sys.glob("/opt/homebrew/Cellar/r/*/bin/Rscript"),
+    "/opt/homebrew/bin/Rscript", "/usr/local/bin/Rscript", "/opt/local/bin/Rscript",
+    "/usr/bin/Rscript", "/usr/lib/R/bin/Rscript",
+    Sys.glob("/usr/lib/R-*/bin/Rscript"),
+    unname(Sys.which("Rscript")))
+  cands <- unique(cands[nzchar(cands) & file.exists(cands)])
+  # `Versions/Current` and a Homebrew symlink point at a versioned install
+  # already in the list: keep one entry per real binary, preferring the
+  # versioned path because it says which R it is.
+  real <- vapply(cands, function(p) tryCatch(normalizePath(p), error = function(e) p), character(1))
+  keep <- !duplicated(real)
+  cands <- cands[keep]; real <- real[keep]
+  cur <- current_rscript()
+  ver <- vapply(cands, function(p) {
+    out <- tryCatch(suppressWarnings(system2(p, "--version", stdout = TRUE, stderr = TRUE, timeout = 10)),
+                    error = function(e) character())
+    hit <- regmatches(out, regexpr("[0-9]+\\.[0-9]+\\.[0-9]+", out))
+    if (length(hit)) hit[[1]] else ""
+  }, character(1))
+  rows <- Map(function(p, r, v) list(path = p, version = v, current = identical(r, cur)), cands, real, ver)
+  rows <- unname(rows[order(vapply(rows, function(x) x$version, character(1)), decreasing = TRUE)])
+  sockets$r_versions_cache <- rows
+  rows
 }
 
 # ── the terminal plane ──────────────────────────────────────────────────────
@@ -2353,7 +2479,9 @@ recover_execution_worker <- function() {
     sockets$worker_restart_attempts <- 0L
     sockets$worker_restart_after <- 0
     sockets$hello <- NULL
-    fail_worker_routes("The R worker stopped unexpectedly. Its session state was lost; CarmaR is starting a fresh R session.")
+    fail_worker_routes(if (isTRUE(sockets$force_stop_asked))
+      "R was force-stopped. Its variables and loaded packages are gone; CarmaR is starting a fresh R session."
+      else "The R worker stopped unexpectedly. Its session state was lost; CarmaR is starting a fresh R session.")
     rm(list = ls(sockets$running), envir = sockets$running)
     rm(list = ls(sockets$worker_routes), envir = sockets$worker_routes)
     sockets$worker_queue <- list()
@@ -2361,9 +2489,12 @@ recover_execution_worker <- function() {
     sockets$worker_terminal <- NULL
     sockets$debug_paused <- FALSE
     sockets$input_waiting <- FALSE
-    payload <- toJSON(list(type = "worker-died", recovering = TRUE), auto_unbox = TRUE)
+    # `forced`: the page must not call a death it asked for "unexpected".
+    payload <- toJSON(list(type = "worker-died", recovering = TRUE,
+                           forced = isTRUE(sockets$force_stop_asked)), auto_unbox = TRUE)
     lapply(sockets$open, function(r) try(r$ws$send(payload), silent = TRUE))
-    audit("worker-died", recovering = TRUE)
+    audit("worker-died", recovering = TRUE, forced = isTRUE(sockets$force_stop_asked))
+    sockets$force_stop_asked <- FALSE
   }
   now <- as.numeric(Sys.time())
   if (now < sockets$worker_restart_after) return(invisible(FALSE))
@@ -2534,6 +2665,23 @@ handle_frame <- function(message, rec) {
   # Pages only (see AGENT_REFUSED above). The wire carries a task NAME and a
   # folder; spike/jobs.R decides whether that pair may run and the supervisor
   # builds the argument vector. Nothing here is pasted into an expression.
+  # ── sessions and R installations (Session ▾) ──────────────────────────────
+  # Page-only: a list of the user's running kernels (ports, titles) and of the
+  # R installations on the machine is a map of the desk, not something a
+  # native client or an agent needs the kernel to draw for it.
+  if (cmd$type %in% c("session_list", "r_versions") && identical(rec$role, "page")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    reply <- function(...) try(rec$ws$send(toJSON(c(list(type = cmd$type, id = cmd$id), list(...)),
+                                                  auto_unbox = TRUE, null = "null")), silent = TRUE)
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit(paste0(cmd$type, "-refused"), class = rec$class %||% "unknown")
+      reply(error = "Only the local notebook page may ask this.")
+      return(invisible(NULL))
+    }
+    if (identical(cmd$type, "session_list")) reply(sessions = I(session_list()))
+    else reply(versions = I(r_versions()), current = current_rscript())
+    return(invisible(NULL))
+  }
   # ── terminals ─────────────────────────────────────────────────────────────
   # Page-only in BOTH senses (see PAGE_ONLY_CLASSES): a declared agent is
   # refused above, and a client that merely never declared is refused here.
@@ -2778,6 +2926,8 @@ handle_frame <- function(message, rec) {
         "term_open" = "Agents cannot open a terminal; run code through chunk_run.",
         "term_input" = "Agents cannot type into the user's terminal.",
         "term_close" = "Agents cannot close the user's terminal.",
+        "session_list" = "Agents cannot list the user's sessions.",
+        "r_versions" = "Agents cannot list or choose R installations.",
         # settings_GET is refused as firmly as the writes. Not because the
         # values are secret, but because handing back the confinement root,
         # the audit-log path and whether AI-text logging is on is a MAP OF THE
@@ -2864,6 +3014,13 @@ handle_frame <- function(message, rec) {
       if (!length(candidates)) return(invisible(NULL))
       wire_id <- candidates[[1L]]
       if (identical(wire_id, sockets$worker_active)) {
+        # The ladder: one SIGINT is not always heard — R inside system() has
+        # it ignored until the child dies — so the same run is signalled
+        # again every 400 ms while it is still the active one, up to four
+        # times. The page offers Force Stop on its own clock; this is the
+        # supervisor doing what a person hammering ^C does, without the person.
+        sockets$interrupt_ladder <- list(wire_id = wire_id, at = as.numeric(Sys.time()), count = 1L,
+                                         step = INTERRUPT_LADDER_FIRST)
         return(invisible(kernel_interrupt(k)))
       }
       sockets$worker_queue <- Filter(function(item) !identical(item$wire_id, wire_id),
@@ -2970,6 +3127,10 @@ handle_frame <- function(message, rec) {
   # WebSocket, analyzer and unsaved text alive and starts a fresh R session.
   if (identical(cmd$type, "force_stop")) {
     audit("force-stop", class = rec$class %||% "unknown")
+    # The death detector below reports the loss; it must say it was ASKED
+    # for, not that R "stopped unexpectedly" — the words a person reads
+    # after pressing Force Stop decide whether they trust the button.
+    sockets$force_stop_asked <- TRUE
     if (k$proc$is_alive()) try(k$proc$kill(), silent = TRUE)
     return(invisible(NULL))
   }
@@ -3387,6 +3548,34 @@ handle_frame <- function(message, rec) {
 }
 
 #' Route worker replies only to the browser that originated the command.
+# The FIRST re-send is fast: when the group SIGINT ends a child under
+# system(), libc has thrown away the SIGINT R got while waiting, and R walks
+# on to the next line. A second SIGINT 60 ms later reaches R itself, which is
+# what makes the CHUNK stop rather than just the child. Later re-sends are
+# slower — they exist for a child that ignores the first signal.
+INTERRUPT_LADDER_FIRST <- 0.06
+INTERRUPT_LADDER_STEP <- 0.4
+INTERRUPT_LADDER_MAX <- 5L
+
+#' Re-send SIGINT to a run that did not end after the last one.
+#' @return Invisibly NULL.
+interrupt_ladder <- function() {
+  l <- sockets$interrupt_ladder
+  if (is.null(l)) return(invisible(NULL))
+  if (!identical(l$wire_id, sockets$worker_active)) {
+    sockets$interrupt_ladder <- NULL
+    return(invisible(NULL))
+  }
+  now <- as.numeric(Sys.time())
+  if (now - l$at < (l$step %||% INTERRUPT_LADDER_STEP)) return(invisible(NULL))
+  if (l$count >= INTERRUPT_LADDER_MAX) { sockets$interrupt_ladder <- NULL; return(invisible(NULL)) }
+  audit("interrupt-again", count = l$count + 1L)
+  kernel_interrupt(k)
+  sockets$interrupt_ladder <- list(wire_id = l$wire_id, at = now, count = l$count + 1L,
+                                   step = INTERRUPT_LADDER_STEP)
+  invisible(NULL)
+}
+
 pump <- function() {
   # The analysis plane drains first and independently: it must not wait behind
   # the evaluating worker's frames, which is the entire reason it exists.
@@ -3707,6 +3896,7 @@ repeat {
   pump_chats()
   pump_jobs()
   pump_terms()
+  interrupt_ladder()
   reap_dead_sockets()
   linger_check()
   if (isTRUE(sockets$quit)) break

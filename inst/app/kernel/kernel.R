@@ -439,7 +439,21 @@ kernel_send_raw <- function(k, line) {
 #' @param k Kernel handle.
 #' @return Invisibly TRUE.
 kernel_interrupt <- function(k) {
-  k$proc$interrupt()
+  # The worker is the leader of its own process group (processx setpgid), so
+  # signalling the GROUP reaches the children too. processx's interrupt()
+  # signals the R pid alone — and R inside system()/system2() waits on a
+  # child that never heard, while libc's system() ignores SIGINT in the
+  # caller for the duration: measured, `system("sleep 60")` could not be
+  # stopped at all and wedged every later Stop. A terminal's ^C goes to the
+  # whole foreground group; so does this. Windows has no groups here.
+  if (.Platform$OS.type != "windows") {
+    pid <- tryCatch(k$proc$get_pid(), error = function(e) NA_integer_)
+    if (length(pid) == 1L && !is.na(pid) && pid > 0L) {
+      try(system2("kill", c("-INT", "--", paste0("-", pid)), stdout = FALSE, stderr = FALSE),
+          silent = TRUE)
+    }
+  }
+  try(k$proc$interrupt(), silent = TRUE)
   invisible(TRUE)
 }
 
