@@ -3497,7 +3497,46 @@ if (identical(unname(Sys.info()[["sysname"]]), "Darwin") &&
 #
 # Advertising the vocabulary lets a client know instantly. Kernels older than
 # this simply omit the field, and clients fall back to probing.
-emit(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
+# ── the workspace across a "Restart into" handoff ───────────────────────────
+#
+# serve.R asks `workspace_save` before it hands this session to the installed
+# build's kernel; the successor's first worker finds CARMAR_RESTORE_WORKSPACE
+# in its environment, loads it into the global environment, and DELETES it —
+# the file is one session's bridge, not a place workspaces accumulate. What
+# came back is said in the ready frame (`restored`), so the page can name the
+# count instead of the person counting the Environment pane.
+emit_workspace_save <- function(id) {
+  file <- Sys.getenv("CARMAR_SESSION_FILE", "")
+  if (!nzchar(file)) {
+    emit(list(type = "workspace_save", id = id, ok = FALSE,
+              error = "This session has no workspace file to save into."))
+    return(invisible(NULL))
+  }
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  saved <- tryCatch({ save.image(file, safe = TRUE); TRUE },
+                    error = function(e) conditionMessage(e))
+  if (isTRUE(saved)) {
+    emit(list(type = "workspace_save", id = id, ok = TRUE, file = file,
+              objects = length(ls(globalenv(), all.names = TRUE)),
+              bytes = as.numeric(file.size(file))))
+  } else {
+    emit(list(type = "workspace_save", id = id, ok = FALSE, error = saved))
+  }
+  invisible(NULL)
+}
+RESTORED <- local({
+  file <- Sys.getenv("CARMAR_RESTORE_WORKSPACE", "")
+  if (!nzchar(file) || !file.exists(file)) return(NULL)
+  loaded <- tryCatch(load(file, envir = globalenv()), error = function(e) {
+    message("CarmaR could not restore the saved workspace: ", conditionMessage(e))
+    NULL
+  })
+  unlink(file)
+  if (is.null(loaded)) return(NULL)
+  list(objects = length(loaded), from = Sys.getenv("CARMAR_HANDOFF_FROM", ""))
+})
+
+emit(c(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
           # I(): a single library path must still ship as an array.
           home = R.home(), libs = I(.libPaths()),
           # "interactive" means a native browser() can pause this worker — the
@@ -3510,8 +3549,10 @@ emit(list(type = "ready", pid = Sys.getpid(), r = R.version.string,
                          "help", "hover", "wd", "files", "choose", "sniff",
                          "import", "readfile", "writefile", "writefiles_atomic", "view", "colstats",
                          "mkdir", "renamepath", "deletepath", "copypath", "revealpath",
-                         "rm",
-                         if (identical(WORKER_MODE, "interactive")) "debug_breaks"))))
+                         "rm", "workspace_save",
+                         if (identical(WORKER_MODE, "interactive")) "debug_breaks"))),
+          # Only after a handoff: how much of the previous session came back.
+          if (!is.null(RESTORED)) list(restored = RESTORED)))
 # (No package count here on purpose: installed.packages() reads every
 # package's DESCRIPTION — 0.3–1.8 s on a big library — and no client ever
 # consumed the number. The packages PANE asks the `packages` op on demand.)
@@ -3549,6 +3590,7 @@ repeat {
   if (identical(cmd$type, "exec"))     run_cell(cmd$id, cmd$source, cmd$dims, cmd$srcname)
   if (identical(cmd$type, "debug_breaks")) emit_debug_breaks(cmd$id, cmd$file, cmd$lines)
   if (identical(cmd$type, "env"))      emit_env(cmd$id)
+  if (identical(cmd$type, "workspace_save")) emit_workspace_save(cmd$id)
   if (identical(cmd$type, "obj"))      emit_obj(cmd$id, cmd$name)
   if (identical(cmd$type, "struct"))   emit_struct(cmd$id, cmd$name, cmd$path)
   if (identical(cmd$type, "parse"))    emit_parse(cmd$id, cmd$source)

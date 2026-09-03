@@ -76,6 +76,16 @@ launch_sh_code <- function(launch_r, alert) {
 #' package, "" when running from source (the generators then skip the icon,
 #' never fail on it).
 #' @keywords internal
+#' The build stamp this package's bundled kernel carries
+#' (`inst/app/kernel/kernel-version` — the same file serve.R announces as
+#' `kernel_build`), or "0.0" for a source run with no bundled kernel. @noRd
+installed_kernel_version <- function() {
+  stamp <- system.file("app", "kernel", "kernel-version", package = "carmar")
+  if (!nzchar(stamp)) return("0.0")
+  value <- trimws(readLines(stamp, warn = FALSE, n = 1L))
+  if (length(value) == 1L && nzchar(value)) value else "0.0"
+}
+
 launcher_assets <- function() {
   p <- system.file("launcher", package = "carmar")
   if (nzchar(p)) p else ""
@@ -216,8 +226,10 @@ app_macos <- function(apps = "~/Applications", assets = launcher_assets(),
   has_icon <- nzchar(icns) && file.exists(icns)
   if (has_icon) file.copy(icns, file.path(res, "CarmaR.icns"))
 
-  version <- tryCatch(as.character(utils::packageVersion("carmar")),
-                      error = function(e) "0.0")
+  # The plist names the build the bundled KERNEL carries, read from its own
+  # stamp — never packageVersion(): DESCRIPTION and inst/app/kernel/kernel-version
+  # are two stamps, and the one a running kernel announces is the second.
+  version <- installed_kernel_version()
   writeLines(c(
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',

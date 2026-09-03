@@ -58,7 +58,7 @@ run <- function(port = 4747, open = TRUE, new = TRUE, file = NULL) {
     u <- unname(at_port[[1]])
     delivered <- is.null(file) || deliver_open_file(u, file)
     if (delivered) {
-      page <- notebook_launch_url(u, state)
+      page <- notebook_launch_url(u)
       if (open) open_notebook(page, state)
       message("CarmaR is already running behind: ", page)
       return(invisible(page))
@@ -151,7 +151,7 @@ run <- function(port = 4747, open = TRUE, new = TRUE, file = NULL) {
     if (!isTRUE(copied)) stop(
       "CarmaR started, but its session record could not be saved: ", url_file)
   }
-  if (is.null(page) || !nzchar(page)) page <- notebook_launch_url(u, state)
+  if (is.null(page) || !nzchar(page)) page <- notebook_launch_url(u)
   if (open) open_notebook(page, state)
   # ALWAYS printed, clickable in the RStudio console — the browser not
   # opening (locked-down default browser, broken association) must never
@@ -434,7 +434,7 @@ sessions <- function() {
   titles <- titles[keep]; listens <- listens[keep]
   page <- rep(NA_character_, length(ports))
   page[alive] <- vapply(urls[alive], function(u)
-    tryCatch(notebook_launch_url(u, state), error = function(e) NA_character_),
+    tryCatch(notebook_launch_url(u), error = function(e) NA_character_),
     character(1), USE.NAMES = FALSE)
   data.frame(port = ports, alive = alive, title = titles, listen = listens,
              page = page, source = origin, stringsAsFactors = FALSE)
@@ -571,14 +571,19 @@ upgrade_package <- function(rel, say) {
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
-#' Is the kernel behind this notebook URL answering? @noRd
+#' What the kernel behind this notebook URL says about itself on `/health`,
+#' as the parsed list (`ok`, `worker`, `kernel_build`, `capabilities`, ...),
+#' or `NULL` when the URL is not a loopback kernel URL or nothing answers
+#' with JSON there. Every question about a live kernel — is it alive, which
+#' build is it, can it pair — reads this one body. @noRd
 kernel_health <- function(u) {
-  if (!valid_kernel_url(u)) return(FALSE)
+  if (!valid_kernel_url(u)) return(NULL)
   health <- paste0(kernel_base(u), "/health")
-  tryCatch({
+  rec <- tryCatch({
     jsonlite::fromJSON(paste(slurp(health), collapse = "\n"),
                        simplifyVector = TRUE)
   }, error = function(e) NULL)
+  if (is.list(rec)) rec else NULL
 }
 
 #' Is the kernel behind this notebook URL answering? @noRd
@@ -607,17 +612,42 @@ valid_kernel_url <- function(u, expected_port = NULL) {
 #' URL origin for both current clean records and legacy tokenized records. @noRd
 kernel_base <- function(u) sub("/+$", "", sub("/\\?token=.*$", "", u))
 
-#' Versioned notebook file with a hidden kernel selector in its fragment. @noRd
-notebook_launch_url <- function(kernel_url,
-                                state = tools::R_user_dir("carmar", "data")) {
-  app <- dirname(system.file("app", "kernel", package = "carmar"))
-  dirs <- unique(c(file.path(state, "dist"), if (nzchar(app)) app,
-                   file.path(getwd(), "dist")))
-  files <- unlist(lapply(dirs, function(d)
-    list.files(d, pattern = "^carmar_V[0-9.]+\\.html$", full.names = TRUE)))
-  if (!length(files)) stop("The versioned CarmaR notebook file is missing; reinstall CarmaR.")
-  versions <- numeric_version(sub("^carmar_V(.*)\\.html$", "\\1", basename(files)))
-  file <- normalizePath(files[order(versions, decreasing = TRUE)][1], winslash = "/")
+#' The notebook file a live kernel belongs to, as a `file://` URL with the
+#' kernel selector — and the launch capability the kernel announced — hidden
+#' in its fragment.
+#'
+#' A pin, never a search. The kernel names its own build on `/health`
+#' (`kernel_build`), and its page is exactly `carmar_V<build>.html`: from this
+#' package's `inst/app` first, then a source checkout's `dist/` (the developer
+#' fallback, `dist`). A higher version found in either place is somebody
+#' else's page and is never substituted. There is deliberately no per-user
+#' location: an unsigned download beside a trusted kernel was a supply-chain
+#' bypass (the same reasoning as spike/notebook-page.R), and a full-product
+#' update replaces the installation instead.
+#'
+#' @param kernel_url A loopback kernel URL (`http://127.0.0.1:<port>/`).
+#' @param dist The developer fallback directory holding `carmar_V*.html`.
+#' @return One `file://…carmar_V<build>.html#kernel=<port>[&pair=<cap>]` URL.
+#'   Stops, naming the build, when the kernel does not report one or its
+#'   page is installed nowhere. @noRd
+notebook_launch_url <- function(kernel_url, dist = file.path(getwd(), "dist")) {
+  build <- kernel_health(kernel_url)$kernel_build
+  if (!is.character(build) || length(build) != 1L || is.na(build) ||
+      !grepl("^[A-Za-z0-9._-]+$", build)) {
+    stop("The CarmaR kernel behind ", kernel_base(kernel_url),
+         " did not report its build; it is not answering, or predates the pinned page.",
+         call. = FALSE)
+  }
+  wanted <- paste0("carmar_V", build, ".html")
+  candidates <- c(system.file("app", wanted, package = "carmar"),
+                  file.path(dist, wanted))
+  present <- candidates[nzchar(candidates) & file.exists(candidates)]
+  if (!length(present)) {
+    stop("The notebook for CarmaR ", build, " (", wanted, ") is not installed",
+         " beside this package or in ", dist, "; reinstall CarmaR ", build, ".",
+         call. = FALSE)
+  }
+  file <- normalizePath(present[[1L]], winslash = "/")
   prefix <- if (startsWith(file, "/")) "file://" else "file:///"
   port <- kernel_port(kernel_url)
   cap <- recorded_pair(port)

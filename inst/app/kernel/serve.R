@@ -72,6 +72,43 @@ read_kernel_build <- function() {
 }
 CARMAR_KERNEL_BUILD <- read_kernel_build()
 
+#' What CarmaR is INSTALLED as, right now — re-read on every call.
+#'
+#' `CARMAR_KERNEL_BUILD` is what this process was started as. The bundle it
+#' lives in is swapped IN PLACE by an upgrade, so the stamp beside this file
+#' can name a newer (or, after a rollback, an older) build than the one
+#' running. Reading it fresh every time is what lets a session that predates
+#' an install say so — in /health, in the ready frame and in every heartbeat
+#' — instead of serving the old page in silence until someone quits it.
+#'
+#' When the build was dictated by CARMAR_KERNEL_BUILD (tests, the broker),
+#' the installed build is dictated the same way: CARMAR_INSTALLED_BUILD, or
+#' the same value — a test kernel must never read "newer installed" off a
+#' source checkout's notebook.version.cjs.
+installed_build <- function() {
+  dictated <- trimws(Sys.getenv("CARMAR_KERNEL_BUILD", ""))
+  if (nzchar(dictated)) {
+    inst <- trimws(Sys.getenv("CARMAR_INSTALLED_BUILD", ""))
+    return(if (nzchar(inst)) inst else dictated)
+  }
+  stamp <- file.path(here, "kernel-version")
+  if (file.exists(stamp)) {
+    value <- trimws(readLines(stamp, warn = FALSE, n = 1L))
+    if (nzchar(value)) return(value)
+  }
+  source_version <- file.path(here, "..", "notebook.version.cjs")
+  if (file.exists(source_version)) {
+    src <- paste(readLines(source_version, warn = FALSE), collapse = "\n")
+    hit <- regmatches(src, regexec('version\\s*:\\s*"([^"]+)"', src))[[1]]
+    if (length(hit) >= 2L && nzchar(hit[[2]])) return(hit[[2]])
+  }
+  "unknown"
+}
+# The build this kernel REPLACED, when it was started by a "Restart into"
+# handoff (session_handoff_finish below). Told to /health for the first
+# minute and a half so the page that asked can recognise its successor.
+HANDOFF_FROM <- trimws(Sys.getenv("CARMAR_HANDOFF_FROM", ""))
+
 # Where to listen. 127.0.0.1 unless an operator says otherwise, and saying
 # otherwise inverts the trust model — see spike/deployment.R, which owns that
 # decision and refuses the unsafe spellings of it outright.
@@ -116,6 +153,14 @@ port <- local({
   wanted <- suppressWarnings(as.integer(Sys.getenv("CARMAR_PORT", "4747")))
   if (is.na(wanted) || wanted < 1024L || wanted > 65535L) wanted <- 4747L
   if (!port_taken(wanted)) return(wanted)
+  # A successor started by a handoff is spawned while its predecessor still
+  # holds the port; it waits for the port to free rather than moving.
+  wait_s <- suppressWarnings(as.numeric(Sys.getenv("CARMAR_WAIT_PORT", "0")))
+  if (is.finite(wait_s) && wait_s > 0) {
+    deadline <- Sys.time() + wait_s
+    while (port_taken(wanted) && Sys.time() < deadline) Sys.sleep(0.25)  # a wait is a loop
+    if (!port_taken(wanted)) return(wanted)
+  }
   if (identical(Sys.getenv("CARMAR_PORT_STRICT", ""), "1")) {
     message("CarmaR refuses to start: CARMAR_PORT=", wanted, " is already in use ",
             "and CARMAR_PORT_STRICT=1 forbids moving to another port. Whoever ",
@@ -196,9 +241,23 @@ settings_rscript <- function() {
                  else Sys.getenv("CARMAR_RSCRIPT", ""))
 }
 
+# Where THIS session's workspace is saved for a "Restart into" handoff, and
+# where a successor finds it. The state dir is the launcher's (CARMAR_STATE)
+# or the package's; the file is per port, so two sessions never share one.
+session_file <- local({
+  state <- Sys.getenv("CARMAR_STATE", "")
+  if (!nzchar(state)) state <- tools::R_user_dir("carmar", "data")
+  file.path(state, sprintf("session-%d.RData", port))
+})
 start_execution_worker <- function() {
-  kernel_start(file.path(here, "worker-boot.R"), interactive = TRUE,
-               rscript = settings_rscript(), env_extra = settings_child_env())
+  started <- kernel_start(file.path(here, "worker-boot.R"), interactive = TRUE,
+                          rscript = settings_rscript(),
+                          env_extra = c(settings_child_env(),
+                                        CARMAR_SESSION_FILE = session_file))
+  # A restored workspace is restored ONCE, by the first worker of a successor
+  # kernel; a plain Restart R later must start empty, as it says it does.
+  Sys.unsetenv("CARMAR_RESTORE_WORKSPACE")
+  started
 }
 k <- start_execution_worker()
 sockets <- new.env(parent = emptyenv())
@@ -310,7 +369,8 @@ sockets$boot_at <- Sys.time()
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
 #' The page to serve at `/`: the built CarmaR notebook when there is one,
-#' otherwise the bare spike page. Highest version wins, `.beta.min` ignored so
+#' otherwise the bare spike page. The page is PINNED to this kernel's build
+#' (never the highest version present), `.beta.min` ignored so
 #' a debuggable build is served during development. The repo keeps builds in
 #' ../dist; a distribution copy keeps the notebook right next to this folder.
 #'
@@ -477,7 +537,14 @@ local_origin <- function(origin) {
 # Fragments do not survive a Finder double-click (macOS `open` strips them),
 # which is precisely why the /pair consent click remains: this is the quiet
 # path, not the only one.
-FILE_LAUNCH_CAP <- secure_token(32L)
+# A handoff pre-mints the capability of its successor (session_handoff_begin),
+# so the page can be told where to go BEFORE this process exits. Only the exact
+# shape secure_token() makes is accepted; anything else is minted afresh.
+FILE_LAUNCH_CAP <- local({
+  given <- Sys.getenv("CARMAR_FILE_LAUNCH_CAP", "")
+  Sys.unsetenv("CARMAR_FILE_LAUNCH_CAP")
+  if (grepl("^[A-Za-z0-9]{32}$", given)) given else secure_token(32L)
+})
 
 open_file_env <- Sys.getenv("CARMAR_OPEN_FILE", "")
 sockets$pending_open <- if (nzchar(open_file_env)) open_file_env else NULL
@@ -792,7 +859,7 @@ start_sibling_session <- function() {
 #
 # Ops a declared MCP agent is refused outright: raw evaluation (it must go
 # through a visible chunk_run) and the user's credentials.
-AGENT_REFUSED <- c("exec", "interrupt", "force_stop", "restart", "debug_cmd", "ai-key",
+AGENT_REFUSED <- c("exec", "interrupt", "force_stop", "restart", "session_upgrade", "debug_cmd", "ai-key",
                    "console_history", "input_reply", "ai-audit-read",
                    "job_start", "job_stop", "job_open",
                    "term_open", "term_input", "term_close",
@@ -1089,7 +1156,7 @@ app <- list(
       # double-clicked document and prefer it. Booleans only — the path
       # itself never appears in an unauthenticated response.
       return(resp(200L, "application/json",
-                  toJSON(list(ok = TRUE, worker = k$proc$is_alive(),
+                  toJSON(c(list(ok = TRUE, worker = k$proc$is_alive(),
                               pending_open = !is.null(sockets$pending_open),
                               # For the attach chooser on a page whose own
                               # kernel died: which R, and how old the
@@ -1099,8 +1166,14 @@ app <- list(
                               started = as.numeric(sockets$boot_at),
                               protocol = CARMAR_PROTOCOL_VERSION,
                               kernel_build = CARMAR_KERNEL_BUILD,
+                              # What is installed beside this kernel NOW, and
+                              # how many pages hold it — the two facts an
+                              # upgrade needs from a running session.
+                              installed_build = installed_build(),
+                              pages = length(page_recs()),
                               capabilities = c("published-direct-v1",
                                                "published-pairing-v3")),
+                           handoff_health()),
                          auto_unbox = TRUE),
                   extra = list("Access-Control-Allow-Origin" = "*")))
     }
@@ -1164,6 +1237,20 @@ app <- list(
       sockets$quit <- TRUE
       return(resp(200L, "application/json",
                   toJSON(list(ok = TRUE, stopping = TRUE), auto_unbox = TRUE)))
+    }
+    # The native door of "Restart into the installed CarmaR" — the menu
+    # helper's row and the upgrade script use it (launch.sh --restart). Gated
+    # exactly like /shutdown; the page's own door is the session_upgrade op.
+    if (identical(req$PATH_INFO, "/session/upgrade")) {
+      blocked <- control_rejection(req, allow_file = TRUE)
+      if (!is.null(blocked)) return(blocked)
+      if (!identical(req$REQUEST_METHOD, "POST")) {
+        return(resp(405L, "application/json",
+                    toJSON(list(ok = FALSE, error = "POST only"), auto_unbox = TRUE)))
+      }
+      begun <- session_handoff_begin()
+      return(resp(if (isTRUE(begun$ok)) 200L else 409L, "application/json",
+                  toJSON(begun, auto_unbox = TRUE)))
     }
     # Loopback-only: where is the MCP server on this machine, and is the
     # discovery file in place? The setup dialog renders the answer as the
@@ -2177,7 +2264,10 @@ route_command <- function(cmd, rec, kind) {
 #' fires, so "still open" is identity in that list — not a flag on the record,
 #' which would need clearing in every path that can lose a page.
 route_is_orphan <- function(route) {
-  if (is.null(route) || is.null(route$rec)) return(TRUE)
+  if (is.null(route)) return(TRUE)
+  # A supervisor-owned route (route_internal) has no page to lose.
+  if (is.function(route$on_reply)) return(FALSE)
+  if (is.null(route$rec)) return(TRUE)
   !any(vapply(sockets$open, function(r) identical(r, route$rec), logical(1)))
 }
 
@@ -2291,7 +2381,7 @@ dispatch_worker_queue <- function() {
       frame <- if (identical(route$kind, "exec"))
         list(type = "done", id = route$client_id, status = "error", message = failed)
       else list(type = item$cmd$type, id = route$client_id, error = failed)
-      try(route$rec$ws$send(toJSON(frame, auto_unbox = TRUE)), silent = TRUE)
+      deliver_route_frame(route, frame)
     }
     drop_worker_route(item$wire_id)
     sockets$worker_active <- NULL
@@ -2304,6 +2394,125 @@ enqueue_worker_command <- function(cmd, wire_id) {
   sockets$worker_queue <- c(sockets$worker_queue,
                             list(list(cmd = cmd, wire_id = wire_id)))
   dispatch_worker_queue()
+}
+
+# ── restart into the installed build ───────────────────────────────────────
+#
+# An upgrade swaps the bundle IN PLACE, so the kernel-version stamp beside
+# this script names the installed build while CARMAR_KERNEL_BUILD names the
+# one running. The two disagreeing is the one honest signal that a session
+# is stale, and this is the one door through it: save the workspace, start a
+# SUCCESSOR supervisor from the installed files on this same port, tell every
+# page where its successor's notebook is, and exit. The successor restores
+# the workspace into its first worker (worker.R, CARMAR_RESTORE_WORKSPACE),
+# and the page — which is HTML the browser already holds — navigates to the
+# installed build's page once /health answers with the new build.
+#
+# Three refusals matter. A running chunk: `save.image()` would queue behind
+# it and the person would be staring at a spinner with no chunk to blame. A
+# missing page for the installed build: a successor with nothing to serve is
+# worse than a stale session. And a second request while one is under way.
+sockets$handoff <- NULL
+
+handoff_refusal <- function() {
+  installed <- installed_build()
+  if (identical(installed, "unknown")) {
+    return("This kernel cannot tell which CarmaR is installed.")
+  }
+  if (identical(installed, CARMAR_KERNEL_BUILD)) {
+    return(sprintf("This session already runs the installed CarmaR %s.", installed))
+  }
+  if (!nzchar(carmar_notebook_page(here, installed))) {
+    return(sprintf("The installed CarmaR %s has no notebook page beside this kernel.", installed))
+  }
+  if (!is.null(sockets$handoff)) return("A restart into the installed CarmaR is already under way.")
+  if (length(ls(sockets$running)) > 0L || !is.null(sockets$worker_active)) {
+    return("R is busy — wait for the running chunk, or interrupt it, then try again.")
+  }
+  if (isTRUE(sockets$debug_paused) || isTRUE(sockets$input_waiting)) {
+    return("R is waiting at a prompt — finish it first.")
+  }
+  NULL
+}
+
+#' The successor's page URL: the installed build's notebook beside this
+#' kernel, with this port and a capability minted here so it can be told
+#' to the page NOW and honoured by the successor later.
+handoff_page_url <- function(installed, cap) {
+  page_file <- normalizePath(carmar_notebook_page(here, installed))
+  paste0("file://", utils::URLencode(page_file, reserved = FALSE),
+         "#kernel=", port, "&pair=", cap)
+}
+
+session_handoff_begin <- function() {
+  why <- handoff_refusal()
+  if (!is.null(why)) {
+    audit("session-upgrade-refused", reason = why)
+    return(list(ok = FALSE, error = why))
+  }
+  installed <- installed_build()
+  cap <- secure_token(32L)
+  page <- handoff_page_url(installed, cap)
+  sockets$handoff <- list(to = installed, cap = cap, page = page, started = Sys.time())
+  audit("session-upgrade", from = CARMAR_KERNEL_BUILD, to = installed)
+  # Every page learns where its successor's notebook is — over the gated
+  # socket only; the capability never appears in /health.
+  told <- toJSON(list(type = "session-upgrade", from = CARMAR_KERNEL_BUILD,
+                      to = installed, page = page), auto_unbox = TRUE)
+  lapply(page_recs(), function(r) try(r$ws$send(told), silent = TRUE))
+  routed <- route_internal(list(type = "workspace_save"), session_handoff_finish)
+  enqueue_worker_command(routed$cmd, routed$wire_id)
+  list(ok = TRUE, from = CARMAR_KERNEL_BUILD, to = installed, page = page)
+}
+
+handoff_abandon <- function(reason) {
+  audit("session-upgrade-failed", reason = reason)
+  sockets$handoff <- NULL
+  told <- toJSON(list(type = "session-upgrade-failed", error = reason), auto_unbox = TRUE)
+  lapply(page_recs(), function(r) try(r$ws$send(told), silent = TRUE))
+  invisible(NULL)
+}
+
+#' The worker answered workspace_save: start the successor and go.
+session_handoff_finish <- function(frame) {
+  h <- sockets$handoff
+  if (is.null(h)) return(invisible(NULL))
+  if (!isTRUE(frame$ok) || !scalar_chr(frame$file)) {
+    return(handoff_abandon(frame$error %||% "R could not save the workspace."))
+  }
+  state <- dirname(session_file)
+  dir.create(state, recursive = TRUE, showWarnings = FALSE)
+  env <- Sys.getenv()
+  env[["CARMAR_PORT"]] <- as.character(port)
+  env[["CARMAR_WAIT_PORT"]] <- "30"
+  env[["CARMAR_RESTORE_WORKSPACE"]] <- frame$file
+  env[["CARMAR_FILE_LAUNCH_CAP"]] <- h$cap
+  env[["CARMAR_HANDOFF_FROM"]] <- CARMAR_KERNEL_BUILD
+  env[["CARMAR_SESSION_TITLE"]] <- runtime_record$title %||% ""
+  if (isTRUE(runtime_record$listen)) env[["CARMAR_LISTEN"]] <- "1"
+  # The same R this supervisor runs on, and the serve.R beside THIS file —
+  # which, after the in-place swap, is the installed build's.
+  rscript <- file.path(R.home("bin"), "Rscript")
+  log <- file.path(state, sprintf("kernel-handoff-%d.log", port))
+  started <- tryCatch(processx::process$new(
+    rscript, file.path(here, "serve.R"), env = env,
+    stdout = log, stderr = "2>&1", cleanup = FALSE), error = function(e) NULL)
+  if (is.null(started) || !started$is_alive()) {
+    return(handoff_abandon("The installed CarmaR could not be started."))
+  }
+  audit("session-upgrade-spawned", to = h$to, pid = started$get_pid())
+  sockets$quit <- TRUE
+  invisible(NULL)
+}
+
+#' /health's word about a handoff: which build this kernel replaced, for the
+#' first 90 s of its life. A page that asked can recognise its successor by
+#' it; nothing else is disclosed (no page, no capability).
+handoff_health <- function() {
+  if (!nzchar(HANDOFF_FROM)) return(list())
+  age <- as.numeric(difftime(Sys.time(), sockets$boot_at, units = "secs"))
+  if (age > 90) return(list())
+  list(handoff_from = HANDOFF_FROM)
 }
 
 # ── the analysis plane ─────────────────────────────────────────────────────
@@ -2457,7 +2666,7 @@ fail_worker_routes <- function(reason) {
     frame <- if (identical(route$kind, "exec"))
       list(type = "done", id = route$client_id, status = "error", message = reason)
     else list(type = route$response_type, id = route$client_id, error = reason)
-    try(route$rec$ws$send(toJSON(frame, auto_unbox = TRUE)), silent = TRUE)
+    deliver_route_frame(route, frame)
     # A failed route is a finished route. The restart path clears everything
     # itself two lines later, but any future caller that forgot would leave
     # routes answered AND still registered — the next reply with a recycled
@@ -2473,6 +2682,36 @@ fail_worker_routes <- function(reason) {
 #' the supervisor. Only R's in-memory session is lost. A dead worker therefore
 #' starts a bounded-backoff respawn loop instead of ending serve.R and turning a
 #' recoverable calculation crash into a dead application.
+#' A frame built by the SUPERVISOR for a route (an error, a refusal): to the
+#' page that asked, or to the supervisor's own continuation.
+deliver_route_frame <- function(route, frame) {
+  if (is.function(route$on_reply)) {
+    try(route$on_reply(frame), silent = TRUE)
+  } else {
+    try(route$rec$ws$send(toJSON(frame, auto_unbox = TRUE)), silent = TRUE)
+  }
+  invisible(NULL)
+}
+
+#' A worker command the SUPERVISOR asks on its own behalf — no page owns it,
+#' and its reply goes to `on_reply(frame)` instead of a socket. It rides the
+#' ordinary queue, so it waits its turn behind a running chunk like anything
+#' a page asks, and it dies with the worker like anything a page asks.
+route_internal <- function(cmd, on_reply) {
+  stopifnot("`on_reply` must be a function" = is.function(on_reply))
+  sockets$route_seq <- sockets$route_seq + 1L
+  wire_id <- paste0("wire-", sockets$route_seq)
+  route <- new.env(parent = emptyenv())
+  route$rec <- NULL
+  route$client_id <- wire_id
+  route$kind <- "request"
+  route$response_type <- cmd$type
+  route$on_reply <- on_reply
+  sockets$worker_routes[[wire_id]] <- route
+  cmd$id <- wire_id
+  list(cmd = cmd, wire_id = wire_id)
+}
+
 recover_execution_worker <- function() {
   if (!isTRUE(sockets$worker_recovering)) {
     sockets$worker_recovering <- TRUE
@@ -2557,7 +2796,10 @@ handle_frame <- function(message, rec) {
   rec$last_seen <- Sys.time()
   if (identical(cmd$type, "hb")) {
     rec$beats <- TRUE
-    try(rec$ws$send(toJSON(list(type = "hb"), auto_unbox = TRUE)), silent = TRUE)
+    # The heartbeat answer carries the installed build, so an open notebook
+    # learns of an upgrade within one beat instead of at its next reconnect.
+    try(rec$ws$send(toJSON(list(type = "hb", installed_build = installed_build()),
+                           auto_unbox = TRUE)), silent = TRUE)
     return(invisible(NULL))
   }
 
@@ -2680,6 +2922,21 @@ handle_frame <- function(message, rec) {
     }
     if (identical(cmd$type, "session_list")) reply(sessions = I(session_list()))
     else reply(versions = I(r_versions()), current = current_rscript())
+    return(invisible(NULL))
+  }
+  # "Restart into the installed CarmaR": the page's door. Page-only in both
+  # senses (AGENT_REFUSED has it too) — a session handoff is the person's
+  # decision about their own session, never an agent's.
+  if (identical(cmd$type, "session_upgrade") && identical(rec$role, "page")) {
+    if (!scalar_chr(cmd$id)) return(invisible(NULL))
+    reply <- function(x) try(rec$ws$send(toJSON(c(list(type = "session_upgrade", id = cmd$id), x),
+                                                auto_unbox = TRUE, null = "null")), silent = TRUE)
+    if (!isTRUE(rec$class %in% PAGE_ONLY_CLASSES)) {
+      audit("session-upgrade-refused", class = rec$class %||% "unknown")
+      reply(list(ok = FALSE, error = "Only the local notebook page may ask this."))
+      return(invisible(NULL))
+    }
+    reply(session_handoff_begin())
     return(invisible(NULL))
   }
   # ── terminals ─────────────────────────────────────────────────────────────
@@ -2928,6 +3185,7 @@ handle_frame <- function(message, rec) {
         "term_close" = "Agents cannot close the user's terminal.",
         "session_list" = "Agents cannot list the user's sessions.",
         "r_versions" = "Agents cannot list or choose R installations.",
+        "session_upgrade" = "Agents cannot restart the user's session into another CarmaR.",
         # settings_GET is refused as firmly as the writes. Not because the
         # values are secret, but because handing back the confinement root,
         # the audit-log path and whether AI-text logging is on is a MAP OF THE
@@ -3594,7 +3852,12 @@ pump <- function() {
       # (which `try(silent)` used to do, uncomplainingly) threw it away. Park
       # it on the route instead and keep the route alive, so the page that
       # comes back can adopt it and see its own output.
-      if (route_is_orphan(terminal$route) && identical(terminal$route$kind, "exec")) {
+      if (is.function(terminal$route$on_reply)) {
+        # The supervisor's own question (route_internal): its continuation
+        # runs here, after the drain, with the frame the worker answered.
+        try(terminal$route$on_reply(terminal$frame), silent = TRUE)
+        drop_worker_route(wire_id)
+      } else if (route_is_orphan(terminal$route) && identical(terminal$route$kind, "exec")) {
         terminal$route$parked <- terminal$frame
         terminal$route$parked_at <- Sys.time()
         audit("result-parked", srcname = terminal$route$srcname %||% "")
@@ -3672,6 +3935,11 @@ pump <- function() {
     if (identical(e$type, "ready")) {
       e$protocol <- CARMAR_PROTOCOL_VERSION
       e$kernel_build <- CARMAR_KERNEL_BUILD
+      e$installed_build <- installed_build()
+      # session_upgrade is the SUPERVISOR's verb; it joins the worker's
+      # vocabulary here so a page can tell, without probing, that this
+      # kernel knows how to hand a session to the installed build.
+      e$commands <- I(unique(c(as.character(e$commands %||% character()), "session_upgrade")))
       # relay_frame normally preserves the worker's original bytes verbatim.
       # This frame is now supervisor-owned, so force the faithful re-encode or
       # the two fields above would exist only in this R object, not on the wire.
@@ -3745,6 +4013,14 @@ file_url <- paste0("file://", utils::URLencode(notebook_file, reserved = FALSE),
 runtime_file <- ""
 runtime_record <- list(url = url, file = file_url, port = port, pid = Sys.getpid(),
                        started = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"))
+# A successor started by a handoff keeps the session's name, so the menu
+# row does not flicker to "Untitled" between the two processes.
+local({
+  title <- Sys.getenv("CARMAR_SESSION_TITLE", "")
+  Sys.unsetenv("CARMAR_SESSION_TITLE")
+  title <- trimws(substr(gsub("[\"\\\\]", "'", gsub("[[:cntrl:]]", " ", title)), 1L, 120L))
+  if (nzchar(title)) runtime_record$title <<- title
+})
 # CARMAR_LISTEN=1 marks a kernel started headless for published pages (the
 # menu's Listen for Web Pages, the keep-ready daemon). The menu helper shows
 # such a kernel as its Listen checkbox, not as a session row — there is no
@@ -3919,4 +4195,13 @@ for (id in ls(sockets$jobs)) {
   job <- sockets$jobs[[id]]
   if (identical(job$state, "running")) try(job$k$proc$kill(), silent = TRUE)
 }
-if (nzchar(runtime_file)) unlink(runtime_file)
+# Only OUR record: a successor on this port (session_handoff_finish) may
+# already have written its own, and taking that one down would hide a live
+# session from every launcher and menu.
+if (nzchar(runtime_file)) {
+  mine <- tryCatch({
+    rec <- jsonlite::fromJSON(runtime_file, simplifyVector = TRUE)
+    identical(as.integer(rec$pid), Sys.getpid())
+  }, error = function(e) TRUE)
+  if (isTRUE(mine)) unlink(runtime_file)
+}
