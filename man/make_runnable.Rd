@@ -7,7 +7,7 @@
 \usage{
 make_runnable(
   path,
-  assets = "https://lacarm.com/carmar/publish/",
+  assets = runtime_url(),
   port = 4747,
   label = "Run on my computer"
 )
@@ -19,7 +19,9 @@ make_runnable(
 recursively) are all stamped - a bookdown `_book/`, say.}
 
 \item{assets}{where the page loads the runtime from: a URL prefix ending in
-`/` (default: CarmaR's published copy), or `"local"` to copy the two
+`/` (default: CarmaR's copy on the jsDelivr CDN, served from the
+`CarmaR-releases` repository; `"https://lacarm.com/carmar/publish/"` is the
+self-hosted mirror), or `"local"` to copy the two
 runtime files from this package into a `carmar/` folder beside the pages
 and reference them relatively - for a site that must not load anything
 from elsewhere.}

@@ -302,7 +302,9 @@ write_carmar_options <- function(yml) {
 #' @param path an `.html` file, or a directory whose `.html` files (searched
 #'   recursively) are all stamped - a bookdown `_book/`, say.
 #' @param assets where the page loads the runtime from: a URL prefix ending in
-#'   `/` (default: CarmaR's published copy), or `"local"` to copy the two
+#'   `/` (default: CarmaR's copy on the jsDelivr CDN, served from the
+#'   `CarmaR-releases` repository; `"https://lacarm.com/carmar/publish/"` is the
+#'   self-hosted mirror), or `"local"` to copy the two
 #'   runtime files from this package into a `carmar/` folder beside the pages
 #'   and reference them relatively - for a site that must not load anything
 #'   from elsewhere.
@@ -324,8 +326,8 @@ write_carmar_options <- function(yml) {
 #' make_runnable(dir)
 #' make_runnable(dir)            # a second call changes nothing
 #' @export
-make_runnable <- function(path, assets = "https://lacarm.com/carmar/publish/",
-                          port = 4747, label = "Run on my computer") {
+make_runnable <- function(path, assets = runtime_url(), port = 4747,
+                          label = "Run on my computer") {
   stopifnot(
     "`path` must be one file or directory" = is.character(path) && length(path) == 1L && nzchar(path),
     "`assets` must be a URL prefix ending in / or \"local\"" =
@@ -422,6 +424,15 @@ relative_path <- function(from, to) {
   down <- b[seq_len(length(b) - common) + common]
   rel <- paste(c(up, down), collapse = "/")
   if (nzchar(rel)) rel else "."
+}
+
+#' Where a page loads the CarmaR runtime from by default: CarmaR's copy on
+#' the jsDelivr CDN, served from the `CarmaR-releases` repository and updated
+#' by every release. `https://lacarm.com/carmar/publish/` is the self-hosted
+#' mirror.
+#' @noRd
+runtime_url <- function() {
+  "https://cdn.jsdelivr.net/gh/mohsaqr/CarmaR-releases@main/inst/quarto/_extensions/carmar/"
 }
 
 #' @noRd

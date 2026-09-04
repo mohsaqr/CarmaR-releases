@@ -17,10 +17,10 @@ test_that("a directory of rendered pages is stamped once, with the CDN runtime",
   expect_s3_class(res, c("carmar_runnable", "data.frame"))
   expect_equal(nrow(res), 2L)
   expect_true(all(res$stamped))
-  expect_equal(unique(res$assets), "https://lacarm.com/carmar/publish/carmar-publish.js")
+  expect_equal(unique(res$assets), "https://cdn.jsdelivr.net/gh/mohsaqr/CarmaR-releases@main/inst/quarto/_extensions/carmar/carmar-publish.js")
   html <- paste(readLines(file.path(root, "index.html")), collapse = "\n")
   expect_match(html, '<meta name="carmar-port" content="4747">', fixed = TRUE)
-  expect_match(html, '<script defer src="https://lacarm.com/carmar/publish/carmar-publish.js"></script></head>', fixed = TRUE)
+  expect_match(html, '<script defer src="https://cdn.jsdelivr.net/gh/mohsaqr/CarmaR-releases@main/inst/quarto/_extensions/carmar/carmar-publish.js"></script></head>', fixed = TRUE)
   # idempotent: a second call changes no byte and reports nothing stamped
   before <- readLines(file.path(root, "index.html"))
   again <- make_runnable(root)
