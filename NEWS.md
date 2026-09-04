@@ -1,3 +1,12 @@
+# carmar 7.17
+
+* The notebook's editor themes: 37 (CarmaR's three and RStudio's 34), chosen
+  from a gallery of live samples; a theme now paints the whole chunk, the
+  console and the script editor. Colour values for the RStudio palettes come
+  from the Ace editor's themes (BSD-3-Clause; see inst/AUTHORS).
+* R highlighting follows RStudio's token vocabulary: section heads, roxygen
+  tags, `%infix%` operators, brackets, the package before `::`.
+
 # carmar 7.15
 
 * `make_runnable()`: stamp already rendered HTML pages (R Markdown, bookdown, pkgdown) with the one tag that makes their R blocks runnable; idempotent, `assets = "local"` copies the runtime beside the pages.

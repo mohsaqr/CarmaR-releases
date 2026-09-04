@@ -15,6 +15,10 @@ The package carries, under inst/, files that are not R code:
   inst/app/lib/*.js                    MIT   Mohammed Saqr
   inst/quarto/_extensions/carmar/*     MIT   Mohammed Saqr
 
+The notebook page also carries editor colour palettes whose colour values
+come from the Ace editor's themes (BSD-3-Clause, Copyright (c) 2010, Ajax.org
+B.V.), as data, not code — see inst/AUTHORS.
+
 No third-party library is bundled. See inst/AUTHORS for the verification and
 for the resources the notebook page may fetch at runtime, which are not part
 of this package.
