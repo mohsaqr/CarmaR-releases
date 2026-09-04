@@ -32,8 +32,7 @@ name (default `"X-Forwarded-User"`; Caddy's `forward_auth` writes
 
 \item{trusted_proxy}{Address(es) the proxy connects from (default
 `"127.0.0.1"`). The identity header is read from these and ignored from
-anywhere else — it is an identity only for as long as nobody but the
-proxy can reach the port.}
+anywhere else.}
 
 \item{origins}{Extra exact browser origins allowed to open a socket, e.g.
 `"https://stats.example.edu"`. The kernel's own address is always allowed.}
@@ -44,15 +43,15 @@ account this kernel runs under. There is no safe network on which that is
 a shortcut.}
 }
 \value{
-Invisibly, a one-row `data.frame` with `port`, `bind`, `url` (the
-  kernel's own address), `hosts` (comma-separated), `authenticated`
-  (logical) and `log` (path to the kernel log).
+Invisibly, a one-row `data.frame` with `port` (integer), `bind`,
+  `url` (the kernel's own address), `hosts` (comma-separated),
+  `authenticated` (logical) and `log` (path to the kernel log).
 }
 \description{
 The classroom deployment: one CarmaR per person, each started under that
 person's own operating-system account on its own port, with TLS and login
 handled entirely by a reverse proxy in front. CarmaR itself never sees a
-password — it trusts an identity header, and only when the request came
+password - it trusts an identity header, and only when the request came
 from the proxy's own address.
 }
 \details{
@@ -61,15 +60,42 @@ exists so that inversion is stated rather than stumbled into. On
 `127.0.0.1`, a client that sends no `Origin` header is allowed outright:
 no Origin means it is not a browser, so it is a process belonging to this
 same user, who could have run `Rscript` anyway. Reachable from the network,
-the identical header means an unauthenticated stranger — so here it is
+the identical header means an unauthenticated stranger - so here it is
 refused. The kernel will not start at all without `hosts`, and will not
 start unauthenticated unless you say `allow_unauthenticated = TRUE` out
 loud.
-
-A worked Caddy configuration is in `docs/server.md` inside the package
-sources; `readme()` opens it.
 }
+\section{The deployment}{
+
+The shape is `reader -> TLS reverse proxy -> 127.0.0.1:<port>`, one kernel
+per person, each running as that person's own account so that file
+permissions, quotas and `~` keep meaning what they already mean on the
+machine. The proxy authenticates the reader (OIDC, SAML, LDAP - whatever
+the institution already has) and maps the authenticated name to that
+person's port, setting `user_header` on every forwarded request. The kernel
+reads that header only from `trusted_proxy`, so it is an identity for
+exactly as long as nobody but the proxy can reach the port. With Caddy, a
+`forward_auth` block in front of `reverse_proxy localhost:<port>` does
+both; Caddy's `forward_auth` writes `Remote-User`, hence that value for
+`user_header`. A misconfigured kernel - off loopback with no `hosts`, or
+with no authentication in front - does not come up degraded: it refuses to
+start and says which part of the posture was unsafe.
+}
+
+\section{What is written where}{
+
+`run()`, [listen()] and [serve_shared()] create the package's state
+directory, `tools::R_user_dir("carmar", "data")`, and write there the
+session record `url-<port>`, the kernel log `kernel-<port>.log` and a
+one-line trampoline page the browser is handed. The kernel itself writes
+its discovery record `~/.carmar/run/kernel-<port>.json` (mode 0600,
+removed on a clean stop; `CARMAR_RUNTIME_DIR` relocates it). Nothing else
+on the system is touched, and no network request leaves the machine.
+}
+
 \examples{
+# Not run: binds a network port and starts an R process that outlives
+# this session.
 \dontrun{
 carmar::serve_shared(hosts = "stats.example.edu")
 carmar::serve_shared(hosts = "stats.example.edu", port = 4801,

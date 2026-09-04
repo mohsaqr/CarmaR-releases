@@ -1,16 +1,38 @@
 Package: carmar
 Type: Package
-Title: CarmaR - an R Notebook That Runs on Your Own R
-Version: 7.14
-Authors@R: person("Mohammed", "Saqr", email = "saqr@saqr.me", role = c("aut", "cre"))
-Description: A single-file R notebook served from a local kernel: your R, your
-    packages, your files. The package carries the notebook and its kernel;
-    carmar::run() starts an independent kernel and opens the
-    notebook in the browser. Built for classrooms: one install, one call.
+Title: Notebooks and Runnable Documents on Your Own Local R
+Version: 7.15
+Authors@R: person("Mohammed", "Saqr", email = "saqr@saqr.me",
+    role = c("aut", "cre", "cph"))
+Description: A single-file notebook for 'R' that runs on the 'R' installation
+    already on the computer, and a 'Quarto' filter that makes the code chunks
+    of a rendered web page runnable against each reader's own local 'R'. The
+    notebook is a self-contained web page opened in the default browser; code
+    is evaluated by a separate local 'R' process (the kernel) that the page
+    reaches over a loopback socket, so closing the calling session does not
+    close the notebook. Nothing is installed elsewhere on the system: on the
+    user's explicit call the kernel process is started, its state is written
+    under the directory returned by tools::R_user_dir(), and one small
+    discovery record is written under '~/.carmar/run' and removed on a clean
+    stop.
 License: MIT + file LICENSE
+URL: https://lacarm.com/carmar/
+BugReports: https://github.com/mohsaqr/CarmaR-releases/issues
 Encoding: UTF-8
+Depends:
+    R (>= 4.1)
 Imports:
     httpuv,
     jsonlite,
-    processx
+    processx,
+    tools,
+    utils
+Suggests:
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+SystemRequirements: Rscript (an R >= 4.1 installation reachable as Rscript);
+    Quarto (>= 1.4, optional, to render publishable sites)
+VignetteBuilder: knitr
+Config/testthat/edition: 3
 RoxygenNote: 7.3.3

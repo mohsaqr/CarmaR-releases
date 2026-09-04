@@ -1,0 +1,146 @@
+---
+title: "Publishing runnable R chunks with CarmaR"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Publishing runnable R chunks with CarmaR}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+A 'Quarto' site rendered with the `carmar` filter keeps every page exactly as
+rendered, and gives each visible R chunk a Run button that evaluates the
+chunk on the reader's own computer, in the reader's own R. No server runs
+the code; the page talks to a small local process - a CarmaR kernel - over a
+loopback socket. This vignette is the author's story, then the reader's.
+
+## The author
+
+Enable publishing in the project once:
+
+```{r}
+carmar::use_publishing("path/to/project")   # or "." from inside the project
+```
+
+This copies the extension into `_extensions/carmar`, puts `- carmar` under
+`filters:` in `_quarto.yml` (appended after any filters already there), and
+writes the two options you may want to change when the file has none:
+
+Prefer a folder to a command? Download `carmar-quarto.zip` from
+<https://lacarm.com/carmar/> and unzip it inside the project: it creates the
+same `_extensions/carmar/` folder. Then add `- carmar` under `filters:` in
+`_quarto.yml` yourself (`quarto add https://lacarm.com/carmar/carmar-quarto.zip`
+does the copy too).
+
+```yaml
+carmar:
+  port: 4747
+  label: Run on my computer
+```
+
+The port is the loopback port a reader's kernel will listen on; leave it at
+4747 unless something else on readers' machines owns that port. The label is
+the text of the Run button. A `_quarto.yml` that `use_publishing()` cannot
+edit safely (an inline `filters: [...]` list) is left as it was and the lines
+to add are printed.
+
+Render and publish as you always do:
+
+```sh
+quarto render
+quarto publish
+```
+
+Before publishing, or after, check the rendered output:
+
+```{r}
+carmar::check_publishing("_site")     # a book renders to "_book"
+```
+
+One row per page: `port` is `NA` for a page rendered without the filter, and
+`assets` is `FALSE` when the page references the runtime script and
+stylesheet but they are not beside it - which is what happens when a site is
+uploaded without its `site_libs` directory.
+
+A chunk that should be shown but never offered to run goes in a div with the
+class `carmar-no-run`:
+
+````markdown
+::: {.carmar-no-run}
+```{r}
+unlink("~", recursive = TRUE)   # example only
+```
+:::
+````
+
+If the site sets its own Content Security Policy, allow the loopback socket
+the page dials, on the port you chose:
+
+```
+connect-src ws://127.0.0.1:4747
+```
+
+## Pages that are already rendered
+
+A report rendered years ago by R Markdown, a bookdown `_book/`, a pkgdown
+article: none of them needs rendering again. One tag before `</head>` loads
+the runtime, which gives every R block a Run button and the strip at the top:
+
+```{r}
+carmar::make_runnable("report.html")     # one file
+carmar::make_runnable("_book")           # every .html under a folder, once
+```
+
+By default the page loads the runtime from CarmaR's published copy; pass
+`assets = "local"` to copy the two files beside the pages instead. The tag is
+inserted once; calling it again changes nothing.
+
+## Any page at all
+
+A reader can make a page runnable that its author never touched: a bookmark
+whose address is the one-line script at <https://lacarm.com/carmar/> injects the
+runtime on click. The kernel treats the site like any other — approved once per
+session in the consent tab, code run only on Run — so no author cooperation is
+needed, only a site whose Content-Security-Policy allows the script.
+
+## The reader
+
+The reader needs R and this package:
+
+```{r}
+install.packages("carmar")
+carmar::listen("https://book.example")
+```
+
+`listen()` starts a headless kernel on the page's port and approves that one
+site - scheme and host, nothing more - for the kernel's lifetime. It prints
+one line:
+
+```
+CarmaR is listening on port 4747 for https://book.example - open the page and press Run.
+```
+
+Then the reader opens the page and presses Run. The chunk's output appears
+under the chunk, from their own R, with their own packages and files.
+
+If `listen()` is called without a site, the page's first Run opens a local
+consent page naming the site, and the reader approves it there. Either way a
+site is never trusted because it asked: approval is per exact origin, per
+kernel, and ends when the kernel stops. The browser may also ask, once, for
+permission for the site to reach the local network; that is the browser's
+own question, and answering yes lets the page reach `127.0.0.1` and nothing
+else.
+
+This is execution, not a sandbox. What a reader runs has the same access as
+their own R console, so authors keep the code visible and readers read a
+chunk before running it.
+
+To see and stop what is running:
+
+```{r}
+carmar::sessions()
+carmar::stop_kernel(4747)
+```

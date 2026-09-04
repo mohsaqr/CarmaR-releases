@@ -1,0 +1,29 @@
+Authorship of the files in this package
+=======================================
+
+All R code, the kernel scripts under app/kernel, the notebook page under app,
+and the Quarto extension under quarto/_extensions/carmar are written by
+Mohammed Saqr and licensed under the MIT license (see LICENSE).
+
+The notebook page (app/carmar_V<version>.html) is a single self-contained
+file built from two JavaScript sources, both by the same author:
+
+  component            version   license   copyright holder
+  -------------------  --------  --------  -----------------
+  CarmaR (this tree)   <pkg>     MIT       Mohammed Saqr
+  @carmnote/core       0.5.0     MIT       Mohammed Saqr
+
+No third-party JavaScript library is bundled into the page or into the
+extension's carmar-publish.js. This was verified at packaging time by
+inspecting the bundle for library banners and API surfaces: the build's only
+runtime dependency is @carmnote/core, whose own dependencies are build tools
+(esbuild, vite, html-minifier-terser) that leave nothing in the output.
+
+Resources the page can fetch at runtime, on the user's request, are NOT part
+of this package and are listed here only for completeness:
+
+  en_US spelling data     SCOWL (Kevin Atkinson), via the dictionary-en 4.0.0
+                          npm package, fetched from cdn.jsdelivr.net when the
+                          user turns spell checking on.
+  @mlc-ai/web-llm 0.2.84  Apache-2.0, fetched from cdn.jsdelivr.net when the
+                          user chooses the in-browser (WebGPU) AI provider.

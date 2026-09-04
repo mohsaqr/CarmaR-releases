@@ -1,0 +1,20 @@
+The carmar package is released under the MIT license; the two-line LICENSE
+file names the year and the copyright holder, and the full text is R's
+MIT license template (https://www.r-project.org/Licenses/MIT).
+
+Bundled components
+------------------
+
+The package carries, under inst/, files that are not R code:
+
+  inst/app/kernel/*.R, index.html      MIT   Mohammed Saqr
+  inst/app/carmar_V<version>.html      MIT   Mohammed Saqr (built from the
+                                             CarmaR sources and @carmnote/core
+                                             0.5.0, both MIT, same author)
+  inst/app/kernel/mcp/carmar-mcp.mjs   MIT   Mohammed Saqr
+  inst/app/lib/*.js                    MIT   Mohammed Saqr
+  inst/quarto/_extensions/carmar/*     MIT   Mohammed Saqr
+
+No third-party library is bundled. See inst/AUTHORS for the verification and
+for the resources the notebook page may fetch at runtime, which are not part
+of this package.
